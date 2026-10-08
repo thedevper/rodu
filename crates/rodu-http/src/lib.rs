@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const BOARD_PAGE: u32 = 100;
 const BOARD_MAX_ITEMS: usize = 1000;
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 const SECURITY_HEADERS: &[(&str, &str)] = &[
     (
@@ -70,10 +71,18 @@ pub struct RunningServer {
 }
 
 impl RunningServer {
-    /// Stops accepting connections and waits for in-flight requests to finish.
+    /// Stops accepting connections and lets in-flight requests finish, for up to five seconds;
+    /// a client that stalls longer is cut off so Ctrl+C always exits.
     pub async fn close(self) -> std::io::Result<()> {
         let _ = self.shutdown.send(());
-        self.task.await.map_err(std::io::Error::other)?
+        let abort = self.task.abort_handle();
+        match tokio::time::timeout(SHUTDOWN_GRACE, self.task).await {
+            Ok(joined) => joined.map_err(std::io::Error::other)?,
+            Err(_) => {
+                abort.abort();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -628,7 +637,15 @@ async fn serve_static<S: Store>(app: &App<S>, path: &str) -> Outcome<Response> {
         let root = app.dist_dir.as_ref().ok_or_else(not_found)?;
         let mut file = root.clone();
         file.extend(&segments);
-        let is_file = tokio::fs::metadata(&file).await.is_ok_and(|m| m.is_file());
+        // Resolve symlinks and stay inside the root, whatever the folder links to.
+        let inside = tokio::fs::canonicalize(&file).await.ok().filter(|f| f.starts_with(root));
+        let is_file = match &inside {
+            Some(f) => tokio::fs::metadata(f).await.is_ok_and(|m| m.is_file()),
+            None => false,
+        };
+        if tokio::fs::symlink_metadata(&file).await.is_ok() && inside.is_none() {
+            return Err(not_found());
+        }
         if !is_file {
             if has_extension(&segments) {
                 return Err(not_found());
@@ -638,11 +655,8 @@ async fn serve_static<S: Store>(app: &App<S>, path: &str) -> Outcome<Response> {
         let content = tokio::fs::read(&file).await.map_err(|_| not_found())?;
         (file.to_string_lossy().into_owned(), Bytes::from(content))
     };
-    let cache = if name.ends_with("index.html") {
-        "no-store"
-    } else {
-        "public, max-age=31536000, immutable"
-    };
+    // Built files keep fixed names (rodu_web_bg.wasm), so they must be revalidated, not pinned.
+    let cache = if name.ends_with("index.html") { "no-store" } else { "no-cache" };
     let mut response = Response::new(Body::from(content));
     let headers = response.headers_mut();
     add_security_headers(headers);

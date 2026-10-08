@@ -94,14 +94,33 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
                 None => (long.to_owned(), None),
             }
-        } else if arg.len() == 2 && arg.starts_with('-') && arg != "-" {
-            let name = match &arg[1..] {
-                "c" => "collection",
-                "v" => "version",
-                "h" => "help",
-                _ => return Err(format!("Unknown option '{arg}'")),
-            };
-            (name.to_owned(), None)
+        } else if let Some(short) = arg.strip_prefix('-').filter(|s| is_short_options(s)) {
+            // -c KEY, -cKEY, or grouped flags such as -vh.
+            let mut chars = short.chars();
+            let mut flags = Vec::new();
+            let mut value = None;
+            while let Some(c) = chars.next() {
+                match c {
+                    'v' => flags.push("version"),
+                    'h' => flags.push("help"),
+                    'c' => {
+                        let attached: String = chars.by_ref().collect();
+                        value = Some(if attached.is_empty() {
+                            rest.next().cloned().ok_or_else(|| {
+                                "Option '-c, --collection <value>' argument missing".to_owned()
+                            })?
+                        } else {
+                            attached
+                        });
+                    }
+                    _ => return Err(format!("Unknown option '-{c}'")),
+                }
+            }
+            args.flags.extend(flags.into_iter().map(str::to_owned));
+            if let Some(value) = value {
+                args.values.insert("collection".to_owned(), value);
+            }
+            continue;
         } else {
             args.positionals.push(arg.clone());
             continue;
@@ -127,6 +146,11 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
     Ok(args)
 }
 
+/// `-x...` is a cluster of short options; `-7d` (a relative date in a query) and `-` are not.
+fn is_short_options(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
 // --- workspace -------------------------------------------------------------------------------
 
 fn resolve(cwd: &Path, path: &str) -> PathBuf {
@@ -134,8 +158,13 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
 }
 
+/// An environment variable, treating an empty value as unset.
+fn var<'a>(io: &'a Io<'_>, name: &str) -> Option<&'a str> {
+    io.env.get(name).map(String::as_str).filter(|v| !v.is_empty())
+}
+
 fn find_dir(io: &Io<'_>) -> Option<PathBuf> {
-    if let Some(dir) = io.env.get("RODU_DIR") {
+    if let Some(dir) = var(io, "RODU_DIR") {
         return Some(resolve(&io.cwd, dir));
     }
     io.cwd.ancestors().map(|dir| dir.join(".rodu")).find(|dir| dir.join("config.json").is_file())
@@ -171,7 +200,7 @@ fn init(io: &mut Io<'_>, args: &Args) -> Result<()> {
         return Err(RoduError::invalid("init needs --name and --key")
             .with_hint("e.g. rodu init --name your-name --key DEMO"));
     };
-    let dir = match io.env.get("RODU_DIR") {
+    let dir = match var(io, "RODU_DIR") {
         Some(dir) => resolve(&io.cwd, dir),
         None => io.cwd.join(".rodu"),
     };
@@ -184,7 +213,13 @@ fn init(io: &mut Io<'_>, args: &Args) -> Result<()> {
     }
     create_private_dir(&dir)
         .map_err(|e| RoduError::invalid(format!("Cannot create {}: {e}", dir.display())))?;
-    let service = RoduService::new(SqliteStore::open(&dir.join("rodu.db"))?);
+    // SQLite gives its -wal and -shm files the database's mode, so this keeps all three private.
+    let db = dir.join("rodu.db");
+    if !db.exists() {
+        write_private_file(&db, "")
+            .map_err(|e| RoduError::invalid(format!("Cannot create {}: {e}", db.display())))?;
+    }
+    let service = RoduService::new(SqliteStore::open(&db)?);
     let config = service.store.transaction(TxMode::Write, || {
         let user = service.create_principal(name, PrincipalKind::Human, None)?;
         let agent = service.create_principal(
@@ -333,7 +368,7 @@ enum WebSource {
 }
 
 fn web_source(io: &Io<'_>) -> Result<WebSource> {
-    if let Some(dist) = io.env.get("RODU_WEB_DIST") {
+    if let Some(dist) = var(io, "RODU_WEB_DIST") {
         let dir = resolve(&io.cwd, dist);
         if !dir.join("index.html").is_file() {
             return Err(

@@ -221,6 +221,19 @@ async fn serves_the_ui_with_security_headers_and_blocks_path_traversal() {
     assert_eq!(send(s, "GET", "/..%5c..%5cCargo.toml", none()).await.status, 404);
     assert_eq!(send(s, "GET", "/missing.js", none()).await.status, 404);
     assert_eq!(send(s, "POST", "/", none()).await.status, 405);
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            f._dist.path().join("leak.txt"),
+        )
+        .unwrap();
+        let leak = send(s, "GET", "/leak.txt", none()).await;
+        assert_eq!(leak.status, 404);
+        assert!(!leak.body.contains("top secret"));
+    }
 }
 
 #[tokio::test]
@@ -423,7 +436,8 @@ async fn serves_files_held_in_memory_as_the_single_binary_does() {
     let js = send(s, "GET", "/assets/app.js", none()).await;
     assert_eq!(js.body, "console.log(2)");
     assert!(js.header("content-type").contains("javascript"));
-    assert!(js.header("cache-control").contains("immutable"));
+    // Built files keep fixed names, so the browser must revalidate them after a rebuild.
+    assert_eq!(js.header("cache-control"), "no-cache");
     let wasm = send(s, "GET", "/assets/app.wasm", none()).await;
     assert_eq!(wasm.header("content-type"), "application/wasm");
     assert!(send(s, "GET", "/board/route", none()).await.body.contains("Embedded"));
@@ -450,4 +464,20 @@ async fn without_a_ui_serves_only_the_api() {
     let page = send(&server, "GET", "/", none()).await;
     assert_eq!(page.status, 404);
     assert_eq!(page.json()["message"], "The web UI is not built");
+}
+
+#[tokio::test]
+async fn closes_even_when_a_client_stalls_mid_body() {
+    let f = fixture().await;
+    let port = f.server.port;
+    let mut stalled = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let head = format!(
+        "POST /api/items HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {TOKEN}\r\n\
+         Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{{"
+    );
+    stalled.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    f.server.close().await.unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(8), "{:?}", started.elapsed());
 }

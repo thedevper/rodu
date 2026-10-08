@@ -3,7 +3,13 @@ use std::collections::HashMap;
 use rodu::{Io, open_url, run};
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<String> = match std::env::args_os().skip(1).map(|a| a.into_string()).collect() {
+        Ok(argv) => argv,
+        Err(arg) => {
+            eprintln!("error: argument {arg:?} is not valid Unicode");
+            std::process::exit(1);
+        }
+    };
     // Variables that are not valid Unicode cannot name a workspace; skip them, never panic.
     let env: HashMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
