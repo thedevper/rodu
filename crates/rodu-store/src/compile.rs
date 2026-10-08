@@ -391,7 +391,18 @@ impl Compiler<'_> {
 
     fn timestamp(&self, value: &Value) -> Result<String> {
         match &value.kind {
-            ValueKind::Duration { ms, .. } => Ok(iso(self.ctx.now + Duration::milliseconds(*ms))),
+            ValueKind::Duration { ms, .. } => {
+                // Huge offsets such as 999999w fall outside the calendar: refuse, never panic.
+                let at =
+                    self.ctx.now.checked_add(Duration::milliseconds(*ms)).ok_or_else(|| {
+                        self.error(
+                            "Relative date is out of range",
+                            value.pos,
+                            Some("Use a smaller offset, e.g. -30d"),
+                        )
+                    })?;
+                Ok(iso(at))
+            }
             ValueKind::Func(name) if name == "now" => Ok(iso(self.ctx.now)),
             ValueKind::Func(name) if name == "today" => {
                 Ok(iso(self.ctx.now).chars().take(10).collect())
@@ -596,5 +607,13 @@ mod tests {
         assert!(to_sql("created > 2026-01-31T09:00:00Z", &ctx()).is_ok());
         assert!(to_sql("due < tomorrow", &ctx()).is_err());
         assert!(to_sql("due < yesterday()", &ctx()).is_err());
+    }
+
+    #[test]
+    fn rejects_relative_dates_past_the_calendar_instead_of_panicking() {
+        for query in ["updated > 999999w", "updated > -999999w"] {
+            let error = to_sql(query, &ctx()).err().expect("an error, not a panic");
+            assert!(error.message.contains("out of range"), "{}", error.message);
+        }
     }
 }

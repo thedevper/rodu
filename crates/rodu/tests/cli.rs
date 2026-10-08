@@ -97,6 +97,7 @@ async fn initialises_a_workspace_and_manages_items_end_to_end() {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&cwd.join(".rodu/config.json")), 0o600);
         assert_eq!(mode(&cwd.join(".rodu")), 0o700);
+        assert_eq!(mode(&cwd.join(".rodu/rodu.db")), 0o600);
     }
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(cwd.join(".rodu/config.json")).unwrap())
@@ -272,4 +273,38 @@ async fn prints_its_version() {
     assert_eq!(res.code, 0);
     let version = res.last_out().strip_prefix("rodu ").unwrap();
     assert_eq!(version.split('.').filter(|p| p.parse::<u32>().is_ok()).count(), 3);
+}
+
+#[tokio::test]
+async fn treats_empty_variables_as_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = vec![("RODU_DIR", String::new())];
+    let made = cli_with(
+        dir.path(),
+        &["init", "--name", "alice", "--key", "DEMO"],
+        Extra { env, ..Extra::default() },
+    )
+    .await;
+    assert_eq!(made.code, 0);
+    assert!(dir.path().join(".rodu/config.json").is_file());
+    assert!(!dir.path().join("config.json").exists());
+    let env = vec![("RODU_DIR", String::new())];
+    assert_eq!(cli_with(dir.path(), &["ls"], Extra { env, ..Extra::default() }).await.code, 0);
+}
+
+#[tokio::test]
+async fn reads_short_options_with_attached_values() {
+    let dir = tempfile::tempdir().unwrap();
+    init(dir.path()).await;
+    assert_eq!(cli(dir.path(), &["init", "--name", "bob", "--key", "OPS"]).await.code, 1);
+    let env = vec![("RODU_DIR", dir.path().join("ops").to_string_lossy().into_owned())];
+    let ops = Extra { env, ..Extra::default() };
+    assert_eq!(cli_with(dir.path(), &["init", "--name", "bob", "--key", "OPS"], ops).await.code, 0);
+    let wrong = cli(dir.path(), &["add", "Fix", "-cNOPE"]).await;
+    assert_eq!(wrong.code, 1, "-cNOPE must name a collection, not join the title");
+    let unknown = cli(dir.path(), &["add", "Fix", "-x"]).await;
+    assert_eq!(unknown.code, 1);
+    assert!(unknown.last_err().contains("-x"));
+    let listed = cli(dir.path(), &["ls", "updated", ">", "-7d"]).await;
+    assert_eq!(listed.code, 0, "{:?}", listed.err);
 }

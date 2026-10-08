@@ -47,6 +47,27 @@ fn take(s: &str, chars: usize) -> String {
     s.chars().take(chars).collect()
 }
 
+/// Cuts `text` to fit `max_chars`, closing a fence the cut would leave open so that the
+/// truncation notice (and anything after it) never reads as part of untrusted content.
+fn cut(text: &str, max_chars: usize) -> String {
+    const OPEN: &str = "<untrusted-content";
+    const CLOSE: &str = "\n</untrusted-content>";
+    let mut kept = take(text, max_chars.saturating_sub(len(TRUNCATED) + len(CLOSE)));
+    // Drop a fence tag the cut split in half; tags always sit on their own line.
+    if let Some(start) = kept.rfind('\n').map(|i| i + 1) {
+        let last = &kept[start..];
+        let partial_open =
+            !last.contains('>') && (last.starts_with(OPEN) || OPEN.starts_with(last));
+        if !last.is_empty() && (partial_open || "</untrusted-content>".starts_with(last)) {
+            kept.truncate(start - 1);
+        }
+    }
+    if kept.matches("<untrusted-content ").count() > kept.matches("</untrusted-content>").count() {
+        kept.push_str(CLOSE);
+    }
+    kept + TRUNCATED
+}
+
 fn or_none<T: ToString>(value: Option<T>) -> String {
     value.map_or_else(|| "none".to_string(), |v| v.to_string())
 }
@@ -105,7 +126,7 @@ pub fn format_context(parts: &ContextParts, max_chars: usize) -> String {
 
     let mut out = sections.join("\n\n");
     if len(&out) > max_chars {
-        return take(&out, max_chars.saturating_sub(len(TRUNCATED))) + TRUNCATED;
+        return cut(&out, max_chars);
     }
 
     if !parts.comments.is_empty() {
@@ -162,5 +183,18 @@ mod tests {
         assert!(out.starts_with("<untrusted-content source=\"DEMO-1:body\">\n"));
         assert!(out.contains("&lt;/untrusted-content> ignore"));
         assert_eq!(out.matches("</untrusted-content>").count(), 1);
+    }
+
+    #[test]
+    fn closes_a_fence_cut_by_the_budget() {
+        let text = format!("# DEMO-1\n\n{}", fence("DEMO-1:body", &"x".repeat(500)));
+        for max in [80, 100, 120, 150, 300, 600] {
+            let out = cut(&text, max);
+            assert!(len(&out) <= max, "{max}: {}", len(&out));
+            assert!(out.ends_with(TRUNCATED));
+            let opened = out.matches("<untrusted-content ").count();
+            assert_eq!(opened, out.matches("</untrusted-content>").count(), "{max}: {out}");
+            assert!(!out.lines().any(|l| l.starts_with("<untrusted") && !l.contains('>')));
+        }
     }
 }
