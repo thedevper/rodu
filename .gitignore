@@ -1,0 +1,41 @@
+# Build output
+/target/
+/dist/
+/crates/rodu-web/dist/
+
+# Rodu workspaces and databases (real boards never belong in the repo)
+.rodu/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Operating systems and editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local tool state
+.omc/
+.claude/
+.direnv/
+.envrc
+*.log
+*.profraw
+*.profdata
+/coverage/
+lcov.info
