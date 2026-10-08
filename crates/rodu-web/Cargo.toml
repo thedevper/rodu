@@ -8,6 +8,35 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+rodu-api = { version = "0.1.0", path = "../rodu-api" }
+
+# The board itself only runs in the browser; on the host only the pure board logic builds, so
+# `cargo test -p rodu-web` stays fast and needs no browser.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-net = { version = "0.7.0", default-features = false, features = ["http", "json"] }
+js-sys = "0.3.106"
+leptos = { version = "0.8.22", features = ["csr"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
+  "DataTransfer",
+  "DomRect",
+  "DragEvent",
+  "Element",
+  "History",
+  "HtmlElement",
+  "HtmlInputElement",
+  "HtmlSelectElement",
+  "HtmlTextAreaElement",
+  "KeyboardEvent",
+  "Location",
+  "Node",
+  "NodeList",
+  "Storage",
+  "Window",
+] }
 
 [lints]
 workspace = true
