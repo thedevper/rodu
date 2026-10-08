@@ -308,3 +308,59 @@ async fn reads_short_options_with_attached_values() {
     let listed = cli(dir.path(), &["ls", "updated", ">", "-7d"]).await;
     assert_eq!(listed.code, 0, "{:?}", listed.err);
 }
+
+/// The real binary: stdout must carry only MCP messages, or the agent's client breaks.
+#[tokio::test]
+async fn serves_mcp_over_stdio_as_the_workspace_agent() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    init(dir.path()).await;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rodu"))
+        .arg("mcp")
+        .current_dir(dir.path())
+        .env_remove("RODU_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |message: serde_json::Value| {
+        writeln!(stdin, "{message}").unwrap();
+        stdin.flush().unwrap();
+    };
+    let mut read = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap_or_else(|_| panic!("{line:?}"))
+    };
+    send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" } }
+    }));
+    assert_eq!(read()["result"]["serverInfo"]["name"], "rodu");
+    send(serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    send(serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "create_items",
+                    "arguments": { "collection": "DEMO", "items": [{ "title": "From agent" }] } }
+    }));
+    let created = read();
+    assert_eq!(created["id"], 2);
+    assert_ne!(created["result"]["isError"], true, "{created}");
+    drop(send);
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
+    assert!(err.contains("rodu mcp: serving"), "{err}");
+
+    // Recorded as the agent acting for alice.
+    let shown = cli(dir.path(), &["show", "DEMO-1"]).await;
+    assert!(shown.last_out().contains("From agent"));
+}

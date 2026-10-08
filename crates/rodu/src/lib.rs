@@ -25,6 +25,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   ls [query] [--limit 50]    list items (JQL-lite, e.g. \"assignee = me() ORDER BY priority\")
   show <key>                 item with its context
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
+  mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
   --version                  print the version
 
@@ -302,6 +303,16 @@ async fn command_result(
     match command {
         "init" => init(io, args).map(|()| 0),
         "web" => serve_web(io, args.value("port"), !args.flag("no-open")).await.map(|()| 0),
+        "mcp" => {
+            // The agent acts for the user: every change is recorded as "alice via alice-agent".
+            let ws = open(io, true)?;
+            // Only MCP messages may go to stdout; the status line goes to stderr.
+            (io.err)(&format!("rodu mcp: serving {} on stdio", ws.dir.display()));
+            rodu_mcp::serve_stdio(ws.service, ws.actor)
+                .await
+                .map_err(|e| RoduError::internal(format!("MCP server stopped: {e}")))?;
+            Ok(0)
+        }
         "add" => {
             let ws = open(io, false)?;
             let mut item = Map::new();
