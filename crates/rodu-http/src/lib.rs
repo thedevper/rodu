@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
+pub use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
