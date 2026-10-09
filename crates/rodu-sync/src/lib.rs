@@ -8,6 +8,12 @@
 //! imports into this process only when the child survives. A refused file is an error and leaves
 //! the replica unchanged.
 
+mod layout;
+mod names;
+mod store;
+
+pub use store::{IndexReport, LoroStore};
+
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -105,16 +111,43 @@ pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
         LoroDoc::from_snapshot(snapshot).map_err(invalid)?
     };
     let before = doc.oplog_vv();
+    let before_frontiers = doc.oplog_frontiers();
     doc.import(update).map_err(invalid)?;
-    // Everything a `Replica` does with the merged document afterwards, so a panic Loro defers to a
-    // later read or export also happens here. A new `Replica` method that reads or exports the
-    // document must be added to this list.
+    // Everything a `Replica` or a `LoroStore` does with the merged document afterwards, so a panic
+    // Loro defers to a later read or export also happens here. A new method that reads or exports
+    // the document must be added to this list.
     let _ = doc.get_deep_value();
     let _ = doc.oplog_vv().encode();
+    if let Ok(diff) = doc.diff(&before_frontiers, &doc.oplog_frontiers()) {
+        for (container, _) in diff.iter() {
+            let _ = doc.get_path_to_container(container);
+        }
+    }
+    let tree = doc.get_tree("items");
+    for node in tree.get_nodes(false) {
+        let _ = tree.parent(node.id);
+        if let Ok(meta) = tree.get_meta(node.id) {
+            let _ = meta.get_deep_value();
+        }
+    }
     doc.export(ExportMode::updates(&before)).map_err(invalid)?;
     doc.export(ExportMode::all_updates()).map_err(invalid)?;
     doc.export(ExportMode::Snapshot).map_err(invalid)?;
     Ok(())
+}
+
+/// Replays importing `bytes` into a copy of `doc` in `checker`'s child process; Ok when the child
+/// survived and found the bytes valid.
+fn check_import(doc: &LoroDoc, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
+    if bytes.len() > MAX_IMPORT_BYTES {
+        return Err(SyncError::TooLarge { size: bytes.len(), max: MAX_IMPORT_BYTES });
+    }
+    let snapshot = doc.export(ExportMode::Snapshot).map_err(invalid)?;
+    let mut input = Vec::with_capacity(8 + snapshot.len() + bytes.len());
+    input.extend((snapshot.len() as u64).to_le_bytes());
+    input.extend(snapshot);
+    input.extend(bytes);
+    checker.run(input)
 }
 
 /// One machine's copy of the document.
@@ -178,15 +211,7 @@ impl Replica {
     /// Merges updates or a snapshot from another machine, once `checker` has replayed the same
     /// import on a copy of this replica in a child process and the child survived.
     pub fn import_untrusted(&mut self, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
-        if bytes.len() > MAX_IMPORT_BYTES {
-            return Err(SyncError::TooLarge { size: bytes.len(), max: MAX_IMPORT_BYTES });
-        }
-        let snapshot = self.snapshot();
-        let mut input = Vec::with_capacity(8 + snapshot.len() + bytes.len());
-        input.extend((snapshot.len() as u64).to_le_bytes());
-        input.extend(snapshot);
-        input.extend(bytes);
-        checker.run(input)?;
+        check_import(&self.doc, bytes, checker)?;
         self.import_trusted(bytes)
     }
 
