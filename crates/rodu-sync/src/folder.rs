@@ -119,6 +119,15 @@ fn unframe_as<'a>(magic: &[u8; 12], bytes: &'a [u8]) -> Frame<'a> {
     }
 }
 
+/// What a push did.
+#[derive(Debug, Default)]
+pub struct Pushed {
+    /// The file written, if there was anything new to write.
+    pub written: Option<PathBuf>,
+    /// What went wrong after it was written, such as an old file a compaction could not remove.
+    pub warnings: Vec<String>,
+}
+
 /// What a pull found.
 #[derive(Debug, Default)]
 pub struct PullReport {
@@ -126,6 +135,9 @@ pub struct PullReport {
     pub incomplete: Vec<String>,
     /// Files that are not sync files or are damaged.
     pub damaged: Vec<String>,
+    /// Replicas whose files this machine dealt with are gone, with no newer file in their place
+    /// yet: a compacted file still arriving. Said on every pull until it arrives.
+    pub missing: Vec<String>,
     pub batch: BatchReport,
 }
 
@@ -323,7 +335,9 @@ impl TeamFolder {
     /// the file written, if there was anything to write.
     /// Refuses a folder without `rodu-team.json`, e.g. a cloud drive that is not mounted, so
     /// nothing is written into an empty stand-in the provider would never sync.
-    pub fn push(&self, store: &LoroStore) -> Result<Option<PathBuf>> {
+    /// A compaction that fails after the file is written is a warning in the result, not an
+    /// error: the file went out.
+    pub fn push(&self, store: &LoroStore) -> Result<Pushed> {
         let info = self.checked_info()?;
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         let mut written = None;
@@ -334,8 +348,11 @@ impl TeamFolder {
             written = Some(path);
             Ok(())
         })?;
-        self.compact(store, &info, &dir)?;
-        Ok(written)
+        let warnings = match self.compact(store, &info, &dir) {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!("compacting this machine's sync files: {}", e.message)],
+        };
+        Ok(Pushed { written, warnings })
     }
 
     /// A payload framed, and sealed first for an encrypted team.
@@ -405,7 +422,9 @@ impl TeamFolder {
         let mut incoming = Vec::new();
         // (content key, file key) of each file read: a file whose content was dealt with is
         // then remembered by its name, size and modification time, and not read again.
-        let mut read: Vec<(String, String)> = Vec::new();
+        let mut read: Vec<(String, Option<String>, u64, Option<u64>)> = Vec::new();
+        // The highest number among each replica's files present now.
+        let mut present: Vec<(u64, Option<u64>)> = Vec::new();
         let mut peers: Vec<(u64, PathBuf)> = Vec::new();
         for entry in fs::read_dir(&sync).map_err(|e| folder_error(&sync, e))? {
             let entry = entry.map_err(|e| folder_error(&sync, e))?;
@@ -427,6 +446,7 @@ impl TeamFolder {
                 }
             }
             files.sort();
+            present.push((peer, files.iter().filter_map(|(name, _)| own_seq(name)).max()));
             for (name, path) in files {
                 // The name is untrusted and ends up in a terminal: control characters are escaped.
                 let shown = format!("{}/{}", peer_dir_name(peer), name.escape_debug());
@@ -459,9 +479,7 @@ impl TeamFolder {
                     Err(e) => return Err(folder_error(&path, e)),
                 };
                 let key = format!("{shown}/{}", hex::encode(Sha256::digest(&bytes)));
-                if let Some(stat) = stat {
-                    read.push((key.clone(), stat));
-                }
+                read.push((key.clone(), stat, peer, own_seq(&name)));
                 // A sealed payload is opened, and so authenticated, here; the plaintext then goes
                 // through the import check like a plain one.
                 let opened = match unframe_as(magic, &bytes) {
@@ -495,20 +513,47 @@ impl TeamFolder {
         report.batch = store.import_batch(&incoming, checker)?;
         // Landed, refused or reported: never read again while its name, size and time hold.
         // A file still waiting for other operations is not, so it is read again next time.
-        for (key, stat) in read {
+        for (key, stat, peer, seq) in read {
             if store.sync_seen(&key)? {
-                store.mark_sync_seen(&stat)?;
+                if let Some(stat) = stat {
+                    store.mark_sync_seen(&stat)?;
+                }
+                if let Some(seq) = seq {
+                    store.raise_highest_seen(peer, seq)?;
+                }
+            }
+        }
+        // A replica's numbers only grow, and a compaction writes its new file under a higher
+        // number than every file it removes. Files this machine dealt with that are gone, with
+        // nothing numbered as high in their place, mean that replica's compacted file is still
+        // on its way: said on every pull until it arrives.
+        for (peer, now) in present {
+            if let Some(highest) = store.highest_seen(peer)?
+                && now.is_none_or(|n| n < highest)
+            {
+                report.missing.push(format!(
+                    "{}: files this machine had are gone and none numbered {highest} or higher \
+                     has arrived (a compacted file still syncing?)",
+                    peer_dir_name(peer)
+                ));
             }
         }
         Ok(report)
     }
 }
 
-/// A file as its name, size and modification time give it, if the time can be read. A file
-/// rewritten in place changes its size or time, and is then read again.
+/// A file as its name, size and modification time give it (and its inode on Unix, so a file
+/// replaced by a rename counts as new), if the time can be read. A write sets the time, so a file
+/// rewritten in place is read again. Only a rewrite that keeps the size and sets the time back, or
+/// lands within the file system's time resolution, is missed: nothing Rodu writes does that, since
+/// a replica never reuses a number, and a file a reader already dealt with holds nothing it lacks.
 fn file_key(shown: &str, meta: &fs::Metadata) -> Option<String> {
     let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(format!("{shown}/stat-{}-{}", meta.len(), modified.as_nanos()))
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(meta);
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some(format!("{shown}/stat-{}-{}-{inode}", meta.len(), modified.as_nanos()))
 }
 
 /// Reports a file over the size cap, once per size.

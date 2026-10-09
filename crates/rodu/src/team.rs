@@ -151,8 +151,9 @@ pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
 /// After a command in a team workspace: writes this machine's new changes to the folder.
 pub(crate) fn after(io: &mut Io<'_>, ws: &Workspace) {
     let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else { return };
-    if let Err(e) = team_folder(&ws.dir, team).and_then(|folder| folder.push(store)) {
-        warn(io, &format!("{} (your changes stay here and go out next time)", e.message));
+    match team_folder(&ws.dir, team).and_then(|folder| folder.push(store)) {
+        Ok(pushed) => pushed.warnings.iter().for_each(|line| warn(io, line)),
+        Err(e) => warn(io, &format!("{} (your changes stay here and go out next time)", e.message)),
     }
 }
 
@@ -167,6 +168,9 @@ pub(crate) fn after_reopen(io: &mut Io<'_>, via_agent: bool) {
 fn warn_report(io: &mut Io<'_>, report: &PullReport) {
     for line in report.damaged.iter().chain(&report.batch.refused) {
         warn(io, &format!("skipped {line}"));
+    }
+    for line in &report.missing {
+        warn(io, line);
     }
     for line in report.batch.notes.iter() {
         warn(io, line);
@@ -208,8 +212,10 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
     let numbered =
         if team.numbering { ws.service.assign_numbers(&user_actor(&ws.config))?.len() } else { 0 };
     let sent = match folder.push(store) {
-        Ok(Some(_)) => "sent your changes",
-        Ok(None) => "nothing new to send",
+        Ok(pushed) => {
+            pushed.warnings.iter().for_each(|line| warn(io, line));
+            if pushed.written.is_some() { "sent your changes" } else { "nothing new to send" }
+        }
         Err(e) => {
             warn(io, &format!("{} (your changes stay here and go out next time)", e.message));
             "could not send your changes"
