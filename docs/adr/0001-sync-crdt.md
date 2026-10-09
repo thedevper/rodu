@@ -248,7 +248,10 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   (its predecessor refused, or never written) is read and checked again on every command, with no
   limit yet; `rodu sync` lists such files. Held files count toward the import cap of each later
   check, so a replica that writes close to 64 MiB of files that never land can hold back what
-  others write until they are removed. A join that fails after its principal reached
+  others write until they are removed. A frame's length is not authenticated: a length past
+  what any sync file holds marks the file damaged, but one changed to a larger length still within
+  that bound cannot be told from a file still arriving, so it is listed as arriving for good (and
+  never imported). A join that fails after its principal reached
   the folder leaves that principal behind; joining again under the same name then shows `bob2`.
 
 ## Encrypted teams (built 2026-10-09)

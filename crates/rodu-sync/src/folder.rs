@@ -102,6 +102,10 @@ fn unframe_as<'a>(magic: &[u8; 12], bytes: &'a [u8]) -> Frame<'a> {
         return Frame::Damaged(kind);
     }
     let len = u64::from_le_bytes(bytes[12..20].try_into().expect("8 bytes"));
+    // A length no sync file can have would otherwise wait for bytes that never come.
+    if len > (MAX_IMPORT_BYTES + SEAL_OVERHEAD) as u64 {
+        return Frame::Damaged("its header claims more than a sync file holds");
+    }
     let payload = &bytes[HEADER..];
     match (payload.len() as u64).cmp(&len) {
         std::cmp::Ordering::Less => Frame::Incomplete,
@@ -483,6 +487,25 @@ mod tests {
         long.push(0);
         assert!(matches!(unframe(&long), Frame::Damaged(_)));
         assert!(matches!(unframe(b"hello world, not a frame at all"), Frame::Damaged(_)));
+    }
+
+    #[test]
+    fn a_header_claiming_more_than_any_sync_file_holds_is_damaged_not_arriving() {
+        // A changed length byte would otherwise leave a whole file "still arriving" for good.
+        for (magic, framed) in
+            [(MAGIC, frame(b"payload")), (SEALED_MAGIC, frame_as(SEALED_MAGIC, b"x"))]
+        {
+            let mut flipped = framed.clone();
+            flipped[MAGIC.len() + 7] ^= 0x80;
+            assert!(matches!(unframe_as(magic, &flipped), Frame::Damaged(_)));
+            let cap = (MAX_IMPORT_BYTES + SEAL_OVERHEAD) as u64;
+            let mut over = framed.clone();
+            over[MAGIC.len()..MAGIC.len() + 8].copy_from_slice(&(cap + 1).to_le_bytes());
+            assert!(matches!(unframe_as(magic, &over), Frame::Damaged(_)));
+            let mut at_cap = framed;
+            at_cap[MAGIC.len()..MAGIC.len() + 8].copy_from_slice(&cap.to_le_bytes());
+            assert_eq!(unframe_as(magic, &at_cap), Frame::Incomplete);
+        }
     }
 
     #[test]
