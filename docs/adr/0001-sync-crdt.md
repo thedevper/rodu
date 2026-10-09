@@ -285,8 +285,8 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   `rodu sync` syncs by hand. Giving neither `--encrypt` nor `--no-encrypt` is an error, so
   there is no silent default.
 - **Automatic sync.** In a team workspace `add`, `ls`, `show` and `mv` read the folder first and
-  write to it after; the numbering peer (the machine that created the team) numbers new cards in
-  between. `web` and `mcp` sync when they start and when they stop. A folder that cannot be read
+  write to it after; the numbering peer (the machine that created the team, until the role is
+  handed over) numbers new cards in between. `web` and `mcp` sync when they start and when they stop. A folder that cannot be read
   is a warning, and the command, `rodu sync` included, works on what the machine has.
 - **Live sync in `web` and `mcp` (built 2026-10-09, step 4c).** While they run, both servers
   keep syncing through a `LiveSync` seam in `rodu-core`, so `rodu-http` and `rodu-mcp` do not
@@ -306,8 +306,26 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
     teammate changed meanwhile is refused by its version, as before.
   - `rodu mcp` pulls before each tool call and pushes after it, so an agent reads teammates'
     latest changes and its own go out at once.
-- **Left for later steps.** 4c: the readable copy, and the command that hands numbering to
-  another machine. Live sync polls on a timer rather than watching the file system, and an open
+- **Handing over numbering (built 2026-10-10, step 4c).** The team document names the numbering
+  peer: a root map `team` holds `numbering_peer`, 16 lowercase hex digits. `rodu team create`
+  writes the creator's peer; anything else in that field, from a broken or hostile machine, counts
+  as no peer. After every pull (each command, `rodu sync`, and each tick of a running `web` or
+  `mcp`) a machine numbers cards only if the document names it, and records its role in its
+  config so the next command starts right. A team made before the document named one keeps the
+  config's choice: its creator names itself at its next sync.
+  - `rodu team take-numbering --yes` makes this machine the numbering peer, for when the one that
+    numbered is gone for good: it pulls, names itself, numbers waiting cards and pushes. Without
+    `--yes` it refuses, since two machines numbering at once give out the same numbers. `rodu team`
+    shows which machine numbers.
+  - The old machine, once it syncs, says once that numbering moved and makes provisional cards
+    from then on. Cards it numbered while offline after the hand-over can clash with the new
+    machine's: the clash rule above keeps the number on the card with the lowest id, and the new
+    numbering peer numbers the other again. So a real number can change once in that case, the
+    one exception to "a real number never changes", and only after a hand-over.
+  - Two machines taking over at once, or an old-format team's creator naming itself while a
+    take-over is still on its way, are settled by the document: one value wins on every replica,
+    and the other machine stops numbering when it syncs.
+- **Left for later steps.** 4c: the readable copy. Live sync polls on a timer rather than watching the file system, and an open
   item panel shows a teammate's change only when it is opened again. A file waiting on operations that never arrive
   (its predecessor refused, or never written) is read and checked again on every command, with no
   limit yet; `rodu sync` lists such files. Held files count toward the import cap of each later
@@ -384,7 +402,8 @@ provider cannot read the board.
    workspace, the *numbering peer*, gives out real numbers: when it imports a provisional card, it
    assigns the next number and writes it to the card. Two peers numbering at once would collide
    again without a server, so no other peer ever numbers. The numbering peer is the one that ran
-   `init`. A command can hand the role to another peer if that machine is gone for good. A real
+   `init`. A command can hand the role to another peer if that machine is gone for good (built:
+   `rodu team take-numbering`, under "The team folder"). A real
    number never changes once given, and the provisional key keeps resolving to the card as an
    alias, so links written before the sync still work. Rejected: renumbering the later card after
    a merge, because then a key someone has already shared can point to another card.
@@ -433,9 +452,8 @@ provider cannot read the board.
    ships Loro without its notices.
 2. Design provisional keys and the numbering peer in the core model. This includes the alias
    lookup and the hand-over command. It also covers a single-user workspace, where the numbering
-   peer is the only peer and every card is numbered immediately, as today. Done except the
-   hand-over command and the setting that turns numbering off, which need `rodu team join`
-   (step 4): `Item.number` is optional, `RoduService::with_numbering` and `assign_numbers` exist,
+   peer is the only peer and every card is numbered immediately, as today. Done, the hand-over
+   command in step 4c: `Item.number` is optional, `RoduService::with_numbering` and `assign_numbers` exist,
    and SQLite schema 2 migrates schema 1 workspaces in place.
 3. Build a Loro-backed store implementing `Store`, keeping the SQLite index in sync from the
    document's change events, and run the existing service tests against it. Done: `LoroStore`
@@ -447,8 +465,8 @@ provider cannot read the board.
    half-written files. Split in three: 4a (transport, team commands, automatic sync) and 4b
    (encryption) are done, described under "The team folder" and "Encrypted teams" above; 4c
    adds the readable copy, live watching in `web` and `mcp`, compaction and the numbering
-   hand-over. Compaction is done, with the `stat` skip, and so is live sync in `web` and `mcp`,
-   both under "The team folder".
+   hand-over. Compaction is done, with the `stat` skip, and so are live sync in `web` and `mcp`
+   and the numbering hand-over, all under "The team folder". The readable copy is left.
 5. Later: `rodu relay` for live sync.
 6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.
