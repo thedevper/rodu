@@ -215,7 +215,11 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   remembered as done only once every operation in it is in the log: Loro keeps operations whose
   predecessors have not arrived pending in memory, and a saved document leaves them out, so such
   a file is read again each time until they land. Each check replays the files still pending
-  first, so the child applies their operations exactly when this process does. A file found invalid or damaged is remembered
+  first, so the child applies their operations exactly when this process does. When such a check
+  fails, the new file is checked without them: if it passes, the held file that breaks once it
+  is released is refused, and the rest of the batch waits for the next one, which starts from
+  the saved document. After any import that leaves operations pending, the next one starts from
+  the saved document too, so pending operations never reach a later import unchecked. A file found invalid or damaged is remembered
   and reported once; one the child could not finish (a crash or timeout) is tried again next
   time. File names are escaped before they are shown.
 - **Writing.** Under the workspace write lock, a replica exports its own operations from the
@@ -239,7 +243,9 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   folder while they run, compaction (today every command reads every file in the folder), and the
   command that hands numbering to another machine. A file waiting on operations that never arrive
   (its predecessor refused, or never written) is read and checked again on every command, with no
-  limit yet; `rodu sync` lists such files. A join that fails after its principal reached
+  limit yet; `rodu sync` lists such files. Held files count toward the import cap of each later
+  check, so a replica that writes close to 64 MiB of files that never land can hold back what
+  others write until they are removed. A join that fails after its principal reached
   the folder leaves that principal behind; joining again under the same name then shows `bob2`.
 
 ## Proposed design for the open problems
