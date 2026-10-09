@@ -189,6 +189,35 @@ impl SqliteStore {
         Ok(items.into_iter().map(|i| (i.id.clone(), i)).collect())
     }
 
+    /// Every cycle, comment and link, for building a document from a plain workspace.
+    pub fn all_cycles(&self) -> Result<Vec<Cycle>> {
+        self.all("SELECT * FROM cycles ORDER BY id", [], crate::to_cycle)
+    }
+
+    pub fn all_comments(&self) -> Result<Vec<Comment>> {
+        self.all("SELECT * FROM comments ORDER BY id", [], crate::to_comment)
+    }
+
+    pub fn all_links(&self) -> Result<Vec<Link>> {
+        self.all("SELECT * FROM links ORDER BY id", [], crate::to_link)
+    }
+
+    /// Creates the table of sync files this replica has dealt with (imported or refused).
+    pub fn ensure_sync_seen(&self) -> Result<()> {
+        self.conn
+            .execute_batch("CREATE TABLE IF NOT EXISTS sync_seen (key TEXT PRIMARY KEY)")
+            .map_err(db)
+    }
+
+    pub fn is_sync_seen(&self, key: &str) -> Result<bool> {
+        Ok(self.optional_text("SELECT key FROM sync_seen WHERE key = ?", [key])?.is_some())
+    }
+
+    pub fn mark_sync_seen(&self, key: &str) -> Result<()> {
+        self.run("INSERT OR IGNORE INTO sync_seen (key) VALUES (?)", [key])?;
+        Ok(())
+    }
+
     /// Lets the next number in each collection follow its highest number, so a replica that takes
     /// over numbering never reuses one.
     pub fn raise_next_numbers(&self) -> Result<()> {
