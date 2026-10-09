@@ -50,15 +50,19 @@ iCloud Drive or Syncthing). Rodu only reads and writes files there; the folder's
 them between machines.
 
 ```sh
-rodu team create --folder ~/Drive/our-board --no-encrypt   # prints an invite code
-# on a teammate's machine, with the same folder synced:
-rodu team join rodu1-... --folder ~/Drive/our-board --name bob
+rodu team create --folder ~/Drive/our-board --encrypt   # prints an invite code
+# on a teammate's machine, with the same folder synced; paste the code when asked:
+rodu team join - --folder ~/Drive/our-board --name bob
 ```
 
 After that every command syncs by itself, and `rodu sync` does it by hand. New cards made on a
 teammate's machine get a key such as `DEMO-KQMRTZ` until the machine that created the team
-gives them their number; the old key keeps working. The sync files are not encrypted yet, so
-anyone with access to the folder can read the board.
+gives them their number; the old key keeps working.
+
+With `--encrypt`, every file in the folder is sealed with a team key, so the folder's provider
+cannot read the board. The invite code holds that key: share it like a password, and see it
+again with `rodu team --show-invite`. Anyone with the code and the folder can read and change
+the board. With `--no-encrypt`, anyone with access to the folder can read it.
 
 ## Use it from an agent (MCP)
 

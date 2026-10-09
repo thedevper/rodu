@@ -6,6 +6,7 @@ use std::time::Duration;
 use loro::LoroDoc;
 use rodu_core::{Actor, PrincipalKind, RoduService, Store};
 use rodu_sync::folder::{Frame, TeamFolder, frame, unframe};
+use rodu_sync::seal::TeamKey;
 use rodu_sync::{Checker, LoroStore, Replica, run_check};
 use serde_json::json;
 use tempfile::TempDir;
@@ -611,4 +612,132 @@ fn two_processes_pushing_from_one_workspace_never_share_a_file() {
     assert_eq!(files_of(&folder, a.store().peer()).len(), 7);
     let b = join(&folder, "bob");
     assert_eq!(b.titles().len(), 7);
+}
+
+// --- encrypted teams ----------------------------------------------------------------------------
+
+const KEY: &str = "5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1ed5ea1";
+
+fn sealed_at(root: &std::path::Path, key: &str) -> TeamFolder {
+    TeamFolder::sealed(root.join("Shared/Team"), TeamKey::from_hex(key).unwrap())
+}
+
+/// Every byte of every file in the folder.
+fn folder_bytes(folder: &TeamFolder) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut stack = vec![folder.root().to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                all.extend(std::fs::read(path).unwrap());
+            }
+        }
+    }
+    all
+}
+
+#[test]
+fn an_encrypted_team_syncs_and_its_folder_never_holds_a_title() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = sealed_at(root.path(), KEY);
+    let a = first(&folder);
+    let b = join(&sealed_at(root.path(), KEY), "bob");
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Secret plan" })], None).unwrap();
+    b.sync(&sealed_at(root.path(), KEY));
+    a.sync(&folder);
+    assert!(a.titles().contains(&"Secret plan".to_owned()));
+    assert!(b.titles().contains(&"Made alone".to_owned()));
+    let bytes = folder_bytes(&folder);
+    for title in ["Secret plan", "Made alone", "bob", "DEMO"] {
+        assert!(
+            !bytes.windows(title.len()).any(|w| w == title.as_bytes()),
+            "{title} in the folder"
+        );
+    }
+    let info = folder.info().unwrap();
+    assert_eq!((info.format, info.encryption.as_deref()), (2, Some("xchacha20poly1305")));
+}
+
+#[test]
+fn sealed_files_that_were_changed_moved_or_made_elsewhere_are_refused_once() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = sealed_at(root.path(), KEY);
+    let a = first(&folder);
+    let b = join(&sealed_at(root.path(), KEY), "bob");
+    a.sync(&folder);
+    let b_folder = sealed_at(root.path(), KEY);
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Kept" })], None).unwrap();
+    let good = b_folder.push(b.store()).unwrap().unwrap();
+    let b_dir = good.parent().unwrap().to_path_buf();
+
+    // One bit changed after sealing, with the outer hash fixed up so only the seal catches it.
+    let whole = std::fs::read(&good).unwrap();
+    let Frame::Complete(_) = unframe_sealed(&whole) else { panic!() };
+    let mut body = whole[52..].to_vec();
+    *body.last_mut().unwrap() ^= 1;
+    std::fs::write(b_dir.join("0000000050.update"), reframe_sealed(&body)).unwrap();
+    // bob's file copied into cat's folder: sealed for another writer.
+    let c = join(&sealed_at(root.path(), KEY), "cat");
+    let c_dir = folder.root().join("sync").join(format!("{:016x}", c.store().peer()));
+    std::fs::copy(&good, c_dir.join("0000000051.update")).unwrap();
+    // A file of another team, sealed with another key.
+    let other = tempfile::tempdir().unwrap();
+    let elsewhere = sealed_at(other.path(), &"0f".repeat(32));
+    let stranger = first(&elsewhere);
+    let theirs = files_of(&elsewhere, stranger.store().peer()).pop().unwrap();
+    std::fs::copy(theirs, b_dir.join("0000000052.update")).unwrap();
+    // And a plain file.
+    std::fs::write(b_dir.join("0000000053.update"), frame(b"whatever")).unwrap();
+
+    let report = a.sync(&folder);
+    assert_eq!(report.damaged.len(), 4, "{report:?}");
+    assert!(report.damaged.iter().filter(|d| d.contains("team key")).count() == 3, "{report:?}");
+    assert!(a.titles().contains(&"Kept".to_owned()), "the good file still lands");
+    assert!(a.sync(&folder).damaged.is_empty(), "each is reported once");
+}
+
+fn unframe_sealed(bytes: &[u8]) -> Frame<'_> {
+    assert_eq!(&bytes[..12], b"RODU-SEALED1");
+    let mut plain_magic = bytes.to_vec();
+    plain_magic[..12].copy_from_slice(b"RODU-UPDATE1");
+    match unframe(&plain_magic) {
+        Frame::Complete(_) => Frame::Complete(&bytes[52..]),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn reframe_sealed(body: &[u8]) -> Vec<u8> {
+    let mut framed = frame(body);
+    framed[..12].copy_from_slice(b"RODU-SEALED1");
+    framed
+}
+
+#[test]
+fn a_folder_of_the_other_kind_or_key_is_never_synced() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = sealed_at(root.path(), KEY);
+    let a = first(&folder);
+    let before = folder_bytes(&folder).len();
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "Not out" })], None).unwrap();
+    // This workspace syncs plain files: an encrypted folder is refused.
+    let plain = TeamFolder::new(folder.root());
+    assert!(plain.push(a.store()).unwrap_err().message.contains("no key"));
+    assert!(plain.pull(a.store(), &checker()).is_err());
+    // Another key.
+    let wrong = sealed_at(root.path(), &"0f".repeat(32));
+    assert!(wrong.push(a.store()).unwrap_err().message.contains("another key"));
+    assert_eq!(folder_bytes(&folder).len(), before, "nothing was written");
+
+    // A plain folder, or one whose team file was turned back to plain, is never written in plain
+    // by an encrypted workspace.
+    let team_file = folder.root().join("rodu-team.json");
+    let info = folder.info().unwrap();
+    std::fs::write(&team_file, format!(r#"{{"format":1,"workspaceId":"{}"}}"#, info.workspace_id))
+        .unwrap();
+    let files = files_of(&folder, a.store().peer()).len();
+    assert!(folder.push(a.store()).unwrap_err().message.contains("not encrypted"));
+    assert_eq!(files_of(&folder, a.store().peer()).len(), files, "no plain file was written");
 }
