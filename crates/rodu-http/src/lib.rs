@@ -55,6 +55,8 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
 pub struct WebServerOptions<S: Store> {
     pub service: RoduService<S>,
     pub actor: Actor,
+    /// Live sync while the server runs, such as with a team folder.
+    pub live: Option<LiveOptions<S>>,
     /// 0 picks a free port.
     pub port: u16,
     /// Built web UI on disk to serve at /.
@@ -64,8 +66,6 @@ pub struct WebServerOptions<S: Store> {
     pub files: Option<HashMap<String, Bytes>>,
     /// Fixed token for tests; a random one is generated otherwise.
     pub token: Option<String>,
-    /// Live sync while the server runs, such as with a team folder.
-    pub live: Option<LiveOptions<S>>,
 }
 
 /// How a server syncs while it runs: a pull and a push every `every`, and a push after each write.
