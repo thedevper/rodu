@@ -133,6 +133,47 @@ Loro:
 3. Run `cargo audit` in CI, with each accepted advisory listed in `.cargo/audit.toml` with its reason,
    so any new advisory on a shipped crate fails the next build.
 
+## The Loro store (built 2026-10-09)
+
+`rodu_sync::LoroStore` implements `Store` over a workspace directory. The same service test suite
+runs against it and against `SqliteStore`.
+
+- **Layout.** Cards are nodes of a Loro `Tree` (`items`), their fields in the node's map and their
+  parent the tree parent. Principals, collections, cycles and comments are maps from id to a
+  mergeable map, so two machines writing one entity merge field by field. Links are keyed by a
+  hash of what they connect, so the same link made twice is one; a key ends up in a Loro container
+  name, which must not contain `/`, and only ids and these hashes are ever used as keys.
+- **Local only.** Events (the audit trail), idempotency records and the number counter stay in each
+  replica's `rodu.db`. A card's `version` is local too (decision 4 above). Syncing every event
+  would make the document grow with every edit forever.
+- **Files.** `rodu.loro` holds the document; `rodu.db` is the index plus the local data, and
+  records the SHA-256 of the document file it matches. A write saves the new document as
+  `rodu.loro.next` and puts its hash in the index in the same SQLite transaction, then renames
+  it into place after the commit. Whoever next takes the write lock finishes or discards a
+  leftover `.next` by its hash, so a transaction that failed never changes the document and one
+  that committed is never lost. If the index does not match the document on open, or `rodu.db`
+  is gone, the index is rebuilt from the document.
+- **One machine, several processes.** SQLite's write lock is the lock on the document: each write
+  transaction first reloads the document if another process changed it, so no process writes
+  operations from a stale copy under the replica's peer id.
+- **Import.** `import_untrusted` replays the import in a child process first (as `Replica` does),
+  then updates the index for exactly the entities in the document's diff. Every entity read from
+  the document is validated; a bad one is left out and reported, and a reference the index cannot
+  hold (an unknown assignee, cycle or parent) is cleared and reported. Indexing never fails on
+  what a teammate's machine wrote.
+- **Clashes after a merge.** When two collections share a key, two principals a name, two cycles a
+  name in one collection, two cards a number in one collection, or two cards a key, the one with
+  the lowest id (the first made) keeps it. The others are shown as `OPS2`, `ann2`, `Sprint 1 (2)`,
+  or for a card its provisional key or id, each taking the first candidate nothing holds yet. A
+  card that lost its number counts as unnumbered, so the numbering peer gives it the next number.
+  The result depends only on what the document holds, so every replica shows the same, and a
+  rebuilt index equals the one kept up to date import by import (tested with three replicas doing
+  random work). Each clash is reported, for the "needs attention" view.
+- **Measured** at 20,000 cards, release build on an M-series Mac: the document file is 5.7 MB, one
+  card edit through the service (index row and snapshot saved) takes 25 ms, opening the store
+  86 ms, and a full index rebuild 0.7 s. Saving a whole snapshot per write is the simple choice for now; step
+  4's update files will let a write append instead.
+
 ## Proposed design for the open problems
 
 1. **Card numbers (decided 2026-10-09: provisional keys).** A new card gets a provisional key
@@ -197,7 +238,9 @@ Loro:
    (step 4): `Item.number` is optional, `RoduService::with_numbering` and `assign_numbers` exist,
    and SQLite schema 2 migrates schema 1 workspaces in place.
 3. Build a Loro-backed store implementing `Store`, keeping the SQLite index in sync from the
-   document's change events, and run the existing service tests against it.
+   document's change events, and run the existing service tests against it. Done: `LoroStore`
+   in `rodu-sync`, described under "The Loro store" above. The CLI still opens plain workspaces
+   with `SqliteStore`; step 4 opens team workspaces with `LoroStore`.
 4. Shared-folder transport with automatic sync, `rodu team create` and `rodu team join`, and
    the encryption and readable-copy options. Test it with two and three workspaces on one folder
    in CI on macOS and Windows, including a folder app's conflict copies (`file (1).update`) and
