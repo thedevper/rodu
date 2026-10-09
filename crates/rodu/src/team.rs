@@ -126,7 +126,7 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
     (io.out)(&format!(
         "Imported {} file(s), {} still arriving; numbered {numbered} card(s); {sent}",
         report.batch.imported.len(),
-        report.incomplete.len(),
+        report.incomplete.len() + report.batch.waiting.len(),
     ));
     Ok(())
 }

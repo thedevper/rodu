@@ -99,6 +99,9 @@ pub struct BatchReport {
     pub imported: Vec<String>,
     /// Files not imported, and why.
     pub refused: Vec<String>,
+    /// Keys of files imported but holding operations that wait for another replica's earlier
+    /// ones: read again next time, until every operation in them has landed.
+    pub waiting: Vec<String>,
     pub index: IndexReport,
 }
 
@@ -391,24 +394,26 @@ impl LoroStore {
             let touched = {
                 let doc = self.doc.borrow();
                 let before = doc.oplog_frontiers();
-                let import = |file: &Incoming, report: &mut BatchReport| -> Result<()> {
+                let mut landed: Vec<&Incoming> = Vec::new();
+                let import = |bytes: &[u8]| -> Result<()> {
                     self.dirty.set(true);
-                    doc.import(&file.bytes).map_err(internal)?;
-                    self.sql.mark_sync_seen(&file.key)?;
-                    report.imported.push(file.key.clone());
-                    Ok(())
+                    doc.import(bytes).map(drop).map_err(internal)
                 };
                 for group in groups.into_iter().filter(|g| !g.is_empty()) {
                     let all: Vec<Untrusted<'_>> = group.iter().map(|f| untrusted(f)).collect();
                     if check_import(&doc, &all, checker).is_ok() {
                         for file in group {
-                            import(file, &mut report)?;
+                            import(&file.bytes)?;
+                            landed.push(file);
                         }
                         continue;
                     }
                     for file in group {
                         match check_import(&doc, &[untrusted(file)], checker) {
-                            Ok(()) => import(file, &mut report)?,
+                            Ok(()) => {
+                                import(&file.bytes)?;
+                                landed.push(file);
+                            }
                             Err(e) => {
                                 if matches!(e, SyncError::InvalidData(_)) {
                                     self.sql.mark_sync_seen(&file.key)?;
@@ -418,7 +423,23 @@ impl LoroStore {
                         }
                     }
                 }
-                if report.imported.is_empty() {
+                // Loro keeps operations whose causal predecessors have not arrived (another
+                // replica's file still syncing, or read later in this batch) pending in memory,
+                // and a saved document leaves them out. A file is done with only once all of its
+                // operations are in the log; until then it is read again each time.
+                let have = doc.oplog_vv();
+                for file in landed {
+                    let end = LoroDoc::decode_import_blob_meta(&file.bytes, false)
+                        .map_err(internal)?
+                        .partial_end_vv;
+                    if have.includes_vv(&end) {
+                        self.sql.mark_sync_seen(&file.key)?;
+                        report.imported.push(file.key.clone());
+                    } else {
+                        report.waiting.push(file.key.clone());
+                    }
+                }
+                if doc.oplog_frontiers() == before {
                     return Ok(report);
                 }
                 touched(&doc, &before, &doc.oplog_frontiers())?
