@@ -98,7 +98,8 @@ const ORDER_FIELDS: &[(&str, &str)] = &[
     ("updated", "i.updated_at"),
     ("due", "i.due_at"),
     ("estimate", "i.estimate"),
-    ("key", "i.collection_id, i.number"),
+    // Numbered cards by number, then cards still waiting for one, oldest first.
+    ("key", "i.collection_id, i.number IS NULL, i.number, i.id"),
     ("rank", "i.rank"),
     ("title", "i.title COLLATE NOCASE"),
     ("status", "i.status COLLATE NOCASE"),
@@ -262,6 +263,13 @@ impl Compiler<'_> {
             ));
         }
         let rhs = self.value(spec, value)?;
+        if spec.column == "i.key" && matches!(op, CompareOp::Eq | CompareOp::Ne) {
+            // A card answers to its key and to the provisional key it had before it was numbered.
+            let either = format!("(i.key = {0} OR i.provisional_key IS {0})", rhs.sql);
+            let params = [rhs.params.clone(), rhs.params].concat();
+            let sql = if op == CompareOp::Ne { format!("NOT {either}") } else { either };
+            return Ok(Fragment::new(sql, params));
+        }
         let column = if spec.kind == Kind::Status {
             format!("{} COLLATE NOCASE", spec.column)
         } else {
@@ -288,6 +296,14 @@ impl Compiler<'_> {
             params.extend(part.params);
         }
         let list = list.join(", ");
+        if spec.column == "i.key" {
+            let either = format!(
+                "(i.key IN ({list}) OR (i.provisional_key IS NOT NULL AND i.provisional_key IN ({list})))"
+            );
+            let params = [params.clone(), params].concat();
+            let sql = if negated { format!("NOT {either}") } else { either };
+            return Ok(Fragment::new(sql, params));
+        }
         let column = if spec.kind == Kind::Status {
             format!("{} COLLATE NOCASE", spec.column)
         } else {
@@ -383,8 +399,12 @@ impl Compiler<'_> {
                 vec![text(literal.clone()), text(literal)],
             ),
             RefKind::Item => Fragment::new(
-                "(SELECT p.id FROM items p WHERE p.id = ? OR p.key = ?)",
-                vec![text(literal.clone()), text(literal.to_uppercase())],
+                "(SELECT p.id FROM items p WHERE p.id = ? OR p.key = ? OR p.provisional_key = ?)",
+                vec![
+                    text(literal.clone()),
+                    text(literal.to_uppercase()),
+                    text(literal.to_uppercase()),
+                ],
             ),
         })
     }

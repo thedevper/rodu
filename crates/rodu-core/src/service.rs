@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::clock::{Clock, iso, system_clock, unix_ms};
 use crate::error::{Result, RoduError};
 use crate::format::{ContextParts, format_context, links_to_item};
-use crate::ids::{format_key, is_uuid, uuidv7};
+use crate::ids::{format_key, free_provisional_key, is_uuid, uuidv7};
 use crate::input::{ItemPatch, NewItem, check_name, parse_date, parse_new_item, parse_patch};
 use crate::model::{
     Actor, Category, Collection, Comment, Cycle, CycleState, Event, Item, Link, LinkKind,
@@ -90,15 +90,24 @@ pub struct RoduService<S: Store> {
     pub store: S,
     pub max_batch: usize,
     clock: Clock,
+    /// Whether this machine hands out card numbers. In a team only the numbering peer does; the
+    /// others create cards with provisional keys until it numbers them.
+    numbering: bool,
 }
 
 impl<S: Store> RoduService<S> {
     pub fn new(store: S) -> Self {
-        Self { store, max_batch: DEFAULT_MAX_BATCH, clock: system_clock() }
+        Self::with_clock(store, system_clock())
     }
 
     pub fn with_clock(store: S, clock: Clock) -> Self {
-        Self { store, max_batch: DEFAULT_MAX_BATCH, clock }
+        Self { store, max_batch: DEFAULT_MAX_BATCH, clock, numbering: true }
+    }
+
+    /// Turns numbering on (the default) or off for this service.
+    pub fn with_numbering(mut self, on: bool) -> Self {
+        self.numbering = on;
+        self
     }
 
     pub fn now(&self) -> time::OffsetDateTime {
@@ -509,14 +518,25 @@ impl<S: Store> RoduService<S> {
             let mut rank = self.store.last_rank(&collection.id)?;
             for input in &parsed {
                 let now = self.timestamp();
-                let number = self.store.next_item_number(&collection.id)?;
+                let id = self.new_id();
+                let (number, key, provisional_key) = if self.numbering {
+                    let number = self.store.next_item_number(&collection.id)?;
+                    (Some(number), format_key(&collection.key, number), None)
+                } else {
+                    let key = free_provisional_key(&collection.key, &id, |k| {
+                        Ok::<_, RoduError>(self.store.get_item_by_key(k)?.is_some())
+                    })?
+                    .ok_or_else(|| RoduError::conflict("No free provisional key"))?;
+                    (None, key.clone(), Some(key))
+                };
                 let next_rank = rank_between(rank.as_deref(), None)?;
                 rank = Some(next_rank.clone());
                 let item = Item {
-                    id: self.new_id(),
+                    id,
                     collection_id: collection.id.clone(),
                     number,
-                    key: format_key(&collection.key, number),
+                    key,
+                    provisional_key,
                     item_type: input.item_type,
                     title: input.title.clone(),
                     body: input.body.clone(),
@@ -560,6 +580,45 @@ impl<S: Store> RoduService<S> {
                 )?;
             }
             Ok(created)
+        })
+    }
+
+    /// Gives every card that has only a provisional key its number, per collection in creation
+    /// order, in one transaction. Only the numbering peer may do this, so numbers stay unique.
+    pub fn assign_numbers(&self, actor: &Actor) -> Result<Vec<Item>> {
+        if !self.numbering {
+            return Err(RoduError::conflict("This machine does not hand out card numbers")
+                .with_hint("The team's numbering peer numbers new cards when it syncs"));
+        }
+        let request = self.new_id();
+        self.store.transaction(TxMode::Write, || {
+            let mut numbered = Vec::new();
+            for collection in self.store.list_collections()? {
+                for item in self.store.list_unnumbered_items(&collection.id)? {
+                    let number = self.store.next_item_number(&collection.id)?;
+                    let mut next = item.clone();
+                    next.number = Some(number);
+                    next.key = format_key(&collection.key, number);
+                    next.updated_at = self.timestamp();
+                    next.version = item.version + 1;
+                    if !self.store.save_item(&next, item.version)? {
+                        return Err(RoduError::conflict(format!(
+                            "{} was changed by someone else",
+                            item.key
+                        )));
+                    }
+                    self.record(
+                        &request,
+                        actor,
+                        "item.number",
+                        &item.id,
+                        to_json(&item),
+                        to_json(&next),
+                    )?;
+                    numbered.push(next);
+                }
+            }
+            Ok(numbered)
         })
     }
 
