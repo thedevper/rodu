@@ -782,3 +782,175 @@ fn a_planted_high_sequence_number_never_stops_pushes() {
     a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "Stuck" })], None).unwrap();
     assert!(folder.push(a.store()).unwrap_err().message.contains("past any sequence"));
 }
+
+// --- compaction ---------------------------------------------------------------------------------
+
+/// The numbered files of a replica's own folder, by number.
+fn numbered(folder: &TeamFolder, peer: u64) -> Vec<std::path::PathBuf> {
+    files_of(folder, peer)
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            name.strip_suffix(".update").is_some_and(|d| d.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect()
+}
+
+/// `count` cards from `m`, each written as its own file.
+fn write_each(m: &Machine, folder: &TeamFolder, prefix: &str, count: usize) {
+    for n in 0..count {
+        m.svc
+            .create_items(&m.me, "DEMO", &[json!({ "title": format!("{prefix}{n}") })], None)
+            .unwrap();
+        folder.push(m.store()).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pull_does_not_read_files_it_already_has() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    write_each(&b, &folder, "B", 3);
+    a.sync(&folder);
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with('B')).count(), 3);
+    let bobs = numbered(&folder, b.store().peer());
+    for path in &bobs {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let again = folder.pull(a.store(), &checker());
+    for path in &bobs {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let again = again.expect("a landed file is not opened again");
+    assert!(again.damaged.is_empty() && again.batch.imported.is_empty(), "{again:?}");
+}
+
+#[test]
+fn a_replica_compacts_its_own_files_and_nobody_loses_a_card() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let b_peer = b.store().peer();
+    write_each(&b, &folder, "Early", 10);
+    a.sync(&folder);
+    // A folder app's conflict copy in bob's folder, and ann's own files, are not bob's to remove.
+    let early = numbered(&folder, b_peer)[1].clone();
+    let copy = early.with_file_name("0000000002 (1).update");
+    std::fs::copy(&early, &copy).unwrap();
+    let anns = files_of(&folder, a.store().peer());
+    write_each(&b, &folder, "Late", 30);
+
+    let left = numbered(&folder, b_peer);
+    assert!(left.len() < 32, "{} numbered files left", left.len());
+    assert!(copy.exists(), "the conflict copy survives");
+    assert_eq!(files_of(&folder, a.store().peer()), anns, "ann's files are untouched");
+
+    // ann had the early files: the compacted one brings nothing new and nothing to report.
+    let report = a.sync(&folder);
+    assert!(report.batch.refused.is_empty() && report.damaged.is_empty(), "{report:?}");
+    let bobs_cards = |m: &Machine| {
+        m.titles().into_iter().filter(|t| t.starts_with("Early") || t.starts_with("Late")).count()
+    };
+    assert_eq!(bobs_cards(&a), 40);
+    // A teammate who joins now gets every card from far fewer files.
+    let c = join(&folder, "cat");
+    assert_eq!(bobs_cards(&c), 40);
+    assert!(c.titles().contains(&"Made alone".to_owned()));
+}
+
+#[test]
+fn removals_that_arrive_before_the_compacted_file_only_make_a_reader_wait() {
+    let (root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let b_peer = b.store().peer();
+    write_each(&b, &folder, "Card", 40);
+    assert!(numbered(&folder, b_peer).len() < 32, "bob compacted");
+    let compacted = numbered(&folder, b_peer)
+        .into_iter()
+        .max_by_key(|p| std::fs::metadata(p).unwrap().len())
+        .expect("the compacted file");
+    write_each(&b, &folder, "After", 1);
+    // A teammate's folder app has applied the removals but not yet brought the compacted file.
+    let hidden = compacted.with_file_name(".in-transit");
+    std::fs::rename(&compacted, &hidden).unwrap();
+    let c_dir = tempfile::tempdir().unwrap();
+    let c = RoduService::new(LoroStore::open(c_dir.path()).unwrap()).with_numbering(false);
+    let report = folder.pull(&c.store, &checker()).unwrap();
+    assert!(!report.batch.waiting.is_empty(), "bob's later file waits: {report:?}");
+    assert!(report.batch.refused.is_empty() && report.damaged.is_empty(), "{report:?}");
+
+    std::fs::rename(&hidden, &compacted).unwrap();
+    let report = folder.pull(&c.store, &checker()).unwrap();
+    assert!(report.batch.waiting.is_empty(), "{report:?}");
+    let me = a.me.clone();
+    let titles: Vec<String> =
+        c.search(&me, "", Some(100), None).unwrap().items.into_iter().map(|i| i.title).collect();
+    assert_eq!(titles.iter().filter(|t| t.starts_with("Card")).count(), 40);
+    assert!(titles.contains(&"After0".to_owned()));
+    drop(root);
+}
+
+#[test]
+fn old_files_left_by_a_compaction_that_stopped_are_harmless_and_removed_later() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let b_peer = b.store().peer();
+    write_each(&b, &folder, "Card", 20);
+    a.sync(&folder);
+    let saved: Vec<(std::path::PathBuf, Vec<u8>)> = numbered(&folder, b_peer)
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    write_each(&b, &folder, "More", 20);
+    // As if the compaction stopped after writing its file: the old files are back.
+    for (path, bytes) in &saved {
+        if !path.exists() {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+    let report = a.sync(&folder);
+    assert!(report.batch.refused.is_empty() && report.damaged.is_empty(), "{report:?}");
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with("More")).count(), 20);
+    // The next compaction removes them.
+    write_each(&b, &folder, "Last", 40);
+    assert!(saved.iter().all(|(path, _)| !path.exists()), "old files removed");
+    assert!(numbered(&folder, b_peer).len() < 32);
+    a.sync(&folder);
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with("Last")).count(), 40);
+}
+
+#[test]
+fn a_replica_does_not_compact_past_the_import_cap() {
+    let (_root, folder) = team();
+    let b_folder = TeamFolder::new(folder.root()).compacting(4, 1);
+    let _a = first(&folder);
+    let b = join(&b_folder, "bob");
+    write_each(&b, &b_folder, "Card", 8);
+    // Every file is still there: one holding everything would be over the (lowered) cap.
+    assert_eq!(numbered(&b_folder, b.store().peer()).len(), 9);
+}
+
+#[test]
+fn an_encrypted_team_compacts_into_a_sealed_file() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = sealed_at(root.path(), KEY);
+    let a = first(&folder);
+    let b_folder = sealed_at(root.path(), KEY);
+    let b = join(&b_folder, "bob");
+    write_each(&b, &b_folder, "Secret", 40);
+    assert!(numbered(&folder, b.store().peer()).len() < 32);
+    let c = join(&sealed_at(root.path(), KEY), "cat");
+    assert_eq!(c.titles().iter().filter(|t| t.starts_with("Secret")).count(), 40);
+    a.sync(&folder);
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with("Secret")).count(), 40);
+    let bytes = folder_bytes(&folder);
+    assert!(!bytes.windows(6).any(|w| w == b"Secret"), "the compacted file is sealed");
+}

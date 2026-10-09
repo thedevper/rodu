@@ -55,6 +55,8 @@ const META_DOC: &str = "doc_sha256";
 const META_PEER: &str = "peer";
 /// This replica's own operation counter up to which [`LoroStore::export_own`] has exported.
 const META_EXPORTED: &str = "exported_counter";
+/// The number of the sync file this replica last compacted its own files into.
+const META_COMPACTED: &str = "compacted_file";
 /// How many entities the index holds differently from the document until something else arrives:
 /// a reference cleared or an entity left out because what it points to is missing, or a card that
 /// lost its number or key. While above zero, every import rebuilds the whole index.
@@ -601,6 +603,32 @@ impl LoroStore {
             write(&bytes)?;
             self.sql.set_index_meta(META_EXPORTED, &to.to_string())?;
             Ok(true)
+        })
+    }
+
+    /// Runs `compact` under the write lock with the number of the file this replica last
+    /// compacted into, if any, and a way to export every operation of its own published so far
+    /// (counter 0 up to where [`Self::export_own`] reached). The number `compact` returns is
+    /// recorded as the new last one.
+    pub fn compact_own(
+        &self,
+        compact: impl FnOnce(Option<u64>, &dyn Fn() -> Result<Vec<u8>>) -> Result<Option<u64>>,
+    ) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            let last = self.sql.index_meta(META_COMPACTED)?.and_then(|n| n.parse().ok());
+            let export = || -> Result<Vec<u8>> {
+                let peer = self.peer.get();
+                let to: Counter =
+                    self.sql.index_meta(META_EXPORTED)?.and_then(|n| n.parse().ok()).unwrap_or(0);
+                self.doc
+                    .borrow()
+                    .export(ExportMode::updates_in_range(vec![IdSpan::new(peer, 0, to)]))
+                    .map_err(internal)
+            };
+            if let Some(done) = compact(last, &export)? {
+                self.sql.set_index_meta(META_COMPACTED, &done.to_string())?;
+            }
+            Ok(())
         })
     }
 
