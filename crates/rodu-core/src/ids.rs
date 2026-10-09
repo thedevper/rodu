@@ -1,11 +1,18 @@
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use regex::Regex;
-use uuid::{NoContext, Timestamp, Uuid};
+use uuid::{ContextV7, Timestamp, Uuid};
 
-/// RFC 9562 UUIDv7: time-ordered, so ids sort by creation time across peers.
+/// Keeps ids made in one millisecond in the order they were made (a counter in the bits after the
+/// time), so the oldest-wins rules hold within a batch too.
+static ID_CONTEXT: Mutex<ContextV7> = Mutex::new(ContextV7::new());
+
+/// RFC 9562 UUIDv7: time-ordered, so ids sort by creation time across peers, and within this
+/// process by creation order. The last 32 bits stay random, so a provisional key built from them
+/// stays unpredictable.
 pub fn uuidv7(unix_ms: u64) -> String {
-    let ts = Timestamp::from_unix(NoContext, unix_ms / 1000, ((unix_ms % 1000) * 1_000_000) as u32);
+    let context = ID_CONTEXT.lock().unwrap_or_else(PoisonError::into_inner);
+    let ts = Timestamp::from_unix(&*context, unix_ms / 1000, ((unix_ms % 1000) * 1_000_000) as u32);
     Uuid::new_v7(ts).to_string()
 }
 
@@ -69,6 +76,15 @@ mod tests {
         assert!(is_uuid(&a));
         assert_eq!(&a[14..15], "7");
         assert!(a < b);
+    }
+
+    #[test]
+    fn ids_made_in_one_millisecond_keep_their_order() {
+        let ids: Vec<String> = (0..1000).map(|_| uuidv7(1_700_000_000_000)).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        let keys: std::collections::HashSet<String> =
+            ids.iter().map(|id| provisional_key("DEMO", id, 6)).collect();
+        assert!(keys.len() > 990, "keys from one millisecond still differ: {}", keys.len());
     }
 
     #[test]

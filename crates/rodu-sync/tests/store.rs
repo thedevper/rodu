@@ -526,3 +526,174 @@ fn measure_one_write_on_a_large_board() {
         "20000 cards: snapshot {size} B, one write {write:?}, open {open:?}, rebuild {rebuild:?}"
     );
 }
+
+/// A copy of `peer`'s document under peer id 99, to change by hand, and its version so far.
+fn raw_copy(peer: &Peer) -> (LoroDoc, loro::VersionVector) {
+    let raw = LoroDoc::new();
+    raw.set_peer_id(99).unwrap();
+    let empty = LoroDoc::new().oplog_vv().encode();
+    raw.import(&peer.store().updates_since(&empty).unwrap()).unwrap();
+    let start = raw.oplog_vv();
+    (raw, start)
+}
+
+/// Sends `peer` what `raw` changed since `start`.
+fn send_raw(raw: &LoroDoc, start: &loro::VersionVector, peer: &Peer) -> IndexReport {
+    raw.commit();
+    let update = raw.export(loro::ExportMode::updates(start)).unwrap();
+    peer.store().import_untrusted(&update, &checker()).unwrap()
+}
+
+/// Adds a well-formed card keyed `{prefix}-{part of its id}`.
+fn raw_card(
+    raw: &LoroDoc,
+    id: &str,
+    collection: &str,
+    prefix: &str,
+    parent: TreeParentId,
+    assignee: Option<&str>,
+) -> loro::TreeID {
+    let tree = raw.get_tree("items");
+    let node = tree.create(parent).unwrap();
+    let meta = tree.get_meta(node).unwrap();
+    let key = format!("{prefix}-{}", id[4..8].to_uppercase());
+    let fields: Vec<(&str, LoroValue)> = vec![
+        ("id", id.into()),
+        ("collection_id", collection.into()),
+        ("key", key.as_str().into()),
+        ("type", "task".into()),
+        ("title", "Made by hand".into()),
+        ("status", "Backlog".into()),
+        ("category", "backlog".into()),
+        ("priority", "normal".into()),
+        ("assignee_id", assignee.map_or(LoroValue::Null, LoroValue::from)),
+        ("rank", "z".into()),
+        ("created_at", "2026-01-01T00:00:00Z".into()),
+        ("updated_at", "2026-01-01T00:00:00Z".into()),
+    ];
+    for (k, v) in fields {
+        meta.insert(k, v).unwrap();
+    }
+    node
+}
+
+/// The fields one entity has in `peer`'s document.
+fn doc_fields(peer: &Peer, root: &str, id: &str) -> std::collections::HashMap<String, LoroValue> {
+    let (raw, _) = raw_copy(peer);
+    let LoroValue::Map(all) = raw.get_map(root).get_deep_value() else { panic!("not a map") };
+    let Some(LoroValue::Map(fields)) = all.get(id) else { panic!("{id} is not in {root}") };
+    fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+#[test]
+fn a_card_under_a_card_left_out_is_indexed_and_its_parent_returns_when_resolvable() {
+    let a = Peer::first();
+    let demo = a.svc.collection("DEMO").unwrap().id;
+    let ghost = "0190eeee-0000-7000-8000-000000000005";
+    let (parent_id, child_id) =
+        ("0190aaaa-0000-7000-8000-000000000001", "0190bbbb-0000-7000-8000-000000000002");
+    let (raw, start) = raw_copy(&a);
+    let parent = raw_card(&raw, parent_id, ghost, "GHOST", TreeParentId::Root, None);
+    raw_card(&raw, child_id, &demo, "DEMO", TreeParentId::Node(parent), None);
+    let report = send_raw(&raw, &start, &a);
+    let problems = report.problems.join("\n");
+    assert!(problems.contains("unknown collection"), "{problems}");
+    assert!(problems.contains("unknown parent cleared"), "{problems}");
+    assert_eq!(a.svc.item("DEMO-BBBB").unwrap().parent_id, None);
+    assert!(a.svc.item("GHOST-AAAA").is_err());
+    assert_rebuild_matches(&a);
+
+    // The collection arrives later: the parked card and the cleared parent come back.
+    let start = raw.oplog_vv();
+    let LoroValue::Map(demo_fields) =
+        raw.get_map("collections").get_deep_value().into_map().unwrap()[&demo].clone()
+    else {
+        panic!("DEMO is not a map")
+    };
+    let copy = raw.get_map("collections").ensure_mergeable_map(ghost).unwrap();
+    for (k, v) in demo_fields.iter() {
+        copy.insert(k, if k == "key" { "GHOST".into() } else { v.clone() }).unwrap();
+    }
+    send_raw(&raw, &start, &a);
+    assert_eq!(a.svc.item("GHOST-AAAA").unwrap().id, parent_id);
+    assert_eq!(a.svc.item("DEMO-BBBB").unwrap().parent_id.as_deref(), Some(parent_id));
+    assert_rebuild_matches(&a);
+}
+
+#[test]
+fn an_indexed_entity_made_malformed_by_an_update_leaves_the_index() {
+    let a = Peer::first();
+    let keys = a.create(&["Card", "Other"]);
+    let card = a.svc.item(&keys[0]).unwrap();
+    a.svc.comment(&a.me, &keys[1], "Hello").unwrap();
+    let comment = a.store().list_comments(&a.svc.item(&keys[1]).unwrap().id).unwrap()[0].clone();
+    let gus = a.svc.create_principal("gus", PrincipalKind::Human, None).unwrap();
+
+    let (raw, start) = raw_copy(&a);
+    raw.get_map("comments").ensure_mergeable_map(&comment.id).unwrap().insert("body", 5).unwrap();
+    let report = send_raw(&raw, &start, &a);
+    assert!(!report.problems.is_empty());
+    assert!(a.store().list_comments(&comment.item_id).unwrap().is_empty());
+    assert_rebuild_matches(&a);
+
+    let start = raw.oplog_vv();
+    let tree = raw.get_tree("items");
+    let node = tree
+        .get_nodes(false)
+        .into_iter()
+        .find(|n| {
+            tree.get_meta(n.id).unwrap().get("id").and_then(|v| v.into_value().ok())
+                == Some(card.id.as_str().into())
+        })
+        .unwrap();
+    tree.get_meta(node.id).unwrap().insert("title", 5).unwrap();
+    raw.get_map("principals").ensure_mergeable_map(&gus.id).unwrap().insert("name", 5).unwrap();
+    send_raw(&raw, &start, &a);
+    assert!(a.svc.item(&keys[0]).is_err(), "the malformed card left the index");
+    assert!(a.store().find_principal(&gus.id).unwrap().is_none(), "so did the principal");
+    assert_rebuild_matches(&a);
+}
+
+#[test]
+fn an_edit_keeps_a_reference_the_index_cleared_and_it_returns_when_resolvable() {
+    let a = Peer::first();
+    let demo = a.svc.collection("DEMO").unwrap().id;
+    let gus = "0190aaaa-0000-7000-8000-000000000001";
+    let (raw, start) = raw_copy(&a);
+    raw_card(
+        &raw,
+        "0190cccc-0000-7000-8000-000000000003",
+        &demo,
+        "DEMO",
+        TreeParentId::Root,
+        Some(gus),
+    );
+    send_raw(&raw, &start, &a);
+    assert_eq!(a.svc.item("DEMO-CCCC").unwrap().assignee_id, None);
+
+    a.patch("DEMO-CCCC", json!({ "title": "Edited here" }));
+    let start = raw.oplog_vv();
+    let person = raw.get_map("principals").ensure_mergeable_map(gus).unwrap();
+    person.insert("kind", "human").unwrap();
+    person.insert("name", "gus").unwrap();
+    person.insert("owner_id", LoroValue::Null).unwrap();
+    send_raw(&raw, &start, &a);
+    let card = a.svc.item("DEMO-CCCC").unwrap();
+    assert_eq!((card.title.as_str(), card.assignee_id.as_deref()), ("Edited here", Some(gus)));
+    assert_rebuild_matches(&a);
+}
+
+#[test]
+fn a_cycle_shown_under_a_suffix_keeps_its_own_name_in_the_document() {
+    let a = Peer::first();
+    let b = Peer::join(&a, "bob");
+    a.svc.create_cycle(&a.me, "DEMO", "Week 1", None, None).unwrap();
+    let later = b.svc.create_cycle(&b.me, "DEMO", "Week 1", None, None).unwrap();
+    exchange(&a, &b);
+    b.svc.start_cycle(&b.me, "DEMO", "Week 1 (2)").unwrap();
+    exchange(&a, &b);
+    assert_eq!(a.dump(), b.dump());
+    assert_eq!(doc_fields(&b, "cycles", &later.id)["name"], LoroValue::from("Week 1"));
+    assert_eq!(doc_fields(&b, "cycles", &later.id)["state"], LoroValue::from("active"));
+    assert_rebuild_matches(&a);
+}
