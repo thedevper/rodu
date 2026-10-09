@@ -5,6 +5,7 @@ pub mod error;
 pub mod format;
 pub mod ids;
 pub mod input;
+pub mod live;
 pub mod model;
 pub mod query;
 pub mod rank;
@@ -13,6 +14,7 @@ pub mod store;
 pub mod workflow;
 
 pub use error::{ErrorCode, Result, RoduError};
+pub use live::{Live, LiveSync, Pulled};
 pub use model::*;
 pub use service::RoduService;
 pub use store::{SearchRequest, SearchResult, Side, Store, TxMode};

@@ -422,3 +422,76 @@ fn a_join_never_removes_a_key_file_it_did_not_write() {
     assert!(run.err.contains("already there"), "{}", run.err);
     assert_eq!(std::fs::read_to_string(bob.join(".rodu/team.key")).unwrap(), "kept\n");
 }
+
+/// A running `rodu web`, stopped when dropped.
+struct Board {
+    child: std::process::Child,
+    host: String,
+    token: String,
+}
+
+impl Drop for Board {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_board(dir: &Path) -> Board {
+    use std::io::BufRead;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rodu"))
+        .args(["web", "--port", "0", "--no-open"])
+        .current_dir(dir)
+        .env_remove("RODU_DIR")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    for line in stdout.lines() {
+        let line = line.unwrap();
+        if let Some(link) = line.strip_prefix("Open: ") {
+            let (base, token) = link.split_once("#token=").unwrap();
+            let host = base.trim_start_matches("http://").trim_end_matches('/').to_owned();
+            return Board { child, host, token: token.to_owned() };
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("rodu web printed no link");
+}
+
+impl Board {
+    fn get(&self, path: &str) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&self.host).unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            self.host, self.token
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        raw.split_once("\r\n\r\n").map(|(_, body)| body.to_owned()).unwrap_or_default()
+    }
+}
+
+#[test]
+fn a_running_board_shows_a_teammates_change_without_a_restart() {
+    let team = team();
+    let bob = join(&team, "bob");
+    let board = start_board(&bob);
+    let before = board.get("/api/revision");
+    assert!(before.contains("\"revision\""), "{before}");
+    ok(&team.ann, &["add", "Written while bob's board was open"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let cards = board.get("/api/board?collection=DEMO&q=");
+        if cards.contains("Written while bob") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the card never appeared: {cards}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_ne!(board.get("/api/revision"), before, "the board can tell it changed");
+}

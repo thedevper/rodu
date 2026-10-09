@@ -288,8 +288,27 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   write to it after; the numbering peer (the machine that created the team) numbers new cards in
   between. `web` and `mcp` sync when they start and when they stop. A folder that cannot be read
   is a warning, and the command, `rodu sync` included, works on what the machine has.
-- **Left for later steps.** 4c: the readable copy, `web` and `mcp` watching the
-  folder while they run, and the command that hands numbering to another machine. A file waiting on operations that never arrive
+- **Live sync in `web` and `mcp` (built 2026-10-09, step 4c).** While they run, both servers
+  keep syncing through a `LiveSync` seam in `rodu-core`, so `rodu-http` and `rodu-mcp` do not
+  depend on `rodu-sync`. The servers call it under their own service lock, on the blocking pool,
+  so sync work is serialized with requests and tool calls. Problems never fail a request: they
+  go to stderr (never stdout, which is MCP's channel), and each message is written once until it
+  changes, so an unreachable folder is not reported every few seconds.
+  - `rodu web` pulls (and numbers, on the numbering peer) and pushes every 2 seconds, and pushes
+    right after each write. A revision counter rises with every pull that took something in and
+    every write; `GET /api/revision` returns it, behind the same token and host checks as the rest
+    of the API.
+  - The board asks for the revision every 3 seconds while the page is visible and no card is being
+    dragged, and reloads when it changed. It reads the revision before the board on each load, so
+    a change landing in between is caught on the next look. A teammate's card shows up within
+    about 3 to 5 seconds.
+  - The item panel is not reloaded, so an edit in progress is never overwritten; saving a card a
+    teammate changed meanwhile is refused by its version, as before.
+  - `rodu mcp` pulls before each tool call and pushes after it, so an agent reads teammates'
+    latest changes and its own go out at once.
+- **Left for later steps.** 4c: the readable copy, and the command that hands numbering to
+  another machine. Live sync polls on a timer rather than watching the file system, and an open
+  item panel shows a teammate's change only when it is opened again. A file waiting on operations that never arrive
   (its predecessor refused, or never written) is read and checked again on every command, with no
   limit yet; `rodu sync` lists such files. Held files count toward the import cap of each later
   check, so a replica that writes close to 64 MiB of files that never land can hold back what
@@ -428,7 +447,8 @@ provider cannot read the board.
    half-written files. Split in three: 4a (transport, team commands, automatic sync) and 4b
    (encryption) are done, described under "The team folder" and "Encrypted teams" above; 4c
    adds the readable copy, live watching in `web` and `mcp`, compaction and the numbering
-   hand-over. Compaction is done, with the `stat` skip, under "The team folder".
+   hand-over. Compaction is done, with the `stat` skip, and so is live sync in `web` and `mcp`,
+   both under "The team folder".
 5. Later: `rodu relay` for live sync.
 6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.
