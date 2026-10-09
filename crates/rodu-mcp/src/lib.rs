@@ -14,8 +14,8 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use rodu_core::service::CategoryCounts;
 use rodu_core::{
-    Actor, Cycle, ErrorCode, Item, ItemType, LinkKind, Priority, RoduError, RoduService, Rule,
-    Store, TxMode,
+    Actor, Cycle, ErrorCode, Item, ItemType, LinkKind, Live, LiveSync, Priority, RoduError,
+    RoduService, Rule, Store, TxMode,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -48,7 +48,21 @@ pub async fn serve_stdio<S: Store + Send + 'static>(
     service: RoduService<S>,
     actor: Actor,
 ) -> Result<(), ServeError> {
-    let running = RoduMcp::new(service, actor).serve(rmcp::transport::stdio()).await?;
+    serve_stdio_live(service, actor, None).await
+}
+
+/// [`serve_stdio`], taking in teammates' changes before each tool call and sending this
+/// replica's after it when `live` is given.
+pub async fn serve_stdio_live<S: Store + Send + 'static>(
+    service: RoduService<S>,
+    actor: Actor,
+    live: Option<Arc<dyn LiveSync<S>>>,
+) -> Result<(), ServeError> {
+    let mut server = RoduMcp::new(service, actor);
+    if let Some(live) = live {
+        server = server.with_live(live);
+    }
+    let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
 }
@@ -58,11 +72,16 @@ pub async fn serve_stdio<S: Store + Send + 'static>(
 pub struct RoduMcp<S: Store> {
     service: Arc<Mutex<RoduService<S>>>,
     actor: Actor,
+    live: Option<Arc<Live<S>>>,
 }
 
 impl<S: Store> Clone for RoduMcp<S> {
     fn clone(&self) -> Self {
-        Self { service: Arc::clone(&self.service), actor: self.actor.clone() }
+        Self {
+            service: Arc::clone(&self.service),
+            actor: self.actor.clone(),
+            live: self.live.clone(),
+        }
     }
 }
 
@@ -74,7 +93,13 @@ enum Output {
 
 impl<S: Store + Send + 'static> RoduMcp<S> {
     pub fn new(service: RoduService<S>, actor: Actor) -> Self {
-        Self { service: Arc::new(Mutex::new(service)), actor }
+        Self { service: Arc::new(Mutex::new(service)), actor, live: None }
+    }
+
+    /// Pulls before each tool call and pushes after it, each under the service lock.
+    pub fn with_live(mut self, sync: Arc<dyn LiveSync<S>>) -> Self {
+        self.live = Some(Arc::new(Live::new(sync)));
+        self
     }
 
     fn with_service<T>(
@@ -95,6 +120,15 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
         tokio::task::spawn_blocking(move || f(&server))
             .await
             .unwrap_or_else(|e| Err(RoduError::internal(format!("tool task failed: {e}"))))
+    }
+
+    /// One step of live sync under the service lock; a no-op without live sync.
+    fn live_step<T>(&self, step: impl FnOnce(&Live<S>, &RoduService<S>) -> T) {
+        if let Some(live) = &self.live
+            && let Ok(service) = self.service.lock()
+        {
+            step(live, &service);
+        }
     }
 
     fn max_batch(&self) -> usize {
@@ -705,7 +739,14 @@ impl<S: Store + Send + 'static> ServerHandler for RoduMcp<S> {
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
-        let outcome = self.blocking(move |server| server.run(&name, &args)).await;
+        let outcome = self
+            .blocking(move |server| {
+                server.live_step(Live::pull);
+                let outcome = server.run(&name, &args);
+                server.live_step(Live::push);
+                outcome
+            })
+            .await;
         Ok(tool_result(outcome).into())
     }
 

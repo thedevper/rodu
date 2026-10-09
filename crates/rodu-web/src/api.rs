@@ -3,7 +3,7 @@
 use gloo_net::http::{Method, RequestBuilder};
 use rodu_api::{
     BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody, ItemDetail,
-    ItemView, MeView, MoveRequest, PatchRequest, PrincipalView, TransitionRequest,
+    ItemView, MeView, MoveRequest, PatchRequest, PrincipalView, RevisionView, TransitionRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -107,6 +107,10 @@ impl Api {
 
     pub async fn collections(self) -> Result<Vec<CollectionView>, ApiError> {
         self.get("/api/collections").await
+    }
+
+    pub async fn revision(self) -> Result<u64, ApiError> {
+        Ok(self.get::<RevisionView>("/api/revision").await?.revision)
     }
 
     pub async fn principals(self) -> Result<Vec<PrincipalView>, ApiError> {
