@@ -263,7 +263,7 @@ impl Compiler<'_> {
             ));
         }
         let rhs = self.value(spec, value)?;
-        if spec.column == "i.key" {
+        if spec.column == "i.key" && matches!(op, CompareOp::Eq | CompareOp::Ne) {
             // A card answers to its key and to the provisional key it had before it was numbered.
             let either = format!("(i.key = {0} OR i.provisional_key IS {0})", rhs.sql);
             let params = [rhs.params.clone(), rhs.params].concat();
