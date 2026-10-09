@@ -218,8 +218,8 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   applies their operations exactly when this process does. When such a check fails, the new file
   is checked without them: if it passes, the held file that breaks once it is released is refused
   (at once when the child finds it invalid; when it crashes or hangs the child, only the second
-  time in a row, in a later batch, since that may be the machine's doing; a passing check that
-  replays it clears the count), and the rest of the batch waits for the next one, which starts
+  time in a row, in a later batch, since that may be the machine's doing; a check that releases it
+  and passes clears the count), and the rest of the batch waits for the next one, which starts
   from the saved document. After any import that leaves operations pending, the next one starts
   from the saved document too, so pending operations never reach a later import unchecked. A file
   found invalid or damaged is remembered and reported once; a file the child could not finish on

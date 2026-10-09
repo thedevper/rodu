@@ -444,18 +444,8 @@ impl LoroStore {
                         report.waiting.extend(group.iter().map(|f| f.key.clone()));
                         continue;
                     }
-                    // A check that replays held files and passes clears their strikes: a crash or
-                    // timeout counts against a file only twice in a row. (A file's own check is no
-                    // evidence: it passes whenever its operations stay pending.)
-                    let cleared = |held: &[&Incoming]| -> Result<()> {
-                        for h in held {
-                            self.sql.forget_sync_seen(&strike_key(&h.key))?;
-                        }
-                        Ok(())
-                    };
                     let accepted: Vec<&Incoming> =
                         if check_import(&doc, &with_held(&held, &group), checker).is_ok() {
-                            cleared(&held)?;
                             group
                         } else {
                             let mut accepted = Vec::new();
@@ -470,7 +460,6 @@ impl LoroStore {
                                 // from this group so far are imported before this one.
                                 let Err(e) = check_import(&doc, &with_held(&held, &files), checker)
                                 else {
-                                    cleared(&held)?;
                                     accepted.push(file);
                                     continue;
                                 };
@@ -500,7 +489,10 @@ impl LoroStore {
                                             // The same files without it just passed: what
                                             // fails now is its doing. A crash or timeout may
                                             // also be the machine's, so it counts against the
-                                            // file only the second time, in a later batch.
+                                            // file only the second time in a row, in a later
+                                            // batch: one that releases it and passes clears it.
+                                            // (A check that does not release it is no evidence:
+                                            // its operations stay pending, which always passes.)
                                             let strike = strike_key(&h.key);
                                             let refuse = match &found {
                                                 Err(SyncError::InvalidData(_)) => true,
@@ -525,7 +517,10 @@ impl LoroStore {
                                                     ));
                                                     false
                                                 }
-                                                Ok(()) => false,
+                                                Ok(()) => {
+                                                    self.sql.forget_sync_seen(&strike)?;
+                                                    false
+                                                }
                                             };
                                             if let (true, Err(e)) = (refuse, found) {
                                                 self.sql.mark_sync_seen(&h.key)?;
@@ -558,6 +553,7 @@ impl LoroStore {
                     }
                     if in_log(file)? {
                         self.sql.mark_sync_seen(&file.key)?;
+                        self.sql.forget_sync_seen(&strike_key(&file.key))?;
                         report.imported.push(file.key.clone());
                     } else {
                         report.waiting.push(file.key.clone());

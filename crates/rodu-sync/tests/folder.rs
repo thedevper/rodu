@@ -14,8 +14,8 @@ const CHILD_ENV: &str = "RODU_SYNC_FOLDER_CHECK_CHILD";
 const LOG_ENV: &str = "RODU_SYNC_FOLDER_CHECK_LOG";
 /// Makes the child refuse any check replaying this peer's files, as if they broke Loro.
 const POISON_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON";
-/// With [`POISON_ENV`]: only when replayed with other files, as if they broke Loro once their
-/// pending operations were released.
+/// With [`POISON_ENV`]: only when replayed with another peer's files, as if they broke Loro once
+/// that peer's operations released their pending ones.
 const POISON_WITH_OTHERS_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON_WITH_OTHERS";
 /// With [`POISON_ENV`]: the child crashes instead of refusing.
 const POISON_CRASH_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON_CRASH";
@@ -43,7 +43,7 @@ fn check_child() {
     if let Some(poison) = std::env::var_os(POISON_ENV) {
         let poison: u64 = poison.to_str().unwrap().parse().unwrap();
         let others = std::env::var_os(POISON_WITH_OTHERS_ENV).is_some();
-        if peers.contains(&poison) && (!others || peers.len() > 1) {
+        if peers.contains(&poison) && (!others || peers.iter().any(|p| *p != poison)) {
             if std::env::var_os(POISON_CRASH_ENV).is_some() {
                 std::process::abort();
             }
@@ -69,8 +69,8 @@ fn checker_logging(log: std::path::PathBuf) -> Checker {
     checker_with(vec![(LOG_ENV, log.into_os_string())])
 }
 
-/// A checker that refuses `peer`'s files, or, with `with_others`, only when other files are
-/// replayed with them.
+/// A checker that refuses `peer`'s files, or, with `with_others`, only when another peer's files
+/// are replayed with them.
 fn checker_poisoned(peer: u64, with_others: bool) -> Checker {
     checker_poisoned_by(peer, with_others, false)
 }
@@ -524,9 +524,9 @@ fn held_file_blamed(crash: bool) {
 }
 
 #[test]
-fn a_crash_counts_against_a_held_file_only_twice_in_a_row() {
+fn a_crash_strike_lasts_until_the_held_file_lands() {
     let (_root, folder, a, [earlier, later]) = three();
-    let (card, _) = base_and_build(&folder, &later, &earlier);
+    let (card, base) = base_and_build(&folder, &later, &earlier);
     a.store().set_import_group_cap(1);
     let crashing = checker_poisoned_by(earlier.store().peer(), true, true);
     let report = folder.pull(a.store(), &crashing).unwrap();
@@ -534,11 +534,40 @@ fn a_crash_counts_against_a_held_file_only_twice_in_a_row() {
     let held = report.batch.notes[0].split(": ").next().unwrap().to_owned();
     let strike = format!("strike:{held}");
     assert!(a.store().sync_seen(&strike).unwrap(), "the crash is remembered once");
-    // A check replaying it that passes clears the strike; the file then lands.
+    // Checks that do not release it are no evidence: the strike stays while it waits.
+    let whole = std::fs::read(&base).unwrap();
+    std::fs::write(&base, &whole[..whole.len() / 2]).unwrap();
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(report.batch.waiting.len(), 1, "{report:?}");
+    assert!(a.store().sync_seen(&strike).unwrap(), "still waiting, still struck");
+    std::fs::write(&base, &whole).unwrap();
+    // A check that releases it and passes lands it, and the strike goes.
     let report = folder.pull(a.store(), &checker()).unwrap();
     assert_eq!(report.batch.imported.len(), 2, "{report:?}");
-    assert!(!a.store().sync_seen(&strike).unwrap(), "a passing check clears the strike");
+    assert!(!a.store().sync_seen(&strike).unwrap(), "landed, so no strike left");
     assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Built on it");
+}
+
+#[test]
+fn a_check_that_does_not_release_a_held_file_leaves_its_strike() {
+    let (_root, folder, a, [earlier, later]) = three();
+    let (card, _) = base_and_build(&folder, &later, &earlier);
+    a.store().set_import_group_cap(1);
+    let crashing = checker_poisoned_by(earlier.store().peer(), true, true);
+    let report = folder.pull(a.store(), &crashing).unwrap();
+    assert_eq!(report.batch.notes.len(), 1, "{report:?}");
+    // The same peer's next file is read between the held one and the base it waits for. Its
+    // check replays the held file without releasing it, so it passes: no evidence either way.
+    let renamed = json!({ "title": "Built on it, again" });
+    earlier.svc.update_item(&earlier.me, &card.key, &renamed, None).unwrap();
+    folder.push(earlier.store()).unwrap();
+    let report = folder.pull(a.store(), &crashing).unwrap();
+    assert_eq!(report.batch.refused.len(), 1, "the second crash in a row counts: {report:?}");
+    let blamed = format!("{:016x}/0000000002.update", earlier.store().peer());
+    assert!(report.batch.refused[0].starts_with(&blamed), "{report:?}");
+    // The base it held back then lands.
+    folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Base");
 }
 
 #[test]
