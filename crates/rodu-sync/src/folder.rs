@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::{BatchReport, Checker, Incoming, LoroStore, MAX_IMPORT_BYTES};
 
 pub const TEAM_FILE: &str = "rodu-team.json";
-const SYNC_DIR: &str = "sync";
+pub const SYNC_DIR: &str = "sync";
 const MAGIC: &[u8; 12] = b"RODU-UPDATE1";
 const HEADER: usize = MAGIC.len() + 8 + 32;
 const SUFFIX: &str = ".update";
@@ -101,10 +101,13 @@ fn peer_dir_name(peer: u64) -> String {
     format!("{peer:016x}")
 }
 
+/// A replica folder's peer id; never 0, which no replica has (and the import check reads as
+/// "any peer").
 fn parse_peer_dir(name: &str) -> Option<u64> {
     (name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
         .then(|| u64::from_str_radix(name, 16).ok())
         .flatten()
+        .filter(|peer| *peer != 0)
 }
 
 /// The sequence number a replica's own file name starts with: `0000000012.update` is 12.
@@ -144,7 +147,9 @@ impl TeamFolder {
     }
 
     /// Makes this folder the home of team `workspace_id`; refuses a folder holding another team.
-    pub fn create(&self, workspace_id: &str) -> Result<()> {
+    /// The replica folder of `peer`, the creator, is made before the team file, so a create that
+    /// stopped half way can tell the folder is its own.
+    pub fn create(&self, workspace_id: &str, peer: u64) -> Result<()> {
         let path = self.root.join(TEAM_FILE);
         if path.exists() {
             let found = self.info()?;
@@ -157,7 +162,8 @@ impl TeamFolder {
             }
             return Ok(());
         }
-        fs::create_dir_all(self.root.join(SYNC_DIR)).map_err(|e| folder_error(&self.root, e))?;
+        let own = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
+        fs::create_dir_all(&own).map_err(|e| folder_error(&self.root, e))?;
         let info = TeamInfo { format: 1, workspace_id: workspace_id.to_owned() };
         let text = serde_json::to_string_pretty(&info).expect("team info serializes");
         write_new(&self.root, &path, format!("{text}\n").as_bytes())
@@ -219,7 +225,11 @@ impl TeamFolder {
                 let shown = format!("{}/{name}", peer_dir_name(peer));
                 let size = fs::metadata(&path).map_err(|e| folder_error(&path, e))?.len();
                 if size > (MAX_IMPORT_BYTES + HEADER) as u64 {
-                    report.damaged.push(format!("{shown}: larger than a sync file may be"));
+                    let key = format!("{shown}/size-{size}");
+                    if !store.sync_seen(&key)? {
+                        store.mark_sync_seen(&key)?;
+                        report.damaged.push(format!("{shown}: larger than a sync file may be"));
+                    }
                     continue;
                 }
                 let bytes = match fs::read(&path) {
@@ -228,14 +238,19 @@ impl TeamFolder {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(folder_error(&path, e)),
                 };
+                let key = format!("{shown}/{}", hex::encode(Sha256::digest(&bytes)));
                 match unframe(&bytes) {
-                    Frame::Complete(payload) => incoming.push(Incoming {
-                        peer,
-                        key: format!("{shown}/{}", hex::encode(Sha256::digest(&bytes))),
-                        bytes: payload.to_vec(),
-                    }),
+                    Frame::Complete(payload) => {
+                        incoming.push(Incoming { peer, key, bytes: payload.to_vec() })
+                    }
                     Frame::Incomplete => report.incomplete.push(shown),
-                    Frame::Damaged(why) => report.damaged.push(format!("{shown}: {why}")),
+                    // Reported once; the same name with other bytes is a new file.
+                    Frame::Damaged(why) => {
+                        if !store.sync_seen(&key)? {
+                            store.mark_sync_seen(&key)?;
+                            report.damaged.push(format!("{shown}: {why}"));
+                        }
+                    }
                 }
             }
         }
@@ -290,6 +305,7 @@ mod tests {
         assert_eq!(parse_peer_dir("00000000000000ff"), Some(255));
         assert_eq!(parse_peer_dir("00000000000000FF"), None);
         assert_eq!(parse_peer_dir("../../etc"), None);
+        assert_eq!(parse_peer_dir("0000000000000000"), None, "0 would mean any peer");
         assert_eq!(own_seq("0000000012.update"), Some(12));
         assert_eq!(own_seq("0000000012 (1).update"), None);
     }
