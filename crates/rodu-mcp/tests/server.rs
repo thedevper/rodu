@@ -408,6 +408,23 @@ async fn concurrent_tool_calls_each_run_pull_tool_push_without_interleaving() {
     assert_eq!(*sync.0.lock().unwrap(), ["pull", "push"].repeat(4));
 }
 
+#[tokio::test]
+async fn a_tool_call_that_fails_still_pulls_and_pushes() {
+    let (service, actor) = demo_service(SqliteStore::memory().unwrap());
+    let sync = std::sync::Arc::new(Recording::default());
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = RoduMcp::new(service, actor).with_live(sync.clone());
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client: Client = ().serve(client_io).await.unwrap();
+    let result = call(&client, "transition", json!({ "ref": "DEMO-99", "to": "Done" })).await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(*sync.calls.lock().unwrap(), ["pull", "push"]);
+}
+
 #[test]
 fn live_sync_warnings_are_written_once_until_they_change() {
     let (service, _) = demo_service(SqliteStore::memory().unwrap());
