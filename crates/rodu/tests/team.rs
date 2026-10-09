@@ -439,12 +439,18 @@ impl Drop for Board {
 
 fn start_board(dir: &Path) -> Board {
     use std::io::BufRead;
+    // A stand-in board, so the test does not depend on `cargo xtask web` having run (CI does not).
+    let dist = dir.join("board-stub");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), "<!doctype html>").unwrap();
+    let errors = dir.join("web-stderr.txt");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rodu"))
         .args(["web", "--port", "0", "--no-open"])
         .current_dir(dir)
         .env_remove("RODU_DIR")
+        .env("RODU_WEB_DIST", &dist)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&errors).unwrap())
         .spawn()
         .unwrap();
     let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
@@ -460,7 +466,7 @@ fn start_board(dir: &Path) -> Board {
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("rodu web printed no link");
+    panic!("rodu web printed no link: {}", std::fs::read_to_string(&errors).unwrap_or_default());
 }
 
 impl Board {
