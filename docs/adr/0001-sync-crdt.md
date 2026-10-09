@@ -276,6 +276,9 @@ provider cannot read the board.
   synced and the command warns:
   - an encrypted workspace and a format 1 folder (a team file turned back to plain);
   - a key whose check does not match;
+  - a team file naming another workspace id than the config's. Files are sealed for the
+    config's id, never the folder's, so a team file with only its id changed cannot make
+    teammates write files nobody can open later;
   - a plain workspace and a format 2 folder;
   - an encrypted workspace without its key file, or a plain one with a key file.
 
@@ -291,8 +294,12 @@ provider cannot read the board.
   against `keyCheck` before it writes anything. A wrong key, a missing key, or a key on a plain
   team's code is refused.
 - **Untrusted input.** A sealed file is opened, and so authenticated, before its plaintext goes
-  through the same child-process import check as a plain file's. Encryption keeps the provider
-  out, not a teammate: anyone with the invite code can write files the team accepts.
+  through the same child-process import check as a plain file's. Files are read with a bound, so
+  one that grows after its size was checked is refused like an oversize one. Encryption keeps
+  the provider out, not a teammate: anyone with the invite code can write files the team
+  accepts. It protects what the board says, not whether it syncs: whoever can write to the
+  folder can still delete files, put back old ones (harmless, since operations already held
+  are ignored) or stop the sync, and that is not detected.
 - **Left for later.** The readable copy (4c). Turning encryption on or off for an existing team,
   and changing the key, which needs a new team today. On Windows, `team.key` relies on the
   user profile's permissions, since there is no 0600.

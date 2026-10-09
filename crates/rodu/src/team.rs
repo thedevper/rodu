@@ -43,28 +43,43 @@ pub struct TeamConfig {
 /// The team key in `dir`, if there is one.
 fn load_key(dir: &Path) -> Result<Option<TeamKey>> {
     let path = dir.join(KEY_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => zeroize::Zeroizing::new(text),
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => zeroize::Zeroizing::new(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(RoduError::invalid(format!("Cannot read {}: {e}", path.display()))),
     };
-    TeamKey::from_hex(text.trim())
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| TeamKey::from_hex(text.trim()))
         .map(Some)
         .ok_or_else(|| RoduError::invalid(format!("{} does not hold a team key", path.display())))
 }
 
 fn save_key(dir: &Path, key: &TeamKey) -> Result<()> {
     let path = dir.join(KEY_FILE);
-    write_private_file(&path, &format!("{}\n", key.to_hex().as_str()))
+    write_private_file(&path, &secret_line(&[key.to_hex().as_str(), "\n"]))
         .map_err(|e| RoduError::invalid(format!("Cannot write {}: {e}", path.display())))
+}
+
+/// `parts` joined in a buffer that is wiped when dropped, sized up front so no copy is left
+/// behind by a reallocation.
+fn secret_line(parts: &[&str]) -> zeroize::Zeroizing<String> {
+    let mut line =
+        zeroize::Zeroizing::new(String::with_capacity(parts.iter().map(|p| p.len()).sum()));
+    for part in parts {
+        line.push_str(part);
+    }
+    line
 }
 
 /// The team folder as this workspace syncs it: sealed with its key when it is encrypted. A key
 /// that is missing, or there when the workspace is plain, stops the sync rather than guess.
 fn team_folder(dir: &Path, team: &TeamConfig) -> Result<TeamFolder> {
     match (team.encrypted, load_key(dir)?) {
-        (true, Some(key)) => Ok(TeamFolder::sealed(&team.folder, key)),
-        (false, None) => Ok(TeamFolder::new(&team.folder)),
+        (true, Some(key)) => {
+            Ok(TeamFolder::sealed(&team.folder, key).expecting(&team.workspace_id))
+        }
+        (false, None) => Ok(TeamFolder::new(&team.folder).expecting(&team.workspace_id)),
         (true, None) => Err(RoduError::invalid(format!(
             "this workspace's team key is missing ({})",
             dir.join(KEY_FILE).display()
@@ -231,7 +246,7 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
                 let key = load_key(&ws.dir)?
                     .ok_or_else(|| RoduError::invalid("This workspace's team key is missing"))?;
                 let code = invite_code(&team.workspace_id, Some(&key));
-                (io.out)(&format!("Invite code: {}", code.as_str()));
+                (io.out)(&secret_line(&["Invite code: ", code.as_str()]));
                 (io.out)("Keep it secret: it holds the team key.");
             } else {
                 (io.out)("Encryption: on");
@@ -318,6 +333,13 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     // taken over by the create that started it: one whose only replica folder is this one's.
     let workspace_id = if folder_path.join(TEAM_FILE).exists() {
         let info = TeamFolder::new(&folder_path).info()?;
+        // Checked before a key is written: a half-made team carries on only as what it was.
+        if resumed.is_some() && info.encrypted() != encrypted {
+            let was = if info.encrypted() { "--encrypt" } else { "--no-encrypt" };
+            return Err(RoduError::conflict(format!(
+                "A team create stopped half way here: run it again with {was}"
+            )));
+        }
         match resumed {
             Some(peer) if wrote_alone(&folder_path, peer) => info.workspace_id,
             _ => {
@@ -343,7 +365,8 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     let folder = match key {
         Some(key) => TeamFolder::sealed(&folder_path, key),
         None => TeamFolder::new(&folder_path),
-    };
+    }
+    .expecting(&workspace_id);
     folder.create(&workspace_id, store.peer())?;
     folder.push(&store)?;
     config.team = Some(TeamConfig {
@@ -354,12 +377,12 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     });
     save_config(&dir, &config)?;
     (io.out)(&format!("This workspace now syncs through {}", folder_path.display()));
-    (io.out)(&format!("Invite code: {}", code.as_str()));
-    (io.out)(&format!(
-        "A teammate joins with: rodu team join {} \
-         --folder <the same folder on their machine> --name <their name>",
-        code.as_str()
-    ));
+    (io.out)(&secret_line(&["Invite code: ", code.as_str()]));
+    (io.out)(&secret_line(&[
+        "A teammate joins with: rodu team join ",
+        code.as_str(),
+        " --folder <the same folder on their machine> --name <their name>",
+    ]));
     if encrypted {
         (io.out)(
             "Keep the invite code secret: it holds the team key. The sync files are encrypted; \
@@ -428,8 +451,10 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
     // The key is checked before anything is written.
     let key_hex = key.as_ref().map(TeamKey::to_hex);
     let folder = match (info.key_check.as_deref(), key) {
-        (None, None) => TeamFolder::new(&folder_path),
-        (Some(check), Some(key)) if key.matches(check) => TeamFolder::sealed(&folder_path, key),
+        (None, None) => TeamFolder::new(&folder_path).expecting(&workspace_id),
+        (Some(check), Some(key)) if key.matches(check) => {
+            TeamFolder::sealed(&folder_path, key).expecting(&workspace_id)
+        }
         (Some(_), Some(_)) => {
             return Err(RoduError::invalid("The invite code's key does not open this team")
                 .with_hint("Ask for the invite code again: rodu team --show-invite"));
@@ -454,6 +479,13 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
         return Err(RoduError::conflict(format!(
             "A workspace already exists at {}",
             dir.display()
+        )));
+    }
+    // A failed join removes the key file it wrote; one that was there before is not its own.
+    if dir.join(KEY_FILE).exists() {
+        return Err(RoduError::conflict(format!(
+            "{} is already there: move it away to join here",
+            dir.join(KEY_FILE).display()
         )));
     }
     if find_dir(io).is_some_and(|found| found != dir) {

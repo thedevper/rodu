@@ -127,6 +127,9 @@ pub struct TeamFolder {
     root: PathBuf,
     /// The team key of an encrypted team; `None` syncs plain files.
     key: Option<TeamKey>,
+    /// The team this workspace belongs to. The folder must name it, and sealing uses it rather
+    /// than what the folder says, so a rewritten team file cannot make files nobody can open.
+    workspace_id: Option<String>,
 }
 
 /// The path holds untrusted names from the folder and ends up in a terminal: control
@@ -149,10 +152,11 @@ fn parse_peer_dir(name: &str) -> Option<u64> {
         .filter(|peer| *peer != 0)
 }
 
-/// The sequence number a replica's own file name starts with: `0000000012.update` is 12.
+/// The sequence number a replica's own file name starts with: `0000000012.update` is 12. Names
+/// are at least 10 digits; past 9999999999 they simply grow.
 fn own_seq(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(SUFFIX)?;
-    (digits.len() == 10 && digits.bytes().all(|b| b.is_ascii_digit()))
+    ((10..=20).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit()))
         .then(|| digits.parse().ok())
         .flatten()
 }
@@ -166,12 +170,23 @@ fn is_candidate(name: &str, kind: fs::FileType) -> bool {
 impl TeamFolder {
     /// The folder of a plain team.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), key: None }
+        Self { root: root.into(), key: None, workspace_id: None }
     }
 
     /// The folder of an encrypted team with key `key`.
     pub fn sealed(root: impl Into<PathBuf>, key: TeamKey) -> Self {
-        Self { root: root.into(), key: Some(key) }
+        Self { root: root.into(), key: Some(key), workspace_id: None }
+    }
+
+    /// Syncs only while the folder names team `workspace_id`.
+    pub fn expecting(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
+    }
+
+    /// The team id files are sealed for: the expected one, else the folder's.
+    fn team_id<'a>(&'a self, info: &'a TeamInfo) -> &'a str {
+        self.workspace_id.as_deref().unwrap_or(&info.workspace_id)
     }
 
     pub fn root(&self) -> &Path {
@@ -208,6 +223,9 @@ impl TeamFolder {
     fn checked_info(&self) -> Result<TeamInfo> {
         let info = self.info()?;
         let path = self.root.join(TEAM_FILE);
+        if self.workspace_id.as_ref().is_some_and(|id| *id != info.workspace_id) {
+            return Err(folder_error(&path, "names another team than this workspace's"));
+        }
         match (&self.key, info.key_check.as_deref()) {
             (None, None) => Ok(info),
             (Some(key), Some(check)) if key.matches(check) => Ok(info),
@@ -265,18 +283,22 @@ impl TeamFolder {
         let mut written = None;
         store.export_own(|payload| {
             fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
-            let mut next = 1;
+            let mut next = 1u64;
             for entry in fs::read_dir(&dir).map_err(|e| folder_error(&dir, e))? {
                 let name = entry.map_err(|e| folder_error(&dir, e))?.file_name();
                 if let Some(seq) = name.to_str().and_then(own_seq) {
-                    next = next.max(seq + 1);
+                    // Only a file planted in this replica's folder gets near the end of u64.
+                    let after = seq.checked_add(1).ok_or_else(|| {
+                        folder_error(&dir, "holds a file numbered past any sequence")
+                    })?;
+                    next = next.max(after);
                 }
             }
             let path = dir.join(format!("{next:010}{SUFFIX}"));
             let framed = match &self.key {
                 Some(key) => frame_as(
                     SEALED_MAGIC,
-                    &seal::seal(key, &info.workspace_id, store.peer(), payload)?,
+                    &seal::seal(key, self.team_id(&info), store.peer(), payload)?,
                 ),
                 None => frame(payload),
             };
@@ -324,16 +346,17 @@ impl TeamFolder {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(folder_error(&path, e)),
                 };
-                if size > (MAX_IMPORT_BYTES + HEADER + SEAL_OVERHEAD) as u64 {
-                    let key = format!("{shown}/size-{size}");
-                    if !store.sync_seen(&key)? {
-                        store.mark_sync_seen(&key)?;
-                        report.damaged.push(format!("{shown}: larger than a sync file may be"));
-                    }
+                let limit = (MAX_IMPORT_BYTES + HEADER + SEAL_OVERHEAD) as u64;
+                if size > limit {
+                    report_too_large(store, &mut report, &shown, size)?;
                     continue;
                 }
-                let bytes = match fs::read(&path) {
-                    Ok(bytes) => bytes,
+                let bytes = match read_at_most(&path, limit) {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        report_too_large(store, &mut report, &shown, size)?;
+                        continue;
+                    }
                     // Deleted or moved by the folder app since it was listed.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(folder_error(&path, e)),
@@ -344,7 +367,7 @@ impl TeamFolder {
                 let opened = match unframe_as(magic, &bytes) {
                     Frame::Complete(payload) => match &self.key {
                         None => Frame::Complete(payload),
-                        Some(team) => match seal::open(team, &info.workspace_id, peer, payload) {
+                        Some(team) => match seal::open(team, self.team_id(&info), peer, payload) {
                             Some(plain) => {
                                 incoming.push(Incoming { peer, key, bytes: plain });
                                 continue;
@@ -372,6 +395,30 @@ impl TeamFolder {
         report.batch = store.import_batch(&incoming, checker)?;
         Ok(report)
     }
+}
+
+/// Reports a file over the size cap, once per size.
+fn report_too_large(
+    store: &LoroStore,
+    report: &mut PullReport,
+    shown: &str,
+    size: u64,
+) -> Result<()> {
+    let key = format!("{shown}/size-{size}");
+    if !store.sync_seen(&key)? {
+        store.mark_sync_seen(&key)?;
+        report.damaged.push(format!("{shown}: larger than a sync file may be"));
+    }
+    Ok(())
+}
+
+/// The whole file, or `None` if it holds more than `limit` bytes: it may have grown since its
+/// size was read.
+fn read_at_most(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
 /// Writes a whole file under a temporary hidden name, then renames it to `path`, so readers never
@@ -445,6 +492,8 @@ mod tests {
         assert_eq!(parse_peer_dir("../../etc"), None);
         assert_eq!(parse_peer_dir("0000000000000000"), None, "0 would mean any peer");
         assert_eq!(own_seq("0000000012.update"), Some(12));
+        assert_eq!(own_seq("10000000000.update"), Some(10_000_000_000));
+        assert_eq!(own_seq("000000012.update"), None);
         assert_eq!(own_seq("0000000012 (1).update"), None);
     }
 }
