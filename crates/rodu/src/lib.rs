@@ -33,9 +33,9 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
-  team                       where this workspace syncs, and its invite code
-  team create --folder <shared folder> --no-encrypt   share this workspace with a team
-  team join <invite code> --folder <shared folder> --name <you>   join a team here
+  team [--show-invite]       where this workspace syncs, and its invite code
+  team create --folder <shared folder> --encrypt|--no-encrypt   share this workspace with a team
+  team join <invite code|-> --folder <shared folder> --name <you>   join a team here (- reads the code from stdin)
   sync                       sync with the team folder now (every command also does)
   --version                  print the version
 
@@ -84,7 +84,8 @@ const STRING_OPTIONS: &[&str] = &[
     "port",
     "folder",
 ];
-const BOOL_OPTIONS: &[&str] = &["no-open", "version", "help", "encrypt", "no-encrypt"];
+const BOOL_OPTIONS: &[&str] =
+    &["no-open", "version", "help", "encrypt", "no-encrypt", "show-invite"];
 
 #[derive(Debug, Default)]
 struct Args {
@@ -335,7 +336,7 @@ async fn command_result(
         "init" => init(io, args).map(|()| 0),
         "web" => serve_web(io, args.value("port"), !args.flag("no-open")).await.map(|()| 0),
         "team" => match rest.first().map(String::as_str) {
-            None => team::status(io).map(|()| 0),
+            None => team::status(io, args).map(|()| 0),
             Some("create") => team::create(io, args).map(|()| 0),
             Some("join") => team::join(io, args, rest.get(1)).map(|()| 0),
             Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
