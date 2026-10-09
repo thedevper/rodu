@@ -151,22 +151,32 @@ runs against it and against `SqliteStore`.
   `rodu.loro.next` and puts its hash in the index in the same SQLite transaction, then renames
   it into place after the commit. Whoever next takes the write lock finishes or discards a
   leftover `.next` by its hash, so a transaction that failed never changes the document and one
-  that committed is never lost. If the index does not match the document on open, or `rodu.db`
-  is gone, the index is rebuilt from the document.
+  that committed is never lost; the directory is flushed after the file is created and after the
+  rename (on Unix). If the index does not match the document on open, or `rodu.db` is gone, the
+  index is rebuilt from the document.
 - **One machine, several processes.** SQLite's write lock is the lock on the document: each write
   transaction first reloads the document if another process changed it, so no process writes
   operations from a stale copy under the replica's peer id.
 - **Import.** `import_untrusted` replays the import in a child process first (as `Replica` does),
-  then updates the index for exactly the entities in the document's diff. Every entity read from
-  the document is validated; a bad one is left out and reported, and a reference the index cannot
-  hold (an unknown assignee, cycle or parent) is cleared and reported. Indexing never fails on
-  what a teammate's machine wrote.
+  then indexes the entities in the document's diff. Every entity read from the document is
+  validated; a bad one is left out and reported, and a reference the index cannot hold (an unknown
+  assignee, cycle or parent) is cleared and reported. Indexing never fails on what a teammate's
+  machine wrote. Only clean changes are indexed one by one: cards, comments and links that decode
+  and resolve without a clash. Anything else (a principal, collection or cycle changed, a malformed
+  or unresolved entity, or an index still holding something cleared or left out) rebuilds the whole
+  index, so a reference cleared today returns when what it points to arrives, and an entity an
+  update made malformed leaves the index.
+- **Writes keep the document's values.** The index can show what the document does not hold: a
+  suffixed name, a fallback key, a cleared reference. An update writes to the document only the
+  fields it changed against the index row it replaced, and moves a card only when its parent
+  changed, so editing a card's title never erases an assignee the index could not resolve yet.
 - **Clashes after a merge.** When two collections share a key, two principals a name, two cycles a
   name in one collection, two cards a number in one collection, or two cards a key, the one with
   the lowest id (the first made) keeps it. The others are shown as `OPS2`, `ann2`, `Sprint 1 (2)`,
   or for a card its provisional key or id, each taking the first candidate nothing holds yet. A
   card that lost its number counts as unnumbered, so the numbering peer gives it the next number.
-  The result depends only on what the document holds, so every replica shows the same, and a
+  Ids made in one millisecond in one process keep their creation order (a UUIDv7 counter), so the
+  rule holds within a batch. The result depends only on what the document holds, so every replica shows the same, and a
   rebuilt index equals the one kept up to date import by import (tested with three replicas doing
   random work). Each clash is reported, for the "needs attention" view.
 - **Measured** at 20,000 cards, release build on an M-series Mac: the document file is 5.7 MB, one

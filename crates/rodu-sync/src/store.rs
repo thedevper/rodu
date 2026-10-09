@@ -47,7 +47,10 @@ const DOC_FILE: &str = "rodu.loro";
 const NEXT_FILE: &str = "rodu.loro.next";
 const META_DOC: &str = "doc_sha256";
 const META_PEER: &str = "peer";
-const META_ITEM_CONFLICTS: &str = "item_conflicts";
+/// How many entities the index holds differently from the document until something else arrives:
+/// a reference cleared or an entity left out because what it points to is missing, or a card that
+/// lost its number or key. While above zero, every import rebuilds the whole index.
+const META_UNSETTLED: &str = "unsettled";
 
 /// What indexing the document found, beyond the cards it changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -60,11 +63,14 @@ pub struct IndexReport {
     pub conflicts: Vec<String>,
 }
 
+/// A write to replay on the document. An update carries the index row it replaced, so only the
+/// fields the write changed reach the document: the index can show a value the document does not
+/// hold (a name suffixed after a clash, a reference cleared), and that must not be written back.
 enum Change {
     Principal(Principal),
     Collection(Collection),
-    Cycle(Cycle),
-    Item(Item),
+    Cycle(Option<Cycle>, Cycle),
+    Item(Box<(Option<Item>, Item)>),
     Comment(Comment),
     Link(Link),
 }
@@ -94,6 +100,8 @@ pub struct LoroStore {
     dirty: Cell<bool>,
     depth: Cell<u32>,
     last_report: RefCell<IndexReport>,
+    /// Counts unsettled entities during a full index (see [`META_UNSETTLED`]).
+    unsettled: Cell<usize>,
 }
 
 fn internal(error: impl Display) -> RoduError {
@@ -124,6 +132,16 @@ fn write_durably(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all().map_err(|e| io(e, path))
 }
 
+/// Flushes a directory's entries, so a file created or renamed in it survives a power loss.
+/// Windows has no such call; NTFS journals its directory changes.
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(dir).and_then(|d| d.sync_all()).map_err(|e| io(e, dir))?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 fn ignore_missing(result: std::io::Result<()>, path: &Path) -> Result<()> {
     match result {
         Err(e) if e.kind() != ErrorKind::NotFound => Err(io(e, path)),
@@ -131,8 +149,12 @@ fn ignore_missing(result: std::io::Result<()>, path: &Path) -> Result<()> {
     }
 }
 
-fn put_fields(map: &LoroMap, fields: Fields) -> Result<()> {
-    for (key, value) in fields {
+/// Writes the fields that differ from `old` (all of them without one) and from the document.
+fn put_fields(map: &LoroMap, fields: Fields, old: Option<Fields>) -> Result<()> {
+    for (n, (key, value)) in fields.into_iter().enumerate() {
+        if old.as_ref().is_some_and(|old| old[n] == (key, value.clone())) {
+            continue;
+        }
         let same =
             matches!(map.get(key), Some(ValueOrContainer::Value(ref current)) if *current == value);
         if !same {
@@ -183,6 +205,7 @@ impl LoroStore {
             dirty: Cell::new(false),
             depth: Cell::new(0),
             last_report: RefCell::new(IndexReport::default()),
+            unsettled: Cell::new(0),
         };
         store.sql.transaction(TxMode::Write, || {
             let peer = match store.sql.index_meta(META_PEER)? {
@@ -262,6 +285,7 @@ impl LoroStore {
         match fs::read(&next) {
             Ok(bytes) if meta.as_deref() == Some(sha256(&bytes).as_str()) => {
                 ignore_missing(fs::rename(&next, self.doc_path()), &next)?;
+                sync_dir(&self.dir)?;
             }
             Ok(_) => ignore_missing(fs::remove_file(&next), &next)?,
             Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -346,6 +370,7 @@ impl LoroStore {
         let bytes = doc.export(ExportMode::Snapshot).map_err(internal)?;
         let hash = sha256(&bytes);
         write_durably(&self.next_path(), &bytes)?;
+        sync_dir(&self.dir)?;
         self.sql.set_index_meta(META_DOC, &hash)?;
         Ok(hash)
     }
@@ -353,49 +378,62 @@ impl LoroStore {
     fn apply(&self, doc: &LoroDoc, change: &Change) -> Result<()> {
         match change {
             Change::Principal(p) => {
-                put_fields(&entity_map(doc, PRINCIPALS, &p.id)?, layout::principal_fields(p))
+                put_fields(&entity_map(doc, PRINCIPALS, &p.id)?, layout::principal_fields(p), None)
             }
-            Change::Collection(c) => {
-                put_fields(&entity_map(doc, COLLECTIONS, &c.id)?, layout::collection_fields(c))
-            }
-            Change::Cycle(c) => {
-                put_fields(&entity_map(doc, CYCLES, &c.id)?, layout::cycle_fields(c))
-            }
+            Change::Collection(c) => put_fields(
+                &entity_map(doc, COLLECTIONS, &c.id)?,
+                layout::collection_fields(c),
+                None,
+            ),
+            Change::Cycle(old, c) => put_fields(
+                &entity_map(doc, CYCLES, &c.id)?,
+                layout::cycle_fields(c),
+                old.as_ref().map(layout::cycle_fields),
+            ),
             Change::Comment(c) => {
-                put_fields(&entity_map(doc, COMMENTS, &c.id)?, layout::comment_fields(c))
+                put_fields(&entity_map(doc, COMMENTS, &c.id)?, layout::comment_fields(c), None)
             }
             Change::Link(l) => {
                 let key = layout::link_key(&l.from_item_id, l.kind.as_str(), &l.target);
-                put_fields(&entity_map(doc, LINKS, &key)?, layout::link_fields(l))
+                put_fields(&entity_map(doc, LINKS, &key)?, layout::link_fields(l), None)
             }
-            Change::Item(i) => {
+            Change::Item(change) => {
+                let (old, i) = &**change;
                 if !is_uuid(&i.id) {
                     return Err(internal(format!("{:?} is not an id", i.id)));
                 }
                 let tree = doc.get_tree(ITEMS);
-                let parent = match &i.parent_id {
-                    Some(p) => {
-                        TreeParentId::Node(*self.nodes.borrow().get(p).ok_or_else(|| {
-                            internal(format!("parent {p} is not in the document"))
-                        })?)
-                    }
-                    None => TreeParentId::Root,
-                };
+                let parent =
+                    || -> Result<TreeParentId> {
+                        Ok(match &i.parent_id {
+                            Some(p) => TreeParentId::Node(*self.nodes.borrow().get(p).ok_or_else(
+                                || internal(format!("parent {p} is not in the document")),
+                            )?),
+                            None => TreeParentId::Root,
+                        })
+                    };
                 let existing = self.nodes.borrow().get(&i.id).copied();
                 let node = match existing {
                     Some(node) => {
-                        if tree.parent(node) != Some(parent) {
-                            tree.mov(node, parent).map_err(internal)?;
+                        // Moved only when the write changed the parent: the index may show none
+                        // where the document has one it could not resolve.
+                        if old.as_ref().is_none_or(|old| old.parent_id != i.parent_id) {
+                            let parent = parent()?;
+                            if tree.parent(node) != Some(parent) {
+                                tree.mov(node, parent).map_err(internal)?;
+                            }
                         }
                         node
                     }
                     None => {
-                        let node = tree.create(parent).map_err(internal)?;
+                        let node = tree.create(parent()?).map_err(internal)?;
                         self.nodes.borrow_mut().insert(i.id.clone(), node);
                         node
                     }
                 };
-                put_fields(&tree.get_meta(node).map_err(internal)?, layout::item_fields(i))
+                // A node made here gets every field.
+                let old = existing.and(old.as_ref()).map(layout::item_fields);
+                put_fields(&tree.get_meta(node).map_err(internal)?, layout::item_fields(i), old)
             }
         }
     }
@@ -420,6 +458,7 @@ impl LoroStore {
     /// Rebuilds the whole index from the document.
     fn index_all(&self) -> Result<IndexReport> {
         let mut report = IndexReport::default();
+        self.unsettled.set(0);
         self.sql.defer_foreign_keys()?;
         self.sql.clear_shared()?;
         self.index_principals(&mut report)?;
@@ -434,33 +473,46 @@ impl LoroStore {
             self.index_link(&doc, &key, &mut report)?;
         }
         self.sql.raise_next_numbers()?;
+        self.sql.set_index_meta(META_UNSETTLED, &self.unsettled.get().to_string())?;
         Ok(report)
     }
 
+    /// Indexes what an import touched. Only clean changes are indexed one by one: a card, comment
+    /// or link that decodes and whose references all resolve, without a clash. Anything else (a
+    /// group of names changed, a malformed or unresolved entity, or an index already unsettled)
+    /// rebuilds the whole index, so the result never depends on what arrived when.
     fn index_touched(&self, touched: &Touched) -> Result<IndexReport> {
+        let unsettled: usize =
+            self.sql.index_meta(META_UNSETTLED)?.and_then(|n| n.parse().ok()).unwrap_or(0);
+        if unsettled > 0 || touched.principals || touched.collections || touched.cycles {
+            return self.index_all();
+        }
         let mut report = IndexReport::default();
         self.sql.defer_foreign_keys()?;
-        if touched.principals {
-            self.index_principals(&mut report)?;
-        }
-        if touched.collections {
-            self.index_collections(&mut report)?;
-        }
-        if touched.cycles {
-            self.index_cycles(&mut report)?;
-        }
-        if !touched.items.is_empty() {
-            self.index_some_items(&touched.items, &mut report)?;
+        if !self.index_some_items(&touched.items, &mut report)? {
+            return self.index_all();
         }
         let doc = self.doc.borrow();
         for id in &touched.comments {
-            self.index_comment(&doc, id, &mut report)?;
+            if !self.index_comment(&doc, id, &mut report)? {
+                drop(doc);
+                return self.index_all();
+            }
         }
         for key in &touched.links {
-            self.index_link(&doc, key, &mut report)?;
+            if !self.index_link(&doc, key, &mut report)? {
+                drop(doc);
+                return self.index_all();
+            }
         }
         self.sql.raise_next_numbers()?;
         Ok(report)
+    }
+
+    /// Reports an entity held differently until something it points to arrives.
+    fn unsettled(&self, report: &mut IndexReport, problem: String) {
+        report.problems.push(problem);
+        self.unsettled.set(self.unsettled.get() + 1);
     }
 
     fn index_principals(&self, report: &mut IndexReport) -> Result<()> {
@@ -476,7 +528,7 @@ impl LoroStore {
             let mut p = p.clone();
             p.name = assigned.names[&p.id].clone();
             if p.owner_id.as_deref().is_some_and(|o| !ids.contains(o)) {
-                report.problems.push(format!("principal {}: unknown owner cleared", p.id));
+                self.unsettled(report, format!("principal {}: unknown owner cleared", p.id));
                 p.owner_id = None;
             }
             self.sql.put_principal(&p)?;
@@ -507,7 +559,7 @@ impl LoroStore {
             if self.has_collection(&c.collection_id)? {
                 all.push(c);
             } else {
-                report.problems.push(format!("cycle {}: unknown collection", c.id));
+                self.unsettled(report, format!("cycle {}: unknown collection", c.id));
             }
         }
         let entries: Vec<Entry<'_>> = all
@@ -543,37 +595,38 @@ impl LoroStore {
         layout::item(&meta, parent)
     }
 
-    /// Clears references the index cannot hold; false if the card cannot be indexed at all.
+    /// Clears the references of a card in an indexed collection that the index cannot hold;
+    /// `cards` are the cards being indexed. Returns whether all of them resolved.
     fn check_item_refs(
         &self,
         item: &mut Item,
         cards: &HashSet<String>,
         report: &mut IndexReport,
     ) -> Result<bool> {
-        if !self.has_collection(&item.collection_id)? {
-            report.problems.push(format!("card {}: unknown collection", item.id));
-            return Ok(false);
-        }
+        let mut clean = true;
         if let Some(a) = &item.assignee_id
             && !self.has_principal(a)?
         {
-            report.problems.push(format!("card {}: unknown assignee cleared", item.id));
+            self.unsettled(report, format!("card {}: unknown assignee cleared", item.id));
             item.assignee_id = None;
+            clean = false;
         }
         if let Some(c) = &item.cycle_id
             && self.sql.find_cycle(&item.collection_id, c)?.is_none_or(|found| found.id != *c)
         {
-            report.problems.push(format!("card {}: unknown cycle cleared", item.id));
+            self.unsettled(report, format!("card {}: unknown cycle cleared", item.id));
             item.cycle_id = None;
+            clean = false;
         }
         if let Some(p) = &item.parent_id
             && !cards.contains(p)
             && self.sql.get_item(p)?.is_none()
         {
-            report.problems.push(format!("card {}: unknown parent cleared", item.id));
+            self.unsettled(report, format!("card {}: unknown parent cleared", item.id));
             item.parent_id = None;
+            clean = false;
         }
-        Ok(true)
+        Ok(clean)
     }
 
     fn put_item(&self, mut item: Item, replace_text: bool, report: &mut IndexReport) -> Result<()> {
@@ -596,36 +649,39 @@ impl LoroStore {
                 }
             }
         }
-        let cards: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+        // Cards left out first, so no card keeps a parent that is not indexed.
         let mut kept = Vec::new();
-        for mut item in items {
-            if self.check_item_refs(&mut item, &cards, report)? {
+        for item in items {
+            if self.has_collection(&item.collection_id)? {
                 kept.push(item);
+            } else {
+                self.unsettled(report, format!("card {}: unknown collection", item.id));
             }
         }
-        let conflicts = assign_item_keys(&mut kept, report);
+        let cards: HashSet<String> = kept.iter().map(|i| i.id.clone()).collect();
+        for item in &mut kept {
+            self.check_item_refs(item, &cards, report)?;
+        }
+        let lost = assign_item_keys(&mut kept, report);
+        self.unsettled.set(self.unsettled.get() + lost);
         self.sql.park_names(Parked::Items)?;
         self.sql.clear_item_text()?;
         for item in kept {
             self.put_item(item, false, report)?;
         }
-        self.sql.set_index_meta(META_ITEM_CONFLICTS, &conflicts.to_string())
+        Ok(())
     }
 
-    /// Indexes the touched cards, falling back to every card when keys clash.
-    fn index_some_items(&self, ids: &BTreeSet<String>, report: &mut IndexReport) -> Result<()> {
-        let conflicts: usize =
-            self.sql.index_meta(META_ITEM_CONFLICTS)?.and_then(|n| n.parse().ok()).unwrap_or(0);
-        if conflicts > 0 {
-            return self.index_all_items(report);
-        }
+    /// Indexes the touched cards if each is clean (see [`LoroStore::index_touched`]); false if
+    /// one is not, leaving the rest to a full rebuild.
+    fn index_some_items(&self, ids: &BTreeSet<String>, report: &mut IndexReport) -> Result<bool> {
         let mut items = Vec::new();
         {
             let doc = self.doc.borrow();
             for id in ids {
                 match self.doc_item(&doc, id) {
                     Ok(item) => items.push(item),
-                    Err(problem) => report.problems.push(problem),
+                    Err(_) => return Ok(false),
                 }
             }
         }
@@ -648,51 +704,65 @@ impl LoroStore {
                 None => false,
             };
             if clash(&item.key)? || alias_clash || number_clash {
-                return self.index_all_items(report);
+                return Ok(false);
+            }
+            if !self.has_collection(&item.collection_id)? {
+                return Ok(false);
             }
         }
         let cards: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
-        for mut item in items {
-            if self.check_item_refs(&mut item, &cards, report)? {
-                self.put_item(item, true, report)?;
+        for item in &mut items {
+            if !self.check_item_refs(item, &cards, report)? {
+                return Ok(false);
             }
         }
-        Ok(())
+        for item in items {
+            self.put_item(item, true, report)?;
+        }
+        Ok(true)
     }
 
-    fn index_comment(&self, doc: &LoroDoc, id: &str, report: &mut IndexReport) -> Result<()> {
-        let Some(map) = map_child(&doc.get_map(COMMENTS), id) else { return Ok(()) };
+    /// Indexes one comment; false if it was left out or changed.
+    fn index_comment(&self, doc: &LoroDoc, id: &str, report: &mut IndexReport) -> Result<bool> {
+        let Some(map) = map_child(&doc.get_map(COMMENTS), id) else { return Ok(true) };
         let mut c = match layout::comment(id, &map) {
             Ok(c) => c,
             Err(problem) => {
                 report.problems.push(problem);
-                return Ok(());
+                return Ok(false);
             }
         };
         if self.sql.get_item(&c.item_id)?.is_none() || !self.has_principal(&c.author_id)? {
-            report.problems.push(format!("comment {id}: unknown card or author"));
-            return Ok(());
+            self.unsettled(report, format!("comment {id}: unknown card or author"));
+            return Ok(false);
         }
+        let mut clean = true;
         if let Some(agent) = &c.via_agent_id
             && !self.has_principal(agent)?
         {
-            report.problems.push(format!("comment {id}: unknown agent cleared"));
+            self.unsettled(report, format!("comment {id}: unknown agent cleared"));
             c.via_agent_id = None;
+            clean = false;
         }
-        self.sql.put_comment(&c)
+        self.sql.put_comment(&c)?;
+        Ok(clean)
     }
 
-    fn index_link(&self, doc: &LoroDoc, key: &str, report: &mut IndexReport) -> Result<()> {
-        let Some(map) = map_child(&doc.get_map(LINKS), key) else { return Ok(()) };
+    /// Indexes one link; false if it was left out.
+    fn index_link(&self, doc: &LoroDoc, key: &str, report: &mut IndexReport) -> Result<bool> {
+        let Some(map) = map_child(&doc.get_map(LINKS), key) else { return Ok(true) };
         match layout::link(key, &map) {
-            Ok(l) if self.sql.get_item(&l.from_item_id)?.is_some() => self.sql.put_link(&l),
+            Ok(l) if self.sql.get_item(&l.from_item_id)?.is_some() => {
+                self.sql.put_link(&l)?;
+                Ok(true)
+            }
             Ok(_) => {
-                report.problems.push(format!("link {key}: unknown card"));
-                Ok(())
+                self.unsettled(report, format!("link {key}: unknown card"));
+                Ok(false)
             }
             Err(problem) => {
                 report.problems.push(problem);
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -867,7 +937,8 @@ impl Store for LoroStore {
             (Ok(_), Some(hash)) => {
                 let next = self.next_path();
                 // If this rename fails, whoever next takes the write lock finishes it.
-                let _ = ignore_missing(fs::rename(&next, self.doc_path()), &next);
+                let _ = ignore_missing(fs::rename(&next, self.doc_path()), &next)
+                    .and_then(|()| sync_dir(&self.dir));
                 *self.loaded.borrow_mut() = Some(Some(hash));
                 self.dirty.set(false);
                 result
@@ -911,11 +982,18 @@ impl Store for LoroStore {
     }
 
     fn insert_cycle(&self, c: &Cycle) -> Result<()> {
-        self.write(|| self.sql.insert_cycle(c), |_| Some(Change::Cycle(c.clone())))
+        self.write(|| self.sql.insert_cycle(c), |_| Some(Change::Cycle(None, c.clone())))
     }
 
     fn save_cycle(&self, c: &Cycle) -> Result<()> {
-        self.write(|| self.sql.save_cycle(c), |_| Some(Change::Cycle(c.clone())))
+        self.write(
+            || {
+                let old = self.sql.find_cycle(&c.collection_id, &c.id)?.filter(|o| o.id == c.id);
+                self.sql.save_cycle(c).map(|()| old)
+            },
+            |old| Some(Change::Cycle(old.clone(), c.clone())),
+        )
+        .map(drop)
     }
 
     fn find_cycle(&self, collection_id: &str, id_or_name: &str) -> Result<Option<Cycle>> {
@@ -945,7 +1023,10 @@ impl Store for LoroStore {
     }
 
     fn insert_item(&self, item: &Item) -> Result<()> {
-        self.write(|| self.sql.insert_item(item), |_| Some(Change::Item(item.clone())))
+        self.write(
+            || self.sql.insert_item(item),
+            |_| Some(Change::Item(Box::new((None, item.clone())))),
+        )
     }
 
     fn get_item(&self, id: &str) -> Result<Option<Item>> {
@@ -962,9 +1043,13 @@ impl Store for LoroStore {
 
     fn save_item(&self, item: &Item, expected_version: i64) -> Result<bool> {
         self.write(
-            || self.sql.save_item(item, expected_version),
-            |saved| saved.then(|| Change::Item(item.clone())),
+            || {
+                let old = self.sql.get_item(&item.id)?;
+                Ok((self.sql.save_item(item, expected_version)?, old))
+            },
+            |(saved, old)| saved.then(|| Change::Item(Box::new((old.clone(), item.clone())))),
         )
+        .map(|(saved, _)| saved)
     }
 
     fn list_children(&self, parent_id: &str) -> Result<Vec<Item>> {
