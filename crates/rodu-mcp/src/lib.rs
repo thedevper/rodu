@@ -122,23 +122,34 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
             .unwrap_or_else(|e| Err(RoduError::internal(format!("tool task failed: {e}"))))
     }
 
-    /// One step of live sync under the service lock; a no-op without live sync.
-    fn live_step<T>(&self, step: impl FnOnce(&Live<S>, &RoduService<S>) -> T) {
-        if let Some(live) = &self.live
-            && let Ok(service) = self.service.lock()
-        {
-            step(live, &service);
-        }
-    }
-
     fn max_batch(&self) -> usize {
         self.with_service(|s| Ok(s.max_batch)).unwrap_or(rodu_core::service::DEFAULT_MAX_BATCH)
     }
 
-    fn run(&self, name: &str, args: &JsonObject) -> Result<Output, RoduError> {
+    /// Runs a tool under one hold of the service lock: with live sync, a pull before it and a push
+    /// after it, so no other tool call or sync step lands in between.
+    fn call(&self, name: &str, args: &JsonObject) -> Result<Output, RoduError> {
+        self.with_service(|service| {
+            if let Some(live) = &self.live {
+                live.pull(service);
+            }
+            let outcome = self.run(service, name, args);
+            if let Some(live) = &self.live {
+                live.push(service);
+            }
+            outcome
+        })
+    }
+
+    fn run(
+        &self,
+        service: &RoduService<S>,
+        name: &str,
+        args: &JsonObject,
+    ) -> Result<Output, RoduError> {
         let args = Args { tool: name, map: args };
         let actor = &self.actor;
-        self.with_service(|service| match name {
+        match name {
             "search" => {
                 let query = args.string_or("query", 0, 2000, "")?;
                 let limit = args.int_or("limit", 1, 100, 20)?;
@@ -231,7 +242,7 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
                 pretty(&plan_cycle(service, actor, &collection, &cycle, &refs, create_if_missing)?)
             }
             other => Err(RoduError::invalid(format!("Unknown tool \"{other}\""))),
-        })
+        }
     }
 }
 
@@ -739,14 +750,7 @@ impl<S: Store + Send + 'static> ServerHandler for RoduMcp<S> {
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
-        let outcome = self
-            .blocking(move |server| {
-                server.live_step(Live::pull);
-                let outcome = server.run(&name, &args);
-                server.live_step(Live::push);
-                outcome
-            })
-            .await;
+        let outcome = self.blocking(move |server| server.call(&name, &args)).await;
         Ok(tool_result(outcome).into())
     }
 

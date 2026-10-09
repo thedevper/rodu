@@ -375,6 +375,39 @@ async fn a_live_server_pulls_before_each_tool_call_and_pushes_after() {
     assert_eq!(*sync.calls.lock().unwrap(), ["pull", "push", "pull", "push"]);
 }
 
+/// Pulls slowly, so a tool call that is not serialized with sync work shows up in the order.
+struct Slow(std::sync::Mutex<Vec<&'static str>>);
+
+impl rodu_core::LiveSync<SqliteStore> for Slow {
+    fn pull(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<rodu_core::Pulled> {
+        self.0.lock().unwrap().push("pull");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        Ok(rodu_core::Pulled::default())
+    }
+
+    fn push(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<Vec<String>> {
+        self.0.lock().unwrap().push("push");
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_tool_calls_each_run_pull_tool_push_without_interleaving() {
+    let (service, actor) = demo_service(SqliteStore::memory().unwrap());
+    let sync = std::sync::Arc::new(Slow(std::sync::Mutex::default()));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = RoduMcp::new(service, actor).with_live(sync.clone());
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client: Client = ().serve(client_io).await.unwrap();
+    let search = || call(&client, "search", json!({ "query": "" }));
+    tokio::join!(search(), search(), search(), search());
+    assert_eq!(*sync.0.lock().unwrap(), ["pull", "push"].repeat(4));
+}
+
 #[test]
 fn live_sync_warnings_are_written_once_until_they_change() {
     let (service, _) = demo_service(SqliteStore::memory().unwrap());
