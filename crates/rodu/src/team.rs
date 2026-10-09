@@ -380,21 +380,22 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     save_config(&dir, &config)?;
     (io.out)(&format!("This workspace now syncs through {}", folder_path.display()));
     (io.out)(&secret_line(&["Invite code: ", code.as_str()]));
-    (io.out)(&secret_line(&[
-        "A teammate joins with: rodu team join ",
-        code.as_str(),
-        " --folder <the same folder on their machine> --name <their name>",
-    ]));
     if encrypted {
+        // The code is printed once: the join reads it from stdin, out of shell history.
+        (io.out)(
+            "A teammate joins with: rodu team join - --folder <the same folder on their machine> \
+             --name <their name>, then pastes the invite code",
+        );
         (io.out)(
             "Keep the invite code secret: it holds the team key. The sync files are encrypted; \
              anyone with the code and the folder can read and change the board.",
         );
-        (io.out)(
-            "To keep it out of shell history, a teammate can paste it into: \
-             rodu team join - --folder <path> --name <their name>",
-        );
     } else {
+        (io.out)(&secret_line(&[
+            "A teammate joins with: rodu team join ",
+            code.as_str(),
+            " --folder <the same folder on their machine> --name <their name>",
+        ]));
         (io.out)(
             "The sync files are not encrypted: anyone with access to the folder can read them.",
         );
