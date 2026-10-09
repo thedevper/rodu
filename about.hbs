@@ -3,7 +3,8 @@ THIRD-PARTY NOTICES
 Rodu is licensed under the Apache License 2.0 (see LICENSE and NOTICE). It is built
 with the third-party software below, compiled into the rodu program and into the
 WebAssembly web board that rodu serves. Each licence text follows the list of the
-components it covers.
+components it covers. The exact source of every component is the crates.io archive
+given as its "source".
 
 Also compiled in, and not listed below:
 
@@ -19,6 +20,7 @@ Also compiled in, and not listed below:
 Used by:
 {{#each used_by}}
   - {{crate.name}} {{crate.version}}{{#if crate.repository}} <{{crate.repository}}>{{/if}}
+    source: https://static.crates.io/crates/{{crate.name}}/{{crate.name}}-{{crate.version}}.crate
 {{/each}}
 --------------------------------------------------------------------------------
 

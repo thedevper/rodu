@@ -38,6 +38,9 @@ Every crate that ends up in a release must be under a licence in [`about.toml`](
 `dist/THIRD-PARTY-NOTICES.txt` and fails on anything else, so a new
 dependency with an unlisted licence needs a deliberate decision, not a quiet addition.
 
+`cargo audit --deny warnings` (needs `cargo install cargo-audit --locked`) fails on any RustSec
+advisory that [`.cargo/audit.toml`](.cargo/audit.toml) does not accept with a reason.
+
 ## Before opening a pull request
 
 ```sh
@@ -46,5 +49,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p rodu-web --target wasm32-unknown-unknown -- -D warnings
 cargo test --workspace
 cargo xtask notices  # when dependencies change
+cargo audit --deny warnings
 cargo xtask web      # when the web board changes
 ```

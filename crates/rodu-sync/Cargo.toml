@@ -1,0 +1,18 @@
+[package]
+name = "rodu-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+loro = "1.16.2"
+thiserror = "2.0.21"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+xxhash-rust = { version = "0.8.19", features = ["xxh32"] }

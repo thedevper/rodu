@@ -86,6 +86,7 @@ cargo build --release -p rodu         # target/release/rodu, with the board embe
 |---|---|
 | `crates/rodu-core` | Domain model, workflow rules, JQL-lite parser, `RoduService`, `Store` trait |
 | `crates/rodu-store` | SQLite store with FTS5, JQL-lite to SQL compiler |
+| `crates/rodu-sync` | Replicated document for team sync, on Loro ([ADR 0001](docs/adr/0001-sync-crdt.md)) |
 | `crates/rodu-api` | JSON contract shared by the server and the board |
 | `crates/rodu-http` | Local API and static files for the web board |
 | `crates/rodu-mcp` | MCP server |

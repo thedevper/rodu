@@ -97,6 +97,14 @@ What we take on, and how we contain it:
   We ship on that reasoning, record it in `.cargo/audit.toml` per advisory, and follow upstream pull
   request loro-dev/loro#1122, which replaces `im` with its maintained fork `imbl`. We take the
   Loro release that contains it and remove the exceptions.
+- **A crafted file can crash Loro.** A fuzz test in `rodu-sync` found sync files that pass
+  Loro's checksum and make it panic on import or on the first read afterwards, in release builds
+  too, which aborts Rodu (reported privately to Loro on 2026-10-09). Anyone who can write to the sync folder could otherwise stop every
+  teammate's Rodu. So every import from the folder is first replayed in a child process
+  (`Replica::import_untrusted`) and refused if the child crashes, exits with an error, runs past a
+  time limit, or the file is over 64 MB; only then does the real replica import it. The cost is a
+  process start (about 7 ms) plus handing the child a snapshot of the board (export takes about
+  115 ms at 20,000 cards), so the transport checks new files in batches.
 - **MPL-2.0 obligations** for those crates, described under Licensing.
 - **About 2 MB more binary** (about 0.4 MB for yrs). Rodu 0.3.0 is 5.4 MB.
 - **100 more crates in what we ship** (139 against 39 for yrs), all covered by `about.toml` and
