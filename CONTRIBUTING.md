@@ -34,7 +34,8 @@ including anything from your employer or a customer.
 ## Dependencies and licences
 
 Every crate that ends up in a release must be under a licence in [`about.toml`](about.toml).
-`cargo xtask notices` regenerates `THIRD-PARTY-NOTICES.txt` and fails on anything else, so a new
+`cargo xtask notices` (needs `cargo install cargo-about --locked --features cli`) writes
+`dist/THIRD-PARTY-NOTICES.txt` and fails on anything else, so a new
 dependency with an unlisted licence needs a deliberate decision, not a quiet addition.
 
 ## Before opening a pull request
@@ -42,6 +43,8 @@ dependency with an unlisted licence needs a deliberate decision, not a quiet add
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p rodu-web --target wasm32-unknown-unknown -- -D warnings
 cargo test --workspace
+cargo xtask notices  # when dependencies change
 cargo xtask web      # when the web board changes
 ```

@@ -1,0 +1,27 @@
+THIRD-PARTY NOTICES
+
+Rodu is licensed under the Apache License 2.0 (see LICENSE and NOTICE). It is built
+with the third-party software below, compiled into the rodu program and into the
+WebAssembly web board that rodu serves. Each licence text follows the list of the
+components it covers.
+
+Also compiled in, and not listed below:
+
+- SQLite, built in by the libsqlite3-sys crate. SQLite is in the public domain:
+  https://sqlite.org/copyright.html
+- The Rust standard library, licensed MIT OR Apache-2.0:
+  https://github.com/rust-lang/rust
+
+{{#each licenses}}
+================================================================================
+{{name}} ({{id}})
+
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} <{{crate.repository}}>{{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+
+{{{text}}}
+
+{{/each}}

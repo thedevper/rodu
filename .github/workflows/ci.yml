@@ -1,0 +1,176 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dco:
+    # Every commit in a pull request certifies the DCO (CONTRIBUTING.md) as its author.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Check Signed-off-by
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            author=$(git log -1 --format='%an <%ae>' "$c")
+            if ! git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$c" | grep -qxF "$author"; then
+              echo "::error::$(git log -1 --format='%h %s' "$c"): no 'Signed-off-by: $author'. Sign off with git commit -s (see CONTRIBUTING.md)."
+              status=1
+            fi
+          done
+          exit $status
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal -c rustfmt,clippy -t wasm32-unknown-unknown && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy -p rodu-web --target wasm32-unknown-unknown --locked -- -D warnings
+      # Fails on any shipped crate whose licence is not accepted in about.toml.
+      - run: cargo xtask notices
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: darwin-arm64, triple: aarch64-apple-darwin }
+          - { os: macos-latest, target: darwin-x64, triple: x86_64-apple-darwin }
+          - { os: windows-latest, target: windows-x64, triple: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal -t wasm32-unknown-unknown,${{ matrix.triple }} && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Tag matches the version in the code
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+          # The install commands in the README must point at this release's scripts.
+          [ "$(grep -c "TheDevper/rodu/v$version/packaging/install" README.md)" = 2 ] ||
+            { echo "README install URLs do not name v$version"; exit 1; }
+      - name: Tool versions pinned by Cargo.lock
+        id: tools
+        shell: bash
+        run: echo "wasm_bindgen=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.tools.outputs.wasm_bindgen }},cargo-about
+      - run: cargo xtask dist --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/release/
+          if-no-files-found: error
+
+  release-files:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist/release
+          merge-multiple: true
+      - run: cargo xtask release-files
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/release/
+          if-no-files-found: error
+
+  smoke:
+    # Installs each binary with the same script users run, on its own OS, and drives it.
+    needs: release-files
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+          - os: macos-15-intel
+          - os: windows-latest
+            shell: powershell
+          - os: windows-latest
+            shell: pwsh
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist/release
+      - name: Install with install.sh and smoke test
+        if: runner.os == 'macOS'
+        run: |
+          export RODU_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          export RODU_BIN_DIR="$RUNNER_TEMP/bin"
+          export RODU_DOWNLOAD_BASE="file://$GITHUB_WORKSPACE/dist/release"
+          export XDG_DATA_HOME="$RUNNER_TEMP/share"
+          sh packaging/install.sh
+          for n in LICENSE NOTICE THIRD-PARTY-NOTICES.txt; do test -s "$XDG_DATA_HOME/rodu/$n"; done
+          cargo xtask smoke "$RUNNER_TEMP/bin/rodu"
+      - name: Install with irm | iex on Windows PowerShell 5.1 and smoke test
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./scripts/ci-install-windows.ps1
+      - name: Install with irm | iex on PowerShell 7 and smoke test
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: ./scripts/ci-install-windows.ps1
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist/release
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/release/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes
