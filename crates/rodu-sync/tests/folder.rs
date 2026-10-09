@@ -17,6 +17,8 @@ const POISON_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON";
 /// With [`POISON_ENV`]: only when replayed with other files, as if they broke Loro once their
 /// pending operations were released.
 const POISON_WITH_OTHERS_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON_WITH_OTHERS";
+/// With [`POISON_ENV`]: the child crashes instead of refusing.
+const POISON_CRASH_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON_CRASH";
 
 #[test]
 #[ignore = "the child process of the import checks, not a test of its own"]
@@ -42,6 +44,9 @@ fn check_child() {
         let poison: u64 = poison.to_str().unwrap().parse().unwrap();
         let others = std::env::var_os(POISON_WITH_OTHERS_ENV).is_some();
         if peers.contains(&poison) && (!others || peers.len() > 1) {
+            if std::env::var_os(POISON_CRASH_ENV).is_some() {
+                std::process::abort();
+            }
             eprintln!("poisoned");
             std::process::exit(2);
         }
@@ -67,9 +72,17 @@ fn checker_logging(log: std::path::PathBuf) -> Checker {
 /// A checker that refuses `peer`'s files, or, with `with_others`, only when other files are
 /// replayed with them.
 fn checker_poisoned(peer: u64, with_others: bool) -> Checker {
+    checker_poisoned_by(peer, with_others, false)
+}
+
+/// As [`checker_poisoned`], with `crash` making the child crash rather than refuse.
+fn checker_poisoned_by(peer: u64, with_others: bool, crash: bool) -> Checker {
     let mut env = vec![(POISON_ENV, peer.to_string().into())];
     if with_others {
         env.push((POISON_WITH_OTHERS_ENV, "1".into()));
+    }
+    if crash {
+        env.push((POISON_CRASH_ENV, "1".into()));
     }
     checker_with(env)
 }
@@ -478,11 +491,20 @@ fn an_import_by_hand_never_leaves_operations_for_the_next_batch() {
 
 #[test]
 fn a_held_file_that_breaks_once_released_is_blamed_not_the_file_it_waits_for() {
+    held_file_blamed(false);
+}
+
+#[test]
+fn a_held_file_that_crashes_the_check_once_released_is_blamed_too() {
+    held_file_blamed(true);
+}
+
+fn held_file_blamed(crash: bool) {
     let (_root, folder, a, [earlier, later]) = three();
     // The earlier peer's file is read first and builds on the later peer's honest one.
     let (card, _) = base_and_build(&folder, &later, &earlier);
     a.store().set_import_group_cap(1);
-    let poisoned = checker_poisoned(earlier.store().peer(), true);
+    let poisoned = checker_poisoned_by(earlier.store().peer(), true, crash);
     let report = folder.pull(a.store(), &poisoned).unwrap();
     assert_eq!(report.batch.refused.len(), 1, "{report:?}");
     assert!(report.batch.refused[0].starts_with(&format!("{:016x}", earlier.store().peer())));

@@ -130,8 +130,8 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
     ));
     if !report.batch.waiting.is_empty() {
         (io.out)(&format!(
-            "{} file(s) build on changes from another machine that have not arrived yet; \
-             they are read again until those do",
+            "{} file(s) wait on changes from another machine that have not arrived, or on a \
+             teammate's file that could not be checked yet; they are read again next time",
             report.batch.waiting.len()
         ));
     }
