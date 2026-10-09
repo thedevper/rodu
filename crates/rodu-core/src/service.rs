@@ -1,5 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -91,8 +92,9 @@ pub struct RoduService<S: Store> {
     pub max_batch: usize,
     clock: Clock,
     /// Whether this machine hands out card numbers. In a team only the numbering peer does; the
-    /// others create cards with provisional keys until it numbers them.
-    numbering: bool,
+    /// others create cards with provisional keys until it numbers them. The role can move to
+    /// another machine while a server runs, so it can change behind a shared reference.
+    numbering: AtomicBool,
 }
 
 impl<S: Store> RoduService<S> {
@@ -101,13 +103,23 @@ impl<S: Store> RoduService<S> {
     }
 
     pub fn with_clock(store: S, clock: Clock) -> Self {
-        Self { store, max_batch: DEFAULT_MAX_BATCH, clock, numbering: true }
+        Self { store, max_batch: DEFAULT_MAX_BATCH, clock, numbering: AtomicBool::new(true) }
     }
 
     /// Turns numbering on (the default) or off for this service.
-    pub fn with_numbering(mut self, on: bool) -> Self {
-        self.numbering = on;
+    pub fn with_numbering(self, on: bool) -> Self {
+        self.set_numbering(on);
         self
+    }
+
+    /// Whether this service hands out card numbers.
+    pub fn numbering(&self) -> bool {
+        self.numbering.load(Ordering::SeqCst)
+    }
+
+    /// Turns numbering on or off while the service runs, such as when the role moves.
+    pub fn set_numbering(&self, on: bool) {
+        self.numbering.store(on, Ordering::SeqCst);
     }
 
     pub fn now(&self) -> time::OffsetDateTime {
@@ -519,7 +531,7 @@ impl<S: Store> RoduService<S> {
             for input in &parsed {
                 let now = self.timestamp();
                 let id = self.new_id();
-                let (number, key, provisional_key) = if self.numbering {
+                let (number, key, provisional_key) = if self.numbering() {
                     let number = self.store.next_item_number(&collection.id)?;
                     (Some(number), format_key(&collection.key, number), None)
                 } else {
@@ -586,7 +598,7 @@ impl<S: Store> RoduService<S> {
     /// Gives every card that has only a provisional key its number, per collection in creation
     /// order, in one transaction. Only the numbering peer may do this, so numbers stay unique.
     pub fn assign_numbers(&self, actor: &Actor) -> Result<Vec<Item>> {
-        if !self.numbering {
+        if !self.numbering() {
             return Err(RoduError::conflict("This machine does not hand out card numbers")
                 .with_hint("The team's numbering peer numbers new cards when it syncs"));
         }

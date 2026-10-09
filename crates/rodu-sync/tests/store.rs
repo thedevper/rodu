@@ -897,3 +897,37 @@ fn a_snapshot_left_half_written_is_discarded() {
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(svc.item("DEMO-1").unwrap().title, "Kept");
 }
+
+#[test]
+fn the_numbering_peer_is_shared_and_a_malformed_one_is_none() {
+    let a = Peer::first();
+    assert_eq!(a.store().numbering_peer().unwrap(), None);
+    a.store().set_numbering_peer(a.store().peer()).unwrap();
+    assert_eq!(a.store().numbering_peer().unwrap(), Some(a.store().peer()));
+    // It is in the document, so another machine receives it.
+    let b = Peer::join(&a, "bob");
+    assert_eq!(b.store().numbering_peer().unwrap(), Some(a.store().peer()));
+    // It survives the store being opened again from disk.
+    let reopened = LoroStore::open(a.dir.path()).unwrap();
+    assert_eq!(reopened.numbering_peer().unwrap(), Some(a.store().peer()));
+    // Handed over on b, it reaches a.
+    b.store().set_numbering_peer(b.store().peer()).unwrap();
+    exchange(&a, &b);
+    assert_eq!(a.store().numbering_peer().unwrap(), Some(b.store().peer()));
+
+    // Anything but 16 lowercase hex digits, written by another machine, reads as no peer.
+    for bad in [LoroValue::from("12"), LoroValue::from("00000000000000AB"), LoroValue::from(7_i64)]
+    {
+        let c = Peer::first();
+        let raw = LoroDoc::new();
+        raw.set_peer_id(99).unwrap();
+        let empty = LoroDoc::new().oplog_vv().encode();
+        raw.import(&c.store().updates_since(&empty).unwrap()).unwrap();
+        let start = raw.oplog_vv();
+        raw.get_map("team").insert("numbering_peer", bad.clone()).unwrap();
+        raw.commit();
+        let update = raw.export(loro::ExportMode::updates(&start)).unwrap();
+        c.store().import_untrusted(&update, &checker()).unwrap();
+        assert_eq!(c.store().numbering_peer().unwrap(), None, "{bad:?}");
+    }
+}

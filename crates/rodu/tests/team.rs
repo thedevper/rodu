@@ -85,7 +85,7 @@ fn a_team_shares_one_board_through_a_folder() {
     assert!(ok(&team.ann, &["show", "DEMO-1"]).contains("Todo"));
 
     let status = ok(&bob, &["team"]);
-    assert!(status.contains(&team.code) && status.contains("done by the machine"), "{status}");
+    assert!(status.contains(&team.code) && status.contains("done by machine"), "{status}");
     let synced = ok(&team.ann, &["sync"]);
     assert!(synced.contains("nothing new to send"), "{synced}");
 }
@@ -502,4 +502,87 @@ fn a_running_board_shows_a_teammates_change_without_a_restart() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     assert_ne!(board.get("/api/revision"), before, "the board can tell it changed");
+}
+
+/// The numbering machine's peer id, as `rodu team` prints it for this machine.
+fn machine(dir: &Path) -> String {
+    let status = ok(dir, &["team"]);
+    status.lines().find_map(|l| l.strip_prefix("This machine: ")).expect("a machine id").to_owned()
+}
+
+#[test]
+fn taking_over_numbering_needs_yes_and_moves_the_role() {
+    let team = team();
+    let bob = join(&team, "bob");
+    let refused = rodu(&bob, &["team", "take-numbering"]);
+    assert_ne!(refused.code, 0);
+    assert!(refused.err.contains("--yes"), "{}", refused.err);
+    assert!(ok(&bob, &["team"]).contains("Numbering: done by machine"), "nothing changed");
+    let already = ok(&team.ann, &["team", "take-numbering", "--yes"]);
+    assert!(already.contains("already numbers"), "{already}");
+
+    let took = ok(&bob, &["team", "take-numbering", "--yes"]);
+    assert!(took.contains("now numbers the team's cards"), "{took}");
+    assert!(ok(&bob, &["team"]).contains("this machine gives new cards their numbers"));
+    // bob's cards are numbered at once now.
+    assert!(ok(&bob, &["add", "Numbered by bob"]).contains("DEMO-2"));
+    // ann hears once that the role moved, then makes cards that wait for bob.
+    let moved = rodu(&team.ann, &["add", "From ann"]);
+    assert_eq!(moved.code, 0, "{}", moved.err);
+    let bob_id = machine(&bob);
+    assert!(moved.err.contains(&format!("numbering moved to machine {bob_id}")), "{}", moved.err);
+    assert!(!moved.out.contains("DEMO-3"), "ann's card waits for a number: {}", moved.out);
+    assert!(ok(&team.ann, &["team"]).contains(&format!("done by machine {bob_id}")));
+    assert!(ok(&bob, &["ls"]).contains("DEMO-3"), "bob numbers ann's card when he syncs");
+    assert!(ok(&team.ann, &["ls"]).contains("DEMO-3"));
+}
+
+#[test]
+fn cards_numbered_by_the_old_machine_offline_end_up_with_unique_numbers() {
+    let team = team();
+    let bob = join(&team, "bob");
+    ok(&bob, &["team", "take-numbering", "--yes"]);
+    // ann is offline and has not heard: she still numbers her own cards.
+    let parked = team.folder.with_file_name("Team board (unmounted)");
+    std::fs::rename(&team.folder, &parked).unwrap();
+    let offline = rodu(&team.ann, &["add", "Ann offline"]);
+    assert!(offline.out.contains("DEMO-2"), "{}", offline.out);
+    std::fs::rename(&parked, &team.folder).unwrap();
+    assert!(ok(&bob, &["add", "Bob online"]).contains("DEMO-2"));
+    // ann hears the role moved; bob sees the clash, and numbers the card that lost its number.
+    assert!(rodu(&team.ann, &["sync"]).err.contains("numbering moved"));
+    let clash = rodu(&bob, &["sync"]);
+    assert!(clash.err.contains("DEMO-2: the number is taken"), "{}", clash.err);
+    let _ = rodu(&team.ann, &["sync"]);
+    let numbers = |dir: &Path| {
+        let ls = ok(dir, &["ls"]);
+        let mut keys: Vec<String> = ls
+            .split_whitespace()
+            .filter(|w| w.starts_with("DEMO-") && w[5..].chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_owned)
+            .collect();
+        keys.sort();
+        (keys, ls)
+    };
+    let (at_ann, ls_ann) = numbers(&team.ann);
+    let (at_bob, ls_bob) = numbers(&bob);
+    assert_eq!(at_ann, ["DEMO-1", "DEMO-2", "DEMO-3"], "{ls_ann}");
+    assert_eq!(at_bob, at_ann, "{ls_bob}");
+}
+
+#[test]
+fn a_running_board_stops_numbering_when_the_role_moves() {
+    let team = team();
+    let bob = join(&team, "bob");
+    let board = start_board(&team.ann);
+    ok(&bob, &["team", "take-numbering", "--yes"]);
+    let config = team.ann.join(".rodu/config.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::fs::read_to_string(&config).unwrap().contains("\"numbering\": true") {
+        assert!(std::time::Instant::now() < deadline, "ann's board never gave up numbering");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    drop(board);
+    let said = std::fs::read_to_string(team.ann.join("web-stderr.txt")).unwrap();
+    assert_eq!(said.matches("numbering moved to machine").count(), 1, "{said}");
 }
