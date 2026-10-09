@@ -297,8 +297,10 @@ fn damaged_files_and_files_with_another_peers_ops_are_refused() {
     let mut damaged = frame(b"whatever");
     *damaged.last_mut().unwrap() ^= 1;
     std::fs::write(b_dir.join("0000000051.update"), damaged).unwrap();
-    // A damaged file whose name would move the cursor and clear the screen.
-    std::fs::write(b_dir.join("0000000052\u{1b}[2J.update"), frame(b"x")[..20].repeat(4)).unwrap();
+    // A damaged file whose name would move the cursor and clear the screen. Windows allows no
+    // control characters in a name, so there it is an ordinary damaged file.
+    let name = if cfg!(windows) { "0000000052.update" } else { "0000000052\u{1b}[2J.update" };
+    std::fs::write(b_dir.join(name), frame(b"x")[..20].repeat(4)).unwrap();
     // And a good one from bob.
     b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Real" })], None).unwrap();
     folder.push(b.store()).unwrap();
