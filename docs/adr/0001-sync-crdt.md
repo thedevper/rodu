@@ -229,10 +229,12 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   counter it last exported to and writes them as its next file. A folder without
   `rodu-team.json` (a cloud drive not mounted) is never written to.
 - **Not reading a file twice (built 2026-10-09, step 4c).** Once a file's content has been dealt
-  with (landed, refused or reported damaged), the file is also remembered by its name, size and
-  modification time, and a later pull skips it after a `stat`, without opening it. A command so
-  costs one `stat` per file instead of reading every byte in the folder. A file rewritten in place
-  changes its size or time and is read again. A file still waiting for other operations is not
+  with (landed, refused or reported damaged), the file is also remembered by its name, size,
+  modification time and (on Unix) inode, and a later pull skips it after a `stat`, without opening
+  it. A command so costs one `stat` per file instead of reading every byte in the folder. A file
+  rewritten in place or replaced gets a new time or inode and is read again; only a rewrite that
+  keeps the size and sets the time back, or falls within the file system's time resolution, is
+  missed, and a file a reader already dealt with holds nothing it lacks. A file still waiting for other operations is not
   remembered this way, so it is read on every pull until it lands.
 - **Compaction (built 2026-10-09, step 4c).** Once a replica has written 32 files since it last
   compacted, its push writes one more numbered file holding every operation it has published
@@ -242,8 +244,9 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   conflict copies, links, dotfiles or another replica's files. Files stay one replica's own
   operations, so the import rule that a file holds only its folder's peer is kept; a whole-document
   snapshot would break it. If the merged payload would be over the 64 MiB import cap, the replica
-  does not compact and tries again after as many files more. A removal that fails (other than the
-  file already gone) is a warning, and the next compaction removes the file.
+  does not compact and tries again after as many files more. Anything that goes wrong after the
+  push wrote its own file, such as an old file that cannot be removed, is a warning, not a failed
+  push; the next compaction removes the file.
 - **Readers during a compaction.** Readers never need to know which files a compacted one
   replaces: what links them is the operations' ids, not the file names. The compacted file covers
   every counter of its replica from 0 up to the last export, so it holds every operation of every
@@ -257,8 +260,16 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   - stopped between write and removals: the old files hold nothing new, and a later compaction
     removes them.
 
-  A reader cannot tell a compacted file still in transit from one that will never come. That is
-  the same as for any file in transit.
+  Removals first with no later file leave nothing to wait on, so a reader also keeps, per replica,
+  the highest number among the files it has dealt with. A replica's numbers only grow, and a
+  compacted file is numbered above every file it replaces. When none of that replica's files
+  present is numbered that high, its files were removed and the compacted file has not arrived:
+  - every pull says so (`rodu sync` and the warnings of other commands);
+  - the mark stays until a file numbered that high or higher is there, which resolves it;
+  - a reader cannot tell a file still in transit from one that will never come, so it keeps saying
+    so until the file arrives.
+
+  The same message appears if a replica's folder is emptied by hand.
 - **Commands.** `rodu team create --folder <path> --no-encrypt` turns the workspace in place
   into a team workspace: the document is built from every row of its index, so events,
   idempotency records and versions stay. It prints an invite code, `rodu1-<workspace id>`, which

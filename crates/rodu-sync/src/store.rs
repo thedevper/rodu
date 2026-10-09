@@ -101,6 +101,10 @@ fn with_held<'a>(held: &[&'a Incoming], files: &[&'a Incoming]) -> Vec<Untrusted
     held.iter().chain(files).map(|f| untrusted(f)).collect()
 }
 
+fn highest_key(peer: u64) -> String {
+    format!("sync_highest_{peer:016x}")
+}
+
 fn untrusted(file: &Incoming) -> Untrusted<'_> {
     Untrusted { bytes: &file.bytes, peer: Some(file.peer) }
 }
@@ -578,6 +582,23 @@ impl LoroStore {
     /// Whether a sync file with this key was dealt with before.
     pub fn sync_seen(&self, key: &str) -> Result<bool> {
         self.sql.is_sync_seen(key)
+    }
+
+    /// The highest number of another replica's file this replica has dealt with, if any.
+    pub fn highest_seen(&self, peer: u64) -> Result<Option<u64>> {
+        Ok(self.sql.index_meta(&highest_key(peer))?.and_then(|n| n.parse().ok()))
+    }
+
+    /// Raises [`Self::highest_seen`] for `peer` to `seq`, if it is lower.
+    pub fn raise_highest_seen(&self, peer: u64, seq: u64) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            let key = highest_key(peer);
+            let now: Option<u64> = self.sql.index_meta(&key)?.and_then(|n| n.parse().ok());
+            if now.is_none_or(|n| n < seq) {
+                self.sql.set_index_meta(&key, &seq.to_string())?;
+            }
+            Ok(())
+        })
     }
 
     /// Remembers a sync file that is not worth reading again (damaged), so it is reported once.
