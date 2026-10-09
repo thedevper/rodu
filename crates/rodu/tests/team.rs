@@ -273,6 +273,10 @@ fn sealed_team() -> Sealed {
         .find_map(|l| l.strip_prefix("Invite code: "))
         .expect("an invite code")
         .to_owned();
+    // Printed once; the join it suggests reads the code from stdin, out of shell history.
+    let (_, key) = code.split_once('.').expect("the code holds the key");
+    assert_eq!(out.matches(key).count(), 1, "{out}");
+    assert!(out.contains("rodu team join - --folder"), "{out}");
     Sealed { root, folder, ann, code }
 }
 

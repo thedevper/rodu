@@ -33,8 +33,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
-  team                       where this workspace syncs, and its invite code
-  team [--show-invite]   where this workspace syncs, and its invite code
+  team [--show-invite]       where this workspace syncs, and its invite code
   team create --folder <shared folder> --encrypt|--no-encrypt   share this workspace with a team
   team join <invite code|-> --folder <shared folder> --name <you>   join a team here (- reads the code from stdin)
   sync                       sync with the team folder now (every command also does)
