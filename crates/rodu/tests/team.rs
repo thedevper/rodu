@@ -451,7 +451,9 @@ fn start_board(dir: &Path) -> Board {
     for line in stdout.lines() {
         let line = line.unwrap();
         if let Some(link) = line.strip_prefix("Open: ") {
-            let (base, bearer) = link.split_once("#token=").unwrap();
+            // The credential rides in the fragment, after the one `=`.
+            let (base, fragment) = link.split_once('#').unwrap();
+            let bearer = fragment.split_once('=').unwrap().1;
             let host = base.trim_start_matches("http://").trim_end_matches('/').to_owned();
             return Board { child, host, bearer: bearer.to_owned() };
         }
