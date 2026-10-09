@@ -141,11 +141,53 @@ pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
         Ok(report) => warn_report(io, &report),
         Err(e) => warn(io, &format!("{} (working offline)", e.message)),
     }
-    if team.numbering
+    match settle_numbering(&ws.dir, &ws.config, &ws.service) {
+        Ok(moved) => moved.iter().for_each(|line| warn(io, line)),
+        Err(e) => warn(io, &format!("numbering new cards: {}", e.message)),
+    }
+    if ws.service.numbering()
         && let Err(e) = ws.service.assign_numbers(&user_actor(&ws.config))
     {
         warn(io, &format!("numbering new cards: {}", e.message));
     }
+}
+
+/// Settles which machine numbers cards, after a pull: the one the team document names. A team
+/// made before the document named one keeps the config's choice, and that machine names itself.
+/// Turns the service's numbering on or off to match and records it in the config, so the next
+/// command starts right. Returns a warning when the role moved away from this machine.
+fn settle_numbering(
+    dir: &Path,
+    config: &Config,
+    service: &RoduService<AnyStore>,
+) -> Result<Option<String>> {
+    let (Some(team), Some(store)) = (&config.team, service.store.team()) else { return Ok(None) };
+    let named = store.numbering_peer()?;
+    let here = match named {
+        Some(peer) => peer == store.peer(),
+        None if team.numbering => {
+            store.set_numbering_peer(store.peer())?;
+            true
+        }
+        None => false,
+    };
+    let was = service.numbering();
+    service.set_numbering(here);
+    // The service starts from the config, so a change of role since then is one to record.
+    if here != was {
+        let mut config = config.clone();
+        if let Some(team) = &mut config.team {
+            team.numbering = here;
+        }
+        save_config(dir, &config)?;
+    }
+    Ok(match named {
+        Some(peer) if was && !here => Some(format!(
+            "card numbering moved to machine {peer:016x}; new cards here get provisional keys \
+             until it numbers them"
+        )),
+        _ => None,
+    })
 }
 
 /// After a command in a team workspace: writes this machine's new changes to the folder.
@@ -183,6 +225,7 @@ fn report_lines(report: &PullReport) -> Vec<String> {
 /// and push every other command does before and after it runs.
 pub(crate) struct FolderLive {
     dir: PathBuf,
+    config: Config,
     team: TeamConfig,
     user: Actor,
 }
@@ -193,6 +236,7 @@ pub(crate) fn live(ws: &Workspace) -> Option<std::sync::Arc<dyn LiveSync<AnyStor
     ws.service.store.team()?;
     Some(std::sync::Arc::new(FolderLive {
         dir: ws.dir.clone(),
+        config: ws.config.clone(),
         team,
         user: user_actor(&ws.config),
     }))
@@ -204,7 +248,11 @@ impl LiveSync<AnyStore> for FolderLive {
         let report = team_folder(&self.dir, &self.team)?.pull(store, &checker())?;
         let mut pulled =
             Pulled { changed: !report.batch.imported.is_empty(), warnings: report_lines(&report) };
-        if self.team.numbering {
+        match settle_numbering(&self.dir, &self.config, service) {
+            Ok(moved) => pulled.warnings.extend(moved),
+            Err(e) => pulled.warnings.push(format!("numbering new cards: {}", e.message)),
+        }
+        if service.numbering() {
             match service.assign_numbers(&self.user) {
                 Ok(numbered) => pulled.changed |= !numbered.is_empty(),
                 Err(e) => pulled.warnings.push(format!("numbering new cards: {}", e.message)),
@@ -248,8 +296,14 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
         }
     };
     warn_report(io, &report);
-    let numbered =
-        if team.numbering { ws.service.assign_numbers(&user_actor(&ws.config))?.len() } else { 0 };
+    if let Some(moved) = settle_numbering(&ws.dir, &ws.config, &ws.service)? {
+        warn(io, &moved);
+    }
+    let numbered = if ws.service.numbering() {
+        ws.service.assign_numbers(&user_actor(&ws.config))?.len()
+    } else {
+        0
+    };
     let sent = match folder.push(store) {
         Ok(pushed) => {
             pushed.warnings.iter().for_each(|line| warn(io, line));
@@ -272,6 +326,46 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
             report.batch.waiting.len()
         ));
     }
+    Ok(())
+}
+
+/// `rodu team take-numbering --yes`: makes this machine the one that numbers the team's cards,
+/// for when the machine that did is gone for good. Two machines numbering at once would give
+/// out the same numbers, so it asks for `--yes`; the document names one machine, and the other
+/// stops once it syncs.
+pub(crate) fn take_numbering(io: &mut Io<'_>, args: &Args) -> Result<()> {
+    let ws = open(io, false)?;
+    let Some(store) = ws.service.store.team() else {
+        return Err(RoduError::invalid("This is not a team workspace")
+            .with_hint("Outside a team every card gets its number at once"));
+    };
+    if !args.flag("yes") {
+        return Err(RoduError::invalid("Taking over card numbering needs --yes").with_hint(
+            "Do it only when the machine that numbers cards is gone for good: if it comes back, \
+             a card it numbered offline can get a new number. Then run: \
+             rodu team take-numbering --yes",
+        ));
+    }
+    before(io, &ws);
+    if ws.service.numbering() {
+        (io.out)("This machine already numbers the team's cards");
+        after(io, &ws);
+        return Ok(());
+    }
+    let previous = store.numbering_peer()?;
+    store.set_numbering_peer(store.peer())?;
+    settle_numbering(&ws.dir, &ws.config, &ws.service)?;
+    let numbered = ws.service.assign_numbers(&user_actor(&ws.config))?.len();
+    after(io, &ws);
+    let from = previous.map_or_else(
+        || "the machine that created the team".to_owned(),
+        |peer| format!("machine {peer:016x}"),
+    );
+    (io.out)(&format!(
+        "This machine ({:016x}) now numbers the team's cards, taking over from {from}; \
+         numbered {numbered} waiting card(s)",
+        store.peer()
+    ));
     Ok(())
 }
 
@@ -303,10 +397,15 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
                 );
             }
             (io.out)(&format!("This machine: {:016x}", store.peer()));
-            (io.out)(if team.numbering {
-                "Numbering: this machine gives new cards their numbers"
-            } else {
-                "Numbering: done by the machine that created the team"
+            (io.out)(&match store.numbering_peer()? {
+                Some(peer) if peer == store.peer() => {
+                    "Numbering: this machine gives new cards their numbers".to_owned()
+                }
+                Some(peer) => format!("Numbering: done by machine {peer:016x}"),
+                None if team.numbering => {
+                    "Numbering: this machine gives new cards their numbers".to_owned()
+                }
+                None => "Numbering: done by the machine that created the team".to_owned(),
             });
         }
         _ => (io.out)("Not a team workspace. Make it one: rodu team create --folder <path>"),
@@ -415,6 +514,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     }
     .expecting(&workspace_id);
     folder.create(&workspace_id, store.peer())?;
+    store.set_numbering_peer(store.peer())?;
     folder.push(&store)?;
     config.team = Some(TeamConfig {
         folder: folder_path.display().to_string(),
@@ -609,4 +709,42 @@ fn join_into(
     save_config(dir, &config)?;
     (io.out)(&format!("Joined the team at {} as {name}", dir.display()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy(dir: &Path, numbering: bool) -> (Config, RoduService<AnyStore>) {
+        let config = Config {
+            user_id: "u".into(),
+            agent_id: "a".into(),
+            collection: "DEMO".into(),
+            team: Some(TeamConfig {
+                folder: dir.join("folder").display().to_string(),
+                workspace_id: "w".into(),
+                numbering,
+                encrypted: false,
+            }),
+        };
+        let store = AnyStore::Team(Box::new(LoroStore::open(dir).unwrap()));
+        (config, RoduService::new(store).with_numbering(numbering))
+    }
+
+    #[test]
+    fn a_team_made_before_the_document_named_a_numbering_machine_keeps_its_creator() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, service) = legacy(dir.path(), true);
+        assert_eq!(settle_numbering(dir.path(), &config, &service).unwrap(), None);
+        let store = service.store.team().unwrap();
+        assert_eq!(store.numbering_peer().unwrap(), Some(store.peer()), "it names itself");
+        assert!(service.numbering());
+        assert!(!dir.path().join("config.json").exists(), "nothing changed to record");
+
+        let other = tempfile::tempdir().unwrap();
+        let (config, service) = legacy(other.path(), false);
+        assert_eq!(settle_numbering(other.path(), &config, &service).unwrap(), None);
+        assert_eq!(service.store.team().unwrap().numbering_peer().unwrap(), None);
+        assert!(!service.numbering(), "a teammate's machine never names itself");
+    }
 }

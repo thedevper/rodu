@@ -27,6 +27,22 @@ pub const CYCLES: &str = "cycles";
 pub const COMMENTS: &str = "comments";
 pub const LINKS: &str = "links";
 pub const ITEMS: &str = "items";
+/// Team-wide settings: a map of single values.
+pub const TEAM: &str = "team";
+/// In [`TEAM`]: the peer that numbers cards, as 16 lowercase hex digits.
+pub const NUMBERING_PEER: &str = "numbering_peer";
+
+/// The numbering peer as written to the document.
+pub fn peer_text(peer: u64) -> String {
+    format!("{peer:016x}")
+}
+
+/// Reads a numbering peer back; anything but 16 lowercase hex digits is no peer.
+pub fn parse_peer(text: &str) -> Option<u64> {
+    let hex =
+        text.len() == 16 && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    hex.then(|| u64::from_str_radix(text, 16).ok()).flatten()
+}
 
 /// The longest single-line text field accepted from the document, other than titles and bodies.
 const MAX_FIELD: usize = 200;
