@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use loro::event::Diff;
 use loro::{
-    ExportMode, Frontiers, Index, LoroDoc, LoroMap, LoroTree, LoroValue, TreeID, TreeParentId,
-    ValueOrContainer, VersionVector,
+    Counter, ExportMode, Frontiers, IdSpan, Index, LoroDoc, LoroMap, LoroTree, LoroValue, TreeID,
+    TreeParentId, ValueOrContainer, VersionVector,
 };
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::{
@@ -42,7 +42,7 @@ use sha2::{Digest, Sha256};
 
 use crate::layout::{self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, PRINCIPALS};
 use crate::names::{self, Entry};
-use crate::{Checker, SyncError, check_import};
+use crate::{Checker, MAX_IMPORT_BYTES, SyncError, Untrusted, check_import};
 
 const DB_FILE: &str = "rodu.db";
 const DOC_FILE: &str = "rodu.loro";
@@ -53,6 +53,8 @@ const NEXT_SUFFIX: &str = ".next";
 const PARTIAL_SUFFIX: &str = ".partial";
 const META_DOC: &str = "doc_sha256";
 const META_PEER: &str = "peer";
+/// This replica's own operation counter up to which [`LoroStore::export_own`] has exported.
+const META_EXPORTED: &str = "exported_counter";
 /// How many entities the index holds differently from the document until something else arrives:
 /// a reference cleared or an entity left out because what it points to is missing, or a card that
 /// lost its number or key. While above zero, every import rebuilds the whole index.
@@ -76,6 +78,46 @@ pub struct IndexReport {
 /// A write to replay on the document. An update carries the index row it replaced, so only the
 /// fields the write changed reach the document: the index can show a value the document does not
 /// hold (a name suffixed after a clash, a reference cleared), and that must not be written back.
+/// A sync file from another replica for [`LoroStore::import_batch`].
+pub struct Incoming {
+    /// The replica whose folder held the file: every operation in it must be its own.
+    pub peer: u64,
+    /// Names the file and its content (e.g. `<peer>/<name>/<sha256>`), so the same file is not
+    /// imported twice and a file rewritten under the same name is checked again.
+    pub key: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Marks a held file whose check crashed or timed out once (see [`LoroStore::import_batch`]).
+/// File keys start with a peer's 16 hex digits, so this never names a file.
+fn strike_key(key: &str) -> String {
+    format!("strike:{key}")
+}
+
+/// The files still pending, then `files`, as the child should replay them.
+fn with_held<'a>(held: &[&'a Incoming], files: &[&'a Incoming]) -> Vec<Untrusted<'a>> {
+    held.iter().chain(files).map(|f| untrusted(f)).collect()
+}
+
+fn untrusted(file: &Incoming) -> Untrusted<'_> {
+    Untrusted { bytes: &file.bytes, peer: Some(file.peer) }
+}
+
+/// What [`LoroStore::import_batch`] did.
+#[derive(Debug, Default)]
+pub struct BatchReport {
+    /// Keys of the files imported.
+    pub imported: Vec<String>,
+    /// Files not imported, and why.
+    pub refused: Vec<String>,
+    /// Keys of files imported but holding operations that wait for another replica's earlier
+    /// ones: read again next time, until every operation in them has landed.
+    pub waiting: Vec<String>,
+    /// Why files wait that were not refused: a check that crashed or could not run.
+    pub notes: Vec<String>,
+    pub index: IndexReport,
+}
+
 enum Change {
     Principal(Principal),
     Collection(Collection),
@@ -114,6 +156,13 @@ pub struct LoroStore {
     unsettled: Cell<usize>,
     /// Tree nodes [`LoroStore::load_nodes`] could not map to a card, and why.
     node_problems: RefCell<Vec<String>>,
+    /// [`LoroStore::adopt`] is building the document from a plain workspace's index.
+    adopting: Cell<bool>,
+    /// The most bytes [`LoroStore::import_batch`] sends to the child in one check.
+    group_cap: Cell<usize>,
+    /// The in-memory document holds pending operations no check has replayed: it is reloaded
+    /// from the file, which leaves them out, when the transaction ends.
+    forget_pending: Cell<bool>,
 }
 
 fn internal(error: impl Display) -> RoduError {
@@ -203,9 +252,49 @@ impl LoroStore {
     /// Opens the workspace in `dir`, creating it if empty. An index that does not match the
     /// document (a crash between the two, or a lost `rodu.db`) is rebuilt from the document.
     pub fn open(dir: &Path) -> Result<Self> {
+        let store = Self::load_peer(dir)?;
+        store.sql.transaction(TxMode::Write, || store.settle())?;
+        Ok(store)
+    }
+
+    /// Turns the plain workspace in `dir` into a team workspace: builds the document from every
+    /// row of its index, keeping the index itself (and so events, idempotency records and card
+    /// versions) as it is.
+    pub fn adopt(dir: &Path) -> Result<Self> {
+        if dir.join(DOC_FILE).exists() {
+            return Err(RoduError::conflict("This workspace is already a team workspace"));
+        }
+        if !dir.join(DB_FILE).is_file() {
+            return Err(RoduError::not_found(format!("No workspace in {}", dir.display())));
+        }
+        let store = Self::load_peer(dir)?;
+        store.adopting.set(true);
+        let result = store.transaction(TxMode::Write, || {
+            let sql = &store.sql;
+            let mut pending = store.pending.borrow_mut();
+            pending.extend(sql.list_principals()?.into_iter().map(Change::Principal));
+            pending.extend(sql.list_collections()?.into_iter().map(Change::Collection));
+            pending.extend(sql.all_cycles()?.into_iter().map(|c| Change::Cycle(None, c)));
+            pending.extend(
+                parents_first(sql.items_by_id()?)
+                    .into_iter()
+                    .map(|i| Change::Item(Box::new((None, i)))),
+            );
+            pending.extend(sql.all_comments()?.into_iter().map(Change::Comment));
+            pending.extend(sql.all_links()?.into_iter().map(Change::Link));
+            Ok(())
+        });
+        store.adopting.set(false);
+        result?;
+        Ok(store)
+    }
+
+    /// The store for `dir` with its peer id set, before the document is loaded.
+    fn load_peer(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
         let sql = SqliteStore::open(&dir.join(DB_FILE))?;
         sql.ensure_index_meta()?;
+        sql.ensure_sync_seen()?;
         let store = Self {
             sql,
             dir: dir.to_path_buf(),
@@ -219,6 +308,9 @@ impl LoroStore {
             last_report: RefCell::new(IndexReport::default()),
             unsettled: Cell::new(0),
             node_problems: RefCell::new(Vec::new()),
+            adopting: Cell::new(false),
+            group_cap: Cell::new(MAX_IMPORT_BYTES),
+            forget_pending: Cell::new(false),
         };
         store.sql.transaction(TxMode::Write, || {
             let peer = match store.sql.index_meta(META_PEER)? {
@@ -230,9 +322,21 @@ impl LoroStore {
                 }
             };
             store.peer.set(peer);
-            store.settle()
+            Ok(())
         })?;
         Ok(store)
+    }
+
+    /// This replica's Loro peer id.
+    pub fn peer(&self) -> u64 {
+        self.peer.get()
+    }
+
+    /// Lowers the bytes checked at once by [`LoroStore::import_batch`], so tests can split a
+    /// batch into groups without writing 64 MiB.
+    #[doc(hidden)]
+    pub fn set_import_group_cap(&self, cap: usize) {
+        self.group_cap.set(cap.min(MAX_IMPORT_BYTES));
     }
 
     /// The index this store reads from.
@@ -263,14 +367,240 @@ impl LoroStore {
         self.transaction(TxMode::Write, || {
             let touched = {
                 let doc = self.doc.borrow();
-                check_import(&doc, bytes, checker).map_err(from_sync)?;
+                check_import(&doc, &[Untrusted { bytes, peer: None }], checker)
+                    .map_err(from_sync)?;
                 let before = doc.oplog_frontiers();
                 self.dirty.set(true);
-                doc.import(bytes).map_err(internal)?;
+                if doc.import(bytes).map_err(internal)?.pending.is_some() {
+                    // Operations waiting on others are dropped, not released unchecked later.
+                    self.forget_pending.set(true);
+                }
                 touched(&doc, &before, &doc.oplog_frontiers())?
             };
             self.load_nodes();
             self.index_touched(&touched)
+        })
+    }
+
+    /// Imports sync files from other replicas. A file is the unit: it is imported whole, after a
+    /// child process replayed it on this document, or not at all. Each must hold only its
+    /// writer's operations (peer 0 is never a writer), and a file whose key was dealt with before
+    /// is skipped. Files go to the child in groups under the import cap, a whole group at once
+    /// when it passes; when a group is refused, each of its files is checked alone, against the
+    /// document with the files accepted so far, so one bad file never holds the rest back. A file
+    /// found invalid is remembered and reported once; one that could not be checked (a crash or
+    /// timeout) is tried again next time.
+    pub fn import_batch(&self, incoming: &[Incoming], checker: &Checker) -> Result<BatchReport> {
+        self.transaction(TxMode::Write, || {
+            let mut report = BatchReport::default();
+            let mut groups: Vec<Vec<&Incoming>> = vec![Vec::new()];
+            let mut size = 0;
+            for file in incoming {
+                if self.sql.is_sync_seen(&file.key)? {
+                    continue;
+                }
+                if file.peer == 0 || file.bytes.len() > MAX_IMPORT_BYTES {
+                    self.sql.mark_sync_seen(&file.key)?;
+                    report.refused.push(format!("{}: not a valid sync file", file.key));
+                    continue;
+                }
+                if size + file.bytes.len() > self.group_cap.get() {
+                    groups.push(Vec::new());
+                    size = 0;
+                }
+                size += file.bytes.len();
+                groups.last_mut().expect("a group").push(file);
+            }
+            let touched = {
+                let doc = self.doc.borrow();
+                let before = doc.oplog_frontiers();
+                // Loro keeps operations whose causal predecessors have not arrived (another
+                // replica's file still syncing, or read later in this batch) pending in memory,
+                // and a saved document leaves them out. They are applied when the predecessors
+                // land, so every check replays the files still pending first: the child then
+                // applies them exactly when this process would. A file is done with only once
+                // all of its operations are in the log; until then it is read again each time.
+                let in_log = |file: &Incoming| -> Result<bool> {
+                    let end = LoroDoc::decode_import_blob_meta(&file.bytes, false)
+                        .map_err(internal)?
+                        .partial_end_vv;
+                    Ok(doc.oplog_vv().includes_vv(&end))
+                };
+                let mut landed: Vec<&Incoming> = Vec::new();
+                let mut held: Vec<&Incoming> = Vec::new();
+                // Held files found to fail once released: refused, and left out at the end.
+                let mut blamed: Vec<&str> = Vec::new();
+                // A blamed file's operations are still pending in this document, so nothing
+                // more can be imported safely in this batch: the rest wait for the next one,
+                // which starts from the file.
+                let mut stalled = false;
+                let import = |file: &Incoming| -> Result<()> {
+                    self.dirty.set(true);
+                    doc.import(&file.bytes).map_err(internal)?;
+                    Ok(())
+                };
+                for group in groups.into_iter().filter(|g| !g.is_empty()) {
+                    if stalled {
+                        report.waiting.extend(group.iter().map(|f| f.key.clone()));
+                        continue;
+                    }
+                    let accepted: Vec<&Incoming> =
+                        if check_import(&doc, &with_held(&held, &group), checker).is_ok() {
+                            group
+                        } else {
+                            let mut accepted = Vec::new();
+                            for file in group {
+                                if stalled {
+                                    report.waiting.push(file.key.clone());
+                                    continue;
+                                }
+                                let mut files = accepted.clone();
+                                files.push(file);
+                                // Checked on the document as it will be: the files accepted
+                                // from this group so far are imported before this one.
+                                let Err(e) = check_import(&doc, &with_held(&held, &files), checker)
+                                else {
+                                    accepted.push(file);
+                                    continue;
+                                };
+                                // With files held, the fault may be theirs: only a file that
+                                // fails without them is blamed for it.
+                                let alone = if held.is_empty() {
+                                    Err(e)
+                                } else {
+                                    check_import(&doc, &with_held(&[], &files), checker)
+                                };
+                                match alone {
+                                    Err(e) => {
+                                        if matches!(e, SyncError::InvalidData(_)) {
+                                            self.sql.mark_sync_seen(&file.key)?;
+                                        }
+                                        report.refused.push(format!("{}: {e}", file.key));
+                                    }
+                                    Ok(()) => {
+                                        for h in &held {
+                                            let mut released = vec![*h];
+                                            released.extend(&files);
+                                            let found = check_import(
+                                                &doc,
+                                                &with_held(&[], &released),
+                                                checker,
+                                            );
+                                            // The same files without it just passed: what
+                                            // fails now is its doing. A crash or timeout may
+                                            // also be the machine's, so it counts against the
+                                            // file only the second time in a row, in a later
+                                            // batch: one that releases it and passes clears it.
+                                            // (A check that does not release it is no evidence:
+                                            // its operations stay pending, which always passes.)
+                                            let strike = strike_key(&h.key);
+                                            let refuse = match &found {
+                                                Err(SyncError::InvalidData(_)) => true,
+                                                Err(
+                                                    SyncError::Crashed(_) | SyncError::TimedOut(_),
+                                                ) if self.sql.is_sync_seen(&strike)? => true,
+                                                Err(
+                                                    e @ (SyncError::Crashed(_)
+                                                    | SyncError::TimedOut(_)),
+                                                ) => {
+                                                    self.sql.mark_sync_seen(&strike)?;
+                                                    report.notes.push(format!(
+                                                        "{}: {e}; checked again next time",
+                                                        h.key
+                                                    ));
+                                                    false
+                                                }
+                                                Err(e) => {
+                                                    report.notes.push(format!(
+                                                        "{}: {e}; checked again next time",
+                                                        h.key
+                                                    ));
+                                                    false
+                                                }
+                                                Ok(()) => {
+                                                    self.sql.forget_sync_seen(&strike)?;
+                                                    false
+                                                }
+                                            };
+                                            if let (true, Err(e)) = (refuse, found) {
+                                                self.sql.mark_sync_seen(&h.key)?;
+                                                report.refused.push(format!("{}: {e}", h.key));
+                                                blamed.push(&h.key);
+                                            }
+                                        }
+                                        stalled = true;
+                                        self.forget_pending.set(true);
+                                        report.waiting.push(file.key.clone());
+                                    }
+                                }
+                            }
+                            accepted
+                        };
+                    for file in accepted {
+                        import(file)?;
+                        landed.push(file);
+                    }
+                    held.clear();
+                    for file in &landed {
+                        if !in_log(file)? {
+                            held.push(file);
+                        }
+                    }
+                }
+                for file in landed {
+                    if blamed.contains(&file.key.as_str()) {
+                        continue;
+                    }
+                    if in_log(file)? {
+                        self.sql.mark_sync_seen(&file.key)?;
+                        self.sql.forget_sync_seen(&strike_key(&file.key))?;
+                        report.imported.push(file.key.clone());
+                    } else {
+                        report.waiting.push(file.key.clone());
+                        // The next batch starts from the file and replays this one again,
+                        // through the child, rather than release its operations unchecked.
+                        self.forget_pending.set(true);
+                    }
+                }
+                if doc.oplog_frontiers() == before {
+                    return Ok(report);
+                }
+                touched(&doc, &before, &doc.oplog_frontiers())?
+            };
+            self.load_nodes();
+            report.index = self.index_touched(&touched)?;
+            Ok(report)
+        })
+    }
+
+    /// Whether a sync file with this key was dealt with before.
+    pub fn sync_seen(&self, key: &str) -> Result<bool> {
+        self.sql.is_sync_seen(key)
+    }
+
+    /// Remembers a sync file that is not worth reading again (damaged), so it is reported once.
+    pub fn mark_sync_seen(&self, key: &str) -> Result<()> {
+        self.transaction(TxMode::Write, || self.sql.mark_sync_seen(key))
+    }
+
+    /// Exports this replica's own operations that no earlier call exported, if any, passing them
+    /// to `write` under the write lock; the export is recorded only when `write` succeeds.
+    pub fn export_own(&self, write: impl FnOnce(&[u8]) -> Result<()>) -> Result<bool> {
+        self.transaction(TxMode::Write, || {
+            let peer = self.peer.get();
+            let from: Counter =
+                self.sql.index_meta(META_EXPORTED)?.and_then(|n| n.parse().ok()).unwrap_or(0);
+            let doc = self.doc.borrow();
+            let to = doc.oplog_vv().get(&peer).copied().unwrap_or(0);
+            if to <= from {
+                return Ok(false);
+            }
+            let bytes = doc
+                .export(ExportMode::updates_in_range(vec![IdSpan::new(peer, from, to)]))
+                .map_err(internal)?;
+            write(&bytes)?;
+            self.sql.set_index_meta(META_EXPORTED, &to.to_string())?;
+            Ok(true)
         })
     }
 
@@ -338,7 +668,7 @@ impl LoroStore {
             }
             // An index with data but no document: a plain workspace, which this store must not
             // treat as an empty team workspace.
-            if !self.sql.list_principals()?.is_empty() {
+            if !self.adopting.get() && !self.sql.list_principals()?.is_empty() {
                 return Err(RoduError::invalid("This workspace is not a team workspace"));
             }
         }
@@ -858,6 +1188,28 @@ impl LoroStore {
     }
 }
 
+/// Cards ordered so each comes after its parent (a parent that is not among them counts as none).
+fn parents_first(items: HashMap<String, Item>) -> Vec<Item> {
+    fn depth(id: &str, items: &HashMap<String, Item>, memo: &mut HashMap<String, usize>) -> usize {
+        if let Some(d) = memo.get(id) {
+            return *d;
+        }
+        // Mark first, so a parent loop (which the index never holds) ends instead of recursing.
+        memo.insert(id.to_owned(), 0);
+        let d = match items.get(id).and_then(|i| i.parent_id.as_deref()) {
+            Some(p) if items.contains_key(p) => depth(p, items, memo) + 1,
+            _ => 0,
+        };
+        memo.insert(id.to_owned(), d);
+        d
+    }
+    let mut memo = HashMap::new();
+    let mut ordered: Vec<(usize, Item)> =
+        items.values().map(|i| (depth(&i.id, &items, &mut memo), i.clone())).collect();
+    ordered.sort_by(|a, b| (a.0, &a.1.id).cmp(&(b.0, &b.1.id)));
+    ordered.into_iter().map(|(_, i)| i).collect()
+}
+
 /// A random peer id for a new replica, from the random bits of a UUIDv7.
 fn new_peer_id() -> u64 {
     let now = std::time::SystemTime::now()
@@ -1015,7 +1367,7 @@ impl Store for LoroStore {
             return result;
         }
         self.pending.borrow_mut().clear();
-        match (&result, staged.take()) {
+        let result = match (&result, staged.take()) {
             (Ok(_), Some(hash)) => {
                 let next = self.next_path(&hash);
                 // If this rename fails, whoever next takes the write lock finishes it.
@@ -1036,7 +1388,12 @@ impl Store for LoroStore {
                 result
             }
             _ => result,
+        };
+        if self.forget_pending.take() {
+            // The next write transaction's settle loads the file again, without them.
+            *self.loaded.borrow_mut() = None;
         }
+        result
     }
 
     fn insert_principal(&self, p: &Principal) -> Result<()> {

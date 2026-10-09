@@ -43,6 +43,23 @@ nearest `.rodu/` above the working directory, or `$RODU_DIR`.
 columns to change status (workflow rules apply, and refusals say how to fix them), drag within a
 column to reorder, filter with JQL-lite, and click a card to edit it or comment.
 
+## Work as a team
+
+Share a workspace through a folder your team already syncs (Google Drive, Dropbox, OneDrive,
+iCloud Drive or Syncthing). Rodu only reads and writes files there; the folder's own app moves
+them between machines.
+
+```sh
+rodu team create --folder ~/Drive/our-board --no-encrypt   # prints an invite code
+# on a teammate's machine, with the same folder synced:
+rodu team join rodu1-... --folder ~/Drive/our-board --name bob
+```
+
+After that every command syncs by itself, and `rodu sync` does it by hand. New cards made on a
+teammate's machine get a key such as `DEMO-KQMRTZ` until the machine that created the team
+gives them their number; the old key keeps working. The sync files are not encrypted yet, so
+anyone with access to the folder can read the board.
+
 ## Use it from an agent (MCP)
 
 Add Rodu to Claude Code from the directory that holds `.rodu/`:

@@ -17,7 +17,6 @@ use rodu_core::{
     Actor, Cycle, ErrorCode, Item, ItemType, LinkKind, Priority, RoduError, RoduService, Rule,
     Store, TxMode,
 };
-use rodu_store::SqliteStore;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -45,8 +44,8 @@ const MAX_COLLECTION: usize = 40;
 const MAX_CYCLE: usize = 60;
 const MAX_KIND: usize = 20;
 
-pub async fn serve_stdio(
-    service: RoduService<SqliteStore>,
+pub async fn serve_stdio<S: Store + Send + 'static>(
+    service: RoduService<S>,
     actor: Actor,
 ) -> Result<(), ServeError> {
     let running = RoduMcp::new(service, actor).serve(rmcp::transport::stdio()).await?;
@@ -54,12 +53,17 @@ pub async fn serve_stdio(
     Ok(())
 }
 
-/// The MCP server handler. `SqliteStore` is not `Sync`, so the service sits behind a mutex and
+/// The MCP server handler. A store need not be `Sync`, so the service sits behind a mutex and
 /// each tool call runs under the lock.
-#[derive(Clone)]
-pub struct RoduMcp {
-    service: Arc<Mutex<RoduService<SqliteStore>>>,
+pub struct RoduMcp<S: Store> {
+    service: Arc<Mutex<RoduService<S>>>,
     actor: Actor,
+}
+
+impl<S: Store> Clone for RoduMcp<S> {
+    fn clone(&self) -> Self {
+        Self { service: Arc::clone(&self.service), actor: self.actor.clone() }
+    }
 }
 
 /// What a tool returns on success: markdown as-is, anything else as pretty JSON.
@@ -68,14 +72,14 @@ enum Output {
     Json(String),
 }
 
-impl RoduMcp {
-    pub fn new(service: RoduService<SqliteStore>, actor: Actor) -> Self {
+impl<S: Store + Send + 'static> RoduMcp<S> {
+    pub fn new(service: RoduService<S>, actor: Actor) -> Self {
         Self { service: Arc::new(Mutex::new(service)), actor }
     }
 
     fn with_service<T>(
         &self,
-        f: impl FnOnce(&RoduService<SqliteStore>) -> Result<T, RoduError>,
+        f: impl FnOnce(&RoduService<S>) -> Result<T, RoduError>,
     ) -> Result<T, RoduError> {
         let service =
             self.service.lock().map_err(|_| RoduError::internal("service lock poisoned"))?;
@@ -85,7 +89,7 @@ impl RoduMcp {
     /// SQLite calls block, so they run on tokio's blocking pool, never on an async worker.
     async fn blocking<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&RoduMcp) -> Result<T, RoduError> + Send + 'static,
+        f: impl FnOnce(&RoduMcp<S>) -> Result<T, RoduError> + Send + 'static,
     ) -> Result<T, RoduError> {
         let server = self.clone();
         tokio::task::spawn_blocking(move || f(&server))
@@ -198,8 +202,8 @@ impl RoduMcp {
 }
 
 /// Puts items into a cycle, all or nothing.
-fn plan_cycle(
-    service: &RoduService<SqliteStore>,
+fn plan_cycle<S: Store>(
+    service: &RoduService<S>,
     actor: &Actor,
     collection: &str,
     cycle: &str,
@@ -287,7 +291,7 @@ impl Serialize for Num {
     }
 }
 
-fn summarize(service: &RoduService<SqliteStore>, item: &Item) -> Result<Summary, RoduError> {
+fn summarize<S: Store>(service: &RoduService<S>, item: &Item) -> Result<Summary, RoduError> {
     Ok(Summary {
         key: item.key.clone(),
         title: item.title.clone(),
@@ -302,8 +306,8 @@ fn summarize(service: &RoduService<SqliteStore>, item: &Item) -> Result<Summary,
     })
 }
 
-fn summarize_all(
-    service: &RoduService<SqliteStore>,
+fn summarize_all<S: Store>(
+    service: &RoduService<S>,
     items: &[Item],
 ) -> Result<Vec<Summary>, RoduError> {
     items.iter().map(|i| summarize(service, i)).collect()
@@ -627,7 +631,7 @@ fn tools(max_batch: usize) -> Vec<Tool> {
     ]
 }
 
-fn schema_text(service: &RoduService<SqliteStore>) -> Result<String, RoduError> {
+fn schema_text<S: Store>(service: &RoduService<S>) -> Result<String, RoduError> {
     let workflows: Vec<String> = service
         .list_collections()?
         .iter()
@@ -679,7 +683,7 @@ Example: assignee = me() AND category != done AND updated > -7d ORDER BY priorit
     ))
 }
 
-impl ServerHandler for RoduMcp {
+impl<S: Store + Send + 'static> ServerHandler for RoduMcp<S> {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(Implementation::new("rodu", env!("CARGO_PKG_VERSION")))

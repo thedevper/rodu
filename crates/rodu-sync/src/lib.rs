@@ -8,11 +8,12 @@
 //! imports into this process only when the child survives. A refused file is an error and leaves
 //! the replica unchanged.
 
+pub mod folder;
 mod layout;
 mod names;
 mod store;
 
-pub use store::{IndexReport, LoroStore};
+pub use store::{BatchReport, Incoming, IndexReport, LoroStore};
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -36,6 +37,10 @@ pub enum SyncError {
     TooLarge { size: usize, max: usize },
     #[error("Sync file refused: checking it {0}")]
     Refused(String),
+    #[error("Sync file refused: checking it crashed ({0})")]
+    Crashed(String),
+    #[error("Sync file refused: checking it took over {0:?}")]
+    TimedOut(Duration),
 }
 
 /// How to start the child process that checks an untrusted import: a command that runs
@@ -51,7 +56,8 @@ impl Checker {
     }
 
     /// Runs the child on `input`: `Ok` when it exits 0, `InvalidData` with its message when it
-    /// exits 2, `Refused` when it crashes, exits otherwise or runs past the timeout.
+    /// exits 2, `Crashed` when it crashes or exits otherwise, `TimedOut` when it runs past the
+    /// timeout, and `Refused` when it cannot be run.
     fn run(&self, input: Vec<u8>) -> Result<(), SyncError> {
         let mut child = (self.command)()
             .stdin(Stdio::piped())
@@ -81,7 +87,7 @@ impl Checker {
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(SyncError::Refused(format!("took over {:?}", self.timeout)));
+                    return Err(SyncError::TimedOut(self.timeout));
                 }
                 Err(e) => return Err(SyncError::Refused(format!("failed: {e}"))),
             }
@@ -91,20 +97,19 @@ impl Checker {
         match status.code() {
             Some(0) => Ok(()),
             Some(2) => Err(SyncError::InvalidData(message.trim().to_owned())),
-            _ => Err(SyncError::Refused(format!("crashed ({status})"))),
+            _ => Err(SyncError::Crashed(status.to_string())),
         }
     }
 }
 
-/// The child side of [`Replica::import_untrusted`]: reads the framed input from `input`, does the
-/// import on a scratch replica and reads everything back, so a panic in Loro's decoder, including
-/// one deferred until data is read, happens here and not in the caller.
+/// The child side of [`Replica::import_untrusted`]: reads the framed input from `input` (a
+/// snapshot, then updates each with the peer that must have written all of its operations, or 0
+/// for any), does the imports on a scratch replica and reads everything back, so a panic in Loro's
+/// decoder, including one deferred until data is read, happens here and not in the caller.
 pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     let mut bytes = Vec::new();
     input.take((MAX_IMPORT_BYTES * 2 + 8) as u64).read_to_end(&mut bytes).map_err(invalid)?;
-    let (len, rest) = bytes.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
-    let len = u64::from_le_bytes(len.try_into().expect("8 bytes")) as usize;
-    let (snapshot, update) = rest.split_at_checked(len).ok_or_else(|| invalid("short input"))?;
+    let (snapshot, mut rest) = split_framed(&bytes)?;
     let doc = if snapshot.is_empty() {
         LoroDoc::new()
     } else {
@@ -112,7 +117,24 @@ pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     };
     let before = doc.oplog_vv();
     let before_frontiers = doc.oplog_frontiers();
-    doc.import(update).map_err(invalid)?;
+    while !rest.is_empty() {
+        let (peer, after_peer) = rest.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
+        let peer = u64::from_le_bytes(peer.try_into().expect("8 bytes"));
+        let (update, after) = split_framed(after_peer)?;
+        rest = after;
+        if peer != 0 {
+            let meta = LoroDoc::decode_import_blob_meta(update, true).map_err(invalid)?;
+            let others = meta
+                .partial_start_vv
+                .iter()
+                .chain(meta.partial_end_vv.iter())
+                .any(|(p, _)| *p != peer);
+            if others {
+                return Err(invalid(format!("holds operations of a peer other than {peer:016x}")));
+            }
+        }
+        doc.import(update).map_err(invalid)?;
+    }
     // Everything a `Replica` or a `LoroStore` does with the merged document afterwards, so a panic
     // Loro defers to a later read or export also happens here. A new method that reads or exports
     // the document must be added to this list.
@@ -136,17 +158,41 @@ pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Replays importing `bytes` into a copy of `doc` in `checker`'s child process; Ok when the child
-/// survived and found the bytes valid.
-fn check_import(doc: &LoroDoc, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
-    if bytes.len() > MAX_IMPORT_BYTES {
-        return Err(SyncError::TooLarge { size: bytes.len(), max: MAX_IMPORT_BYTES });
+/// Splits `u64 LE length, bytes` off the front of `input`.
+fn split_framed(input: &[u8]) -> Result<(&[u8], &[u8]), SyncError> {
+    let (len, rest) = input.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
+    let len = usize::try_from(u64::from_le_bytes(len.try_into().expect("8 bytes")))
+        .map_err(|_| invalid("short input"))?;
+    rest.split_at_checked(len).ok_or_else(|| invalid("short input"))
+}
+
+/// One untrusted update for [`check_import`]: its bytes, and the peer that must have written all
+/// of its operations (a sync file's folder names its writer), or None for any.
+pub(crate) struct Untrusted<'a> {
+    pub bytes: &'a [u8],
+    pub peer: Option<u64>,
+}
+
+/// Replays importing `updates`, in order, into a copy of `doc` in `checker`'s child process; Ok
+/// when the child survived and found them all valid.
+fn check_import(
+    doc: &LoroDoc,
+    updates: &[Untrusted<'_>],
+    checker: &Checker,
+) -> Result<(), SyncError> {
+    let size: usize = updates.iter().map(|u| u.bytes.len()).sum();
+    if size > MAX_IMPORT_BYTES {
+        return Err(SyncError::TooLarge { size, max: MAX_IMPORT_BYTES });
     }
     let snapshot = doc.export(ExportMode::Snapshot).map_err(invalid)?;
-    let mut input = Vec::with_capacity(8 + snapshot.len() + bytes.len());
+    let mut input = Vec::with_capacity(8 + snapshot.len() + 16 * updates.len() + size);
     input.extend((snapshot.len() as u64).to_le_bytes());
     input.extend(snapshot);
-    input.extend(bytes);
+    for update in updates {
+        input.extend(update.peer.unwrap_or(0).to_le_bytes());
+        input.extend((update.bytes.len() as u64).to_le_bytes());
+        input.extend(update.bytes);
+    }
     checker.run(input)
 }
 
@@ -211,8 +257,16 @@ impl Replica {
     /// Merges updates or a snapshot from another machine, once `checker` has replayed the same
     /// import on a copy of this replica in a child process and the child survived.
     pub fn import_untrusted(&mut self, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
-        check_import(&self.doc, bytes, checker)?;
-        self.import_trusted(bytes)
+        check_import(&self.doc, &[Untrusted { bytes, peer: None }], checker)?;
+        if self.doc.import(bytes).map_err(invalid)?.pending.is_some() {
+            // Operations waiting on others would be applied, unchecked, by a later import:
+            // dropped instead, by starting again from a snapshot, which leaves them out.
+            let peer = self.doc.peer_id();
+            let doc = LoroDoc::from_snapshot(&self.snapshot()).map_err(invalid)?;
+            doc.set_peer_id(peer).map_err(invalid)?;
+            self.doc = doc;
+        }
+        Ok(())
     }
 
     /// The whole document, for a new replica or compaction.
@@ -388,7 +442,7 @@ mod tests {
         let update = sample().updates_since(&Replica::new(9).unwrap().version()).unwrap();
         let crash = checker(Duration::from_secs(30), &[("RODU_SYNC_CHECK_ABORT", "1")]);
         let refused = a.import_untrusted(&update, &crash);
-        assert!(matches!(refused, Err(SyncError::Refused(_))), "{refused:?}");
+        assert!(matches!(refused, Err(SyncError::Crashed(_))), "{refused:?}");
         assert_eq!(a.version(), before);
         assert_eq!(a.field("c3", "status").as_deref(), Some("Done"));
     }
@@ -414,7 +468,7 @@ mod tests {
         assert_eq!(b.field("c3", "status").as_deref(), Some("Done"));
         let crash = checker(Duration::from_secs(30), &[("RODU_SYNC_CHECK_ABORT", "1")]);
         let refused = Replica::from_untrusted_snapshot(&snapshot, 2, &crash);
-        assert!(matches!(refused, Err(SyncError::Refused(_))));
+        assert!(matches!(refused, Err(SyncError::Crashed(_))));
     }
 
     #[test]
@@ -423,7 +477,7 @@ mod tests {
         let update = a.updates_since(&Replica::new(9).unwrap().version()).unwrap();
         let hang = checker(Duration::from_millis(500), &[("RODU_SYNC_CHECK_HANG", "1")]);
         let start = Instant::now();
-        assert!(matches!(a.import_untrusted(&update, &hang), Err(SyncError::Refused(_))));
+        assert!(matches!(a.import_untrusted(&update, &hang), Err(SyncError::TimedOut(_))));
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 
