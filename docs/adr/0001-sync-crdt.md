@@ -192,6 +192,43 @@ runs against it and against `SqliteStore`.
   86 ms, and a full index rebuild 0.7 s. Saving a whole snapshot per write is the simple choice for now; step
   4's update files will let a write append instead.
 
+## The team folder (built 2026-10-09)
+
+Step 4a: sync through a folder the team already shares, and the commands to set it up.
+
+- **Layout.** `<folder>/rodu-team.json` names the team (`{"format": 1, "workspaceId": ...}`).
+  Each replica writes only `sync/<its peer id, 16 hex>/<sequence, 10 digits>.update`, and each
+  file holds only that replica's own operations since its last file. A file is framed as
+  `RODU-UPDATE1`, the payload's length and its SHA-256, so a reader tells a file the folder app
+  is still bringing in (shorter than its length: skipped until complete) from a damaged one
+  (reported). Files are written under a hidden temporary name and renamed into place.
+- **Reading the folder.** Everything in it is untrusted. Directory and file names are parsed,
+  never joined into paths; links, dotfiles and files over the import cap are skipped; conflict
+  copies (`0000000003 (1).update`) are read like any other file. All new files are replayed in one
+  child process (`rodu __check-import`), which also refuses a file holding operations of any peer
+  but the one its folder names. If the batch is refused, each file is checked alone so one bad
+  file never holds the rest back. Files are remembered by folder, name and SHA-256: a file
+  rewritten under a seen name is checked and imported again, and operations Loro already holds
+  are ignored by their ids. A file found invalid is remembered and reported once.
+- **Writing.** Under the workspace write lock, a replica exports its own operations from the
+  counter it last exported to and writes them as its next file. A folder without
+  `rodu-team.json` (a cloud drive not mounted) is never written to.
+- **Commands.** `rodu team create --folder <path> --no-encrypt` turns the workspace in place
+  into a team workspace: the document is built from every row of its index, so events,
+  idempotency records and versions stay. It prints an invite code, `rodu1-<workspace id>`, which
+  holds no secret yet. `rodu team join <code> --folder <path> --name <you>` makes a workspace from
+  the folder; a join that fails removes what it made. `rodu team` shows the folder, code and role;
+  `rodu sync` syncs by hand. `--encrypt` is refused until step 4b, and giving neither flag is an
+  error, so there is no silent default.
+- **Automatic sync.** In a team workspace `add`, `ls`, `show` and `mv` read the folder first and
+  write to it after; the numbering peer (the machine that created the team) numbers new cards in
+  between. `web` and `mcp` sync when they start and when they stop. A folder that cannot be read
+  is a warning, and the command works on what the machine has.
+- **Left for later steps.** 4b: encryption. 4c: the readable copy, `web` and `mcp` watching the
+  folder while they run, compaction (today every command reads every file in the folder), and the
+  command that hands numbering to another machine. A join that fails after its principal reached
+  the folder leaves that principal behind; joining again under the same name then shows `bob2`.
+
 ## Proposed design for the open problems
 
 1. **Card numbers (decided 2026-10-09: provisional keys).** A new card gets a provisional key
@@ -262,7 +299,9 @@ runs against it and against `SqliteStore`.
 4. Shared-folder transport with automatic sync, `rodu team create` and `rodu team join`, and
    the encryption and readable-copy options. Test it with two and three workspaces on one folder
    in CI on macOS and Windows, including a folder app's conflict copies (`file (1).update`) and
-   half-written files.
+   half-written files. Split in three: 4a (transport, team commands, automatic sync) is done,
+   described under "The team folder" above; 4b adds encryption; 4c the readable copy, live
+   watching in `web` and `mcp`, compaction and the numbering hand-over.
 5. Later: `rodu relay` for live sync.
 6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.

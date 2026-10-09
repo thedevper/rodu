@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use rodu::team::CHECK_COMMAND;
 use rodu::{Io, open_url, run};
 
 fn main() {
@@ -10,6 +11,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // The child process that replays a sync import, so a crash in the decoder stays here.
+    if argv == [CHECK_COMMAND] {
+        let code = match rodu_sync::run_check(&mut std::io::stdin().lock()) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
     // Variables that are not valid Unicode cannot name a workspace; skip them, never panic.
     let env: HashMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))

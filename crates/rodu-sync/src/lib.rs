@@ -8,11 +8,12 @@
 //! imports into this process only when the child survives. A refused file is an error and leaves
 //! the replica unchanged.
 
+pub mod folder;
 mod layout;
 mod names;
 mod store;
 
-pub use store::{IndexReport, LoroStore};
+pub use store::{BatchReport, Incoming, IndexReport, LoroStore};
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -96,15 +97,14 @@ impl Checker {
     }
 }
 
-/// The child side of [`Replica::import_untrusted`]: reads the framed input from `input`, does the
-/// import on a scratch replica and reads everything back, so a panic in Loro's decoder, including
-/// one deferred until data is read, happens here and not in the caller.
+/// The child side of [`Replica::import_untrusted`]: reads the framed input from `input` (a
+/// snapshot, then updates each with the peer that must have written all of its operations, or 0
+/// for any), does the imports on a scratch replica and reads everything back, so a panic in Loro's
+/// decoder, including one deferred until data is read, happens here and not in the caller.
 pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     let mut bytes = Vec::new();
     input.take((MAX_IMPORT_BYTES * 2 + 8) as u64).read_to_end(&mut bytes).map_err(invalid)?;
-    let (len, rest) = bytes.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
-    let len = u64::from_le_bytes(len.try_into().expect("8 bytes")) as usize;
-    let (snapshot, update) = rest.split_at_checked(len).ok_or_else(|| invalid("short input"))?;
+    let (snapshot, mut rest) = split_framed(&bytes)?;
     let doc = if snapshot.is_empty() {
         LoroDoc::new()
     } else {
@@ -112,7 +112,24 @@ pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     };
     let before = doc.oplog_vv();
     let before_frontiers = doc.oplog_frontiers();
-    doc.import(update).map_err(invalid)?;
+    while !rest.is_empty() {
+        let (peer, after_peer) = rest.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
+        let peer = u64::from_le_bytes(peer.try_into().expect("8 bytes"));
+        let (update, after) = split_framed(after_peer)?;
+        rest = after;
+        if peer != 0 {
+            let meta = LoroDoc::decode_import_blob_meta(update, true).map_err(invalid)?;
+            let others = meta
+                .partial_start_vv
+                .iter()
+                .chain(meta.partial_end_vv.iter())
+                .any(|(p, _)| *p != peer);
+            if others {
+                return Err(invalid(format!("holds operations of a peer other than {peer:016x}")));
+            }
+        }
+        doc.import(update).map_err(invalid)?;
+    }
     // Everything a `Replica` or a `LoroStore` does with the merged document afterwards, so a panic
     // Loro defers to a later read or export also happens here. A new method that reads or exports
     // the document must be added to this list.
@@ -136,17 +153,41 @@ pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Replays importing `bytes` into a copy of `doc` in `checker`'s child process; Ok when the child
-/// survived and found the bytes valid.
-fn check_import(doc: &LoroDoc, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
-    if bytes.len() > MAX_IMPORT_BYTES {
-        return Err(SyncError::TooLarge { size: bytes.len(), max: MAX_IMPORT_BYTES });
+/// Splits `u64 LE length, bytes` off the front of `input`.
+fn split_framed(input: &[u8]) -> Result<(&[u8], &[u8]), SyncError> {
+    let (len, rest) = input.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
+    let len = usize::try_from(u64::from_le_bytes(len.try_into().expect("8 bytes")))
+        .map_err(|_| invalid("short input"))?;
+    rest.split_at_checked(len).ok_or_else(|| invalid("short input"))
+}
+
+/// One untrusted update for [`check_import`]: its bytes, and the peer that must have written all
+/// of its operations (a sync file's folder names its writer), or None for any.
+pub(crate) struct Untrusted<'a> {
+    pub bytes: &'a [u8],
+    pub peer: Option<u64>,
+}
+
+/// Replays importing `updates`, in order, into a copy of `doc` in `checker`'s child process; Ok
+/// when the child survived and found them all valid.
+fn check_import(
+    doc: &LoroDoc,
+    updates: &[Untrusted<'_>],
+    checker: &Checker,
+) -> Result<(), SyncError> {
+    let size: usize = updates.iter().map(|u| u.bytes.len()).sum();
+    if size > MAX_IMPORT_BYTES {
+        return Err(SyncError::TooLarge { size, max: MAX_IMPORT_BYTES });
     }
     let snapshot = doc.export(ExportMode::Snapshot).map_err(invalid)?;
-    let mut input = Vec::with_capacity(8 + snapshot.len() + bytes.len());
+    let mut input = Vec::with_capacity(8 + snapshot.len() + 16 * updates.len() + size);
     input.extend((snapshot.len() as u64).to_le_bytes());
     input.extend(snapshot);
-    input.extend(bytes);
+    for update in updates {
+        input.extend(update.peer.unwrap_or(0).to_le_bytes());
+        input.extend((update.bytes.len() as u64).to_le_bytes());
+        input.extend(update.bytes);
+    }
     checker.run(input)
 }
 
@@ -211,7 +252,7 @@ impl Replica {
     /// Merges updates or a snapshot from another machine, once `checker` has replayed the same
     /// import on a copy of this replica in a child process and the child survived.
     pub fn import_untrusted(&mut self, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
-        check_import(&self.doc, bytes, checker)?;
+        check_import(&self.doc, &[Untrusted { bytes, peer: None }], checker)?;
         self.import_trusted(bytes)
     }
 

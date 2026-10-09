@@ -161,7 +161,7 @@ fn to_collection(r: &Row<'_>) -> rusqlite::Result<Collection> {
     })
 }
 
-fn to_cycle(r: &Row<'_>) -> rusqlite::Result<Cycle> {
+pub(crate) fn to_cycle(r: &Row<'_>) -> rusqlite::Result<Cycle> {
     Ok(Cycle {
         id: r.get("id")?,
         collection_id: r.get("collection_id")?,
@@ -197,7 +197,7 @@ pub(crate) fn to_item(r: &Row<'_>) -> rusqlite::Result<Item> {
     })
 }
 
-fn to_comment(r: &Row<'_>) -> rusqlite::Result<Comment> {
+pub(crate) fn to_comment(r: &Row<'_>) -> rusqlite::Result<Comment> {
     Ok(Comment {
         id: r.get("id")?,
         item_id: r.get("item_id")?,
@@ -208,7 +208,7 @@ fn to_comment(r: &Row<'_>) -> rusqlite::Result<Comment> {
     })
 }
 
-fn to_link(r: &Row<'_>) -> rusqlite::Result<Link> {
+pub(crate) fn to_link(r: &Row<'_>) -> rusqlite::Result<Link> {
     Ok(Link {
         id: r.get("id")?,
         from_item_id: r.get("from_item_id")?,

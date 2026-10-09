@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use loro::event::Diff;
 use loro::{
-    ExportMode, Frontiers, Index, LoroDoc, LoroMap, LoroTree, LoroValue, TreeID, TreeParentId,
-    ValueOrContainer, VersionVector,
+    Counter, ExportMode, Frontiers, IdSpan, Index, LoroDoc, LoroMap, LoroTree, LoroValue, TreeID,
+    TreeParentId, ValueOrContainer, VersionVector,
 };
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::{
@@ -42,7 +42,7 @@ use sha2::{Digest, Sha256};
 
 use crate::layout::{self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, PRINCIPALS};
 use crate::names::{self, Entry};
-use crate::{Checker, SyncError, check_import};
+use crate::{Checker, SyncError, Untrusted, check_import};
 
 const DB_FILE: &str = "rodu.db";
 const DOC_FILE: &str = "rodu.loro";
@@ -53,6 +53,8 @@ const NEXT_SUFFIX: &str = ".next";
 const PARTIAL_SUFFIX: &str = ".partial";
 const META_DOC: &str = "doc_sha256";
 const META_PEER: &str = "peer";
+/// This replica's own operation counter up to which [`LoroStore::export_own`] has exported.
+const META_EXPORTED: &str = "exported_counter";
 /// How many entities the index holds differently from the document until something else arrives:
 /// a reference cleared or an entity left out because what it points to is missing, or a card that
 /// lost its number or key. While above zero, every import rebuilds the whole index.
@@ -76,6 +78,30 @@ pub struct IndexReport {
 /// A write to replay on the document. An update carries the index row it replaced, so only the
 /// fields the write changed reach the document: the index can show a value the document does not
 /// hold (a name suffixed after a clash, a reference cleared), and that must not be written back.
+/// A sync file from another replica for [`LoroStore::import_batch`].
+pub struct Incoming {
+    /// The replica whose folder held the file: every operation in it must be its own.
+    pub peer: u64,
+    /// Names the file and its content (e.g. `<peer>/<name>/<sha256>`), so the same file is not
+    /// imported twice and a file rewritten under the same name is checked again.
+    pub key: String,
+    pub bytes: Vec<u8>,
+}
+
+fn untrusted(file: &Incoming) -> Untrusted<'_> {
+    Untrusted { bytes: &file.bytes, peer: Some(file.peer) }
+}
+
+/// What [`LoroStore::import_batch`] did.
+#[derive(Debug, Default)]
+pub struct BatchReport {
+    /// Keys of the files imported.
+    pub imported: Vec<String>,
+    /// Files not imported, and why.
+    pub refused: Vec<String>,
+    pub index: IndexReport,
+}
+
 enum Change {
     Principal(Principal),
     Collection(Collection),
@@ -114,6 +140,8 @@ pub struct LoroStore {
     unsettled: Cell<usize>,
     /// Tree nodes [`LoroStore::load_nodes`] could not map to a card, and why.
     node_problems: RefCell<Vec<String>>,
+    /// [`LoroStore::adopt`] is building the document from a plain workspace's index.
+    adopting: Cell<bool>,
 }
 
 fn internal(error: impl Display) -> RoduError {
@@ -203,9 +231,49 @@ impl LoroStore {
     /// Opens the workspace in `dir`, creating it if empty. An index that does not match the
     /// document (a crash between the two, or a lost `rodu.db`) is rebuilt from the document.
     pub fn open(dir: &Path) -> Result<Self> {
+        let store = Self::load_peer(dir)?;
+        store.sql.transaction(TxMode::Write, || store.settle())?;
+        Ok(store)
+    }
+
+    /// Turns the plain workspace in `dir` into a team workspace: builds the document from every
+    /// row of its index, keeping the index itself (and so events, idempotency records and card
+    /// versions) as it is.
+    pub fn adopt(dir: &Path) -> Result<Self> {
+        if dir.join(DOC_FILE).exists() {
+            return Err(RoduError::conflict("This workspace is already a team workspace"));
+        }
+        if !dir.join(DB_FILE).is_file() {
+            return Err(RoduError::not_found(format!("No workspace in {}", dir.display())));
+        }
+        let store = Self::load_peer(dir)?;
+        store.adopting.set(true);
+        let result = store.transaction(TxMode::Write, || {
+            let sql = &store.sql;
+            let mut pending = store.pending.borrow_mut();
+            pending.extend(sql.list_principals()?.into_iter().map(Change::Principal));
+            pending.extend(sql.list_collections()?.into_iter().map(Change::Collection));
+            pending.extend(sql.all_cycles()?.into_iter().map(|c| Change::Cycle(None, c)));
+            pending.extend(
+                parents_first(sql.items_by_id()?)
+                    .into_iter()
+                    .map(|i| Change::Item(Box::new((None, i)))),
+            );
+            pending.extend(sql.all_comments()?.into_iter().map(Change::Comment));
+            pending.extend(sql.all_links()?.into_iter().map(Change::Link));
+            Ok(())
+        });
+        store.adopting.set(false);
+        result?;
+        Ok(store)
+    }
+
+    /// The store for `dir` with its peer id set, before the document is loaded.
+    fn load_peer(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir).map_err(|e| io(e, dir))?;
         let sql = SqliteStore::open(&dir.join(DB_FILE))?;
         sql.ensure_index_meta()?;
+        sql.ensure_sync_seen()?;
         let store = Self {
             sql,
             dir: dir.to_path_buf(),
@@ -219,6 +287,7 @@ impl LoroStore {
             last_report: RefCell::new(IndexReport::default()),
             unsettled: Cell::new(0),
             node_problems: RefCell::new(Vec::new()),
+            adopting: Cell::new(false),
         };
         store.sql.transaction(TxMode::Write, || {
             let peer = match store.sql.index_meta(META_PEER)? {
@@ -230,9 +299,14 @@ impl LoroStore {
                 }
             };
             store.peer.set(peer);
-            store.settle()
+            Ok(())
         })?;
         Ok(store)
+    }
+
+    /// This replica's Loro peer id.
+    pub fn peer(&self) -> u64 {
+        self.peer.get()
     }
 
     /// The index this store reads from.
@@ -263,7 +337,8 @@ impl LoroStore {
         self.transaction(TxMode::Write, || {
             let touched = {
                 let doc = self.doc.borrow();
-                check_import(&doc, bytes, checker).map_err(from_sync)?;
+                check_import(&doc, &[Untrusted { bytes, peer: None }], checker)
+                    .map_err(from_sync)?;
                 let before = doc.oplog_frontiers();
                 self.dirty.set(true);
                 doc.import(bytes).map_err(internal)?;
@@ -271,6 +346,90 @@ impl LoroStore {
             };
             self.load_nodes();
             self.index_touched(&touched)
+        })
+    }
+
+    /// Imports sync files from other replicas: each must hold only its writer's operations, and
+    /// a file whose key was imported or refused before is skipped. The batch is replayed in one
+    /// child process; if that refuses it, each file is checked alone, so one bad file never holds
+    /// the rest back. A file found invalid is remembered as refused, so it is reported once; one
+    /// that could not be checked (a crash or timeout) is tried again next time.
+    pub fn import_batch(&self, incoming: &[Incoming], checker: &Checker) -> Result<BatchReport> {
+        self.transaction(TxMode::Write, || {
+            let mut report = BatchReport::default();
+            let mut fresh = Vec::new();
+            for file in incoming {
+                if !self.sql.is_sync_seen(&file.key)? {
+                    fresh.push(file);
+                }
+            }
+            if fresh.is_empty() {
+                return Ok(report);
+            }
+            let touched = {
+                let doc = self.doc.borrow();
+                let all: Vec<Untrusted<'_>> = fresh.iter().map(|f| untrusted(f)).collect();
+                let accepted = if check_import(&doc, &all, checker).is_ok() {
+                    fresh
+                } else {
+                    let mut accepted = Vec::new();
+                    for file in fresh {
+                        match check_import(&doc, &[untrusted(file)], checker) {
+                            Ok(()) => accepted.push(file),
+                            Err(e) => {
+                                if matches!(
+                                    e,
+                                    SyncError::InvalidData(_) | SyncError::TooLarge { .. }
+                                ) {
+                                    self.sql.mark_sync_seen(&file.key)?;
+                                }
+                                report.refused.push(format!("{}: {e}", file.key));
+                            }
+                        }
+                    }
+                    let rest: Vec<Untrusted<'_>> = accepted.iter().map(|f| untrusted(f)).collect();
+                    if !accepted.is_empty() && check_import(&doc, &rest, checker).is_err() {
+                        report.refused.push("the files together were refused".into());
+                        accepted.clear();
+                    }
+                    accepted
+                };
+                if accepted.is_empty() {
+                    return Ok(report);
+                }
+                let before = doc.oplog_frontiers();
+                self.dirty.set(true);
+                for file in accepted {
+                    doc.import(&file.bytes).map_err(internal)?;
+                    self.sql.mark_sync_seen(&file.key)?;
+                    report.imported.push(file.key.clone());
+                }
+                touched(&doc, &before, &doc.oplog_frontiers())?
+            };
+            self.load_nodes();
+            report.index = self.index_touched(&touched)?;
+            Ok(report)
+        })
+    }
+
+    /// Exports this replica's own operations that no earlier call exported, if any, passing them
+    /// to `write` under the write lock; the export is recorded only when `write` succeeds.
+    pub fn export_own(&self, write: impl FnOnce(&[u8]) -> Result<()>) -> Result<bool> {
+        self.transaction(TxMode::Write, || {
+            let peer = self.peer.get();
+            let from: Counter =
+                self.sql.index_meta(META_EXPORTED)?.and_then(|n| n.parse().ok()).unwrap_or(0);
+            let doc = self.doc.borrow();
+            let to = doc.oplog_vv().get(&peer).copied().unwrap_or(0);
+            if to <= from {
+                return Ok(false);
+            }
+            let bytes = doc
+                .export(ExportMode::updates_in_range(vec![IdSpan::new(peer, from, to)]))
+                .map_err(internal)?;
+            write(&bytes)?;
+            self.sql.set_index_meta(META_EXPORTED, &to.to_string())?;
+            Ok(true)
         })
     }
 
@@ -338,7 +497,7 @@ impl LoroStore {
             }
             // An index with data but no document: a plain workspace, which this store must not
             // treat as an empty team workspace.
-            if !self.sql.list_principals()?.is_empty() {
+            if !self.adopting.get() && !self.sql.list_principals()?.is_empty() {
                 return Err(RoduError::invalid("This workspace is not a team workspace"));
             }
         }
@@ -856,6 +1015,28 @@ impl LoroStore {
     fn has_collection(&self, id: &str) -> Result<bool> {
         Ok(self.sql.find_collection(id)?.is_some_and(|c| c.id == id))
     }
+}
+
+/// Cards ordered so each comes after its parent (a parent that is not among them counts as none).
+fn parents_first(items: HashMap<String, Item>) -> Vec<Item> {
+    fn depth(id: &str, items: &HashMap<String, Item>, memo: &mut HashMap<String, usize>) -> usize {
+        if let Some(d) = memo.get(id) {
+            return *d;
+        }
+        // Mark first, so a parent loop (which the index never holds) ends instead of recursing.
+        memo.insert(id.to_owned(), 0);
+        let d = match items.get(id).and_then(|i| i.parent_id.as_deref()) {
+            Some(p) if items.contains_key(p) => depth(p, items, memo) + 1,
+            _ => 0,
+        };
+        memo.insert(id.to_owned(), d);
+        d
+    }
+    let mut memo = HashMap::new();
+    let mut ordered: Vec<(usize, Item)> =
+        items.values().map(|i| (depth(&i.id, &items, &mut memo), i.clone())).collect();
+    ordered.sort_by(|a, b| (a.0, &a.1.id).cmp(&(b.0, &b.1.id)));
+    ordered.into_iter().map(|(_, i)| i).collect()
 }
 
 /// A random peer id for a new replica, from the random bits of a UUIDv7.

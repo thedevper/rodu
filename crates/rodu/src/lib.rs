@@ -11,6 +11,12 @@ use rodu_store::SqliteStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::store::AnyStore;
+use crate::team::TeamConfig;
+
+mod store;
+pub mod team;
+
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/web_files.rs"));
 }
@@ -27,6 +33,10 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
+  team                       where this workspace syncs, and its invite code
+  team create --folder <shared folder> --no-encrypt   share this workspace with a team
+  team join <invite code> --folder <shared folder> --name <you>   join a team here
+  sync                       sync with the team folder now (every command also does)
   --version                  print the version
 
 The workspace is the nearest .rodu directory, or $RODU_DIR.";
@@ -49,20 +59,32 @@ struct Config {
     user_id: String,
     agent_id: String,
     collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    team: Option<TeamConfig>,
 }
 
 struct Workspace {
     dir: PathBuf,
-    service: RoduService<SqliteStore>,
+    service: RoduService<AnyStore>,
     config: Config,
     actor: Actor,
 }
 
 // --- arguments -------------------------------------------------------------------------------
 
-const STRING_OPTIONS: &[&str] =
-    &["name", "key", "title", "type", "priority", "assignee", "collection", "limit", "port"];
-const BOOL_OPTIONS: &[&str] = &["no-open", "version", "help"];
+const STRING_OPTIONS: &[&str] = &[
+    "name",
+    "key",
+    "title",
+    "type",
+    "priority",
+    "assignee",
+    "collection",
+    "limit",
+    "port",
+    "folder",
+];
+const BOOL_OPTIONS: &[&str] = &["no-open", "version", "help", "encrypt", "no-encrypt"];
 
 #[derive(Debug, Default)]
 struct Args {
@@ -188,7 +210,16 @@ fn open(io: &Io<'_>, via_agent: bool) -> Result<Workspace> {
         .ok_or_else(|| {
             RoduError::invalid(format!("{} is not a valid Rodu config", path.display()))
         })?;
-    let service = RoduService::new(SqliteStore::open(&dir.join("rodu.db"))?);
+    // A document in the folder means a team workspace, even if its config does not say so yet (a
+    // team create that stopped half way): writing it as a plain one would leave the document
+    // behind.
+    let store = if config.team.is_some() || dir.join("rodu.loro").exists() {
+        AnyStore::Team(Box::new(rodu_sync::LoroStore::open(&dir)?))
+    } else {
+        AnyStore::Plain(SqliteStore::open(&dir.join("rodu.db"))?)
+    };
+    let numbering = config.team.as_ref().is_none_or(|t| t.numbering);
+    let service = RoduService::new(store).with_numbering(numbering);
     let actor = Actor {
         principal_id: config.user_id.clone(),
         via_agent_id: via_agent.then(|| config.agent_id.clone()),
@@ -232,7 +263,7 @@ fn init(io: &mut Io<'_>, args: &Args) -> Result<()> {
         let upper = key.to_uppercase();
         let title = args.value("title").unwrap_or(&upper);
         let collection = service.create_collection(&actor, key, title)?;
-        Ok(Config { user_id: user.id, agent_id: agent.id, collection: collection.key })
+        Ok(Config { user_id: user.id, agent_id: agent.id, collection: collection.key, team: None })
     })?;
     let text = serde_json::to_string_pretty(&config)
         .map_err(|e| RoduError::internal(format!("config: {e}")))?;
@@ -303,18 +334,50 @@ async fn command_result(
     match command {
         "init" => init(io, args).map(|()| 0),
         "web" => serve_web(io, args.value("port"), !args.flag("no-open")).await.map(|()| 0),
+        "team" => match rest.first().map(String::as_str) {
+            None => team::status(io).map(|()| 0),
+            Some("create") => team::create(io, args).map(|()| 0),
+            Some("join") => team::join(io, args, rest.get(1)).map(|()| 0),
+            Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
+                .with_hint("rodu team, rodu team create, rodu team join")),
+        },
+        "sync" => team::sync(io).map(|()| 0),
         "mcp" => {
             // The agent acts for the user: every change is recorded as "alice via alice-agent".
             let ws = open(io, true)?;
+            team::before(io, &ws);
             // Only MCP messages may go to stdout; the status line goes to stderr.
             (io.err)(&format!("rodu mcp: serving {} on stdio", ws.dir.display()));
-            rodu_mcp::serve_stdio(ws.service, ws.actor)
+            let served = rodu_mcp::serve_stdio(ws.service, ws.actor)
                 .await
-                .map_err(|e| RoduError::internal(format!("MCP server stopped: {e}")))?;
-            Ok(0)
+                .map_err(|e| RoduError::internal(format!("MCP server stopped: {e}")));
+            team::after_reopen(io, true);
+            served.map(|()| 0)
         }
-        "add" => {
+        "add" | "ls" | "show" | "mv" => {
             let ws = open(io, false)?;
+            team::before(io, &ws);
+            let result = item_command(command, rest, args, &ws, io);
+            team::after(io, &ws);
+            result
+        }
+        _ => {
+            (io.err)(&format!("Unknown command \"{command}\"\n\n{USAGE}"));
+            Ok(1)
+        }
+    }
+}
+
+/// The quick item commands, on an opened workspace.
+fn item_command(
+    command: &str,
+    rest: &[String],
+    args: &Args,
+    ws: &Workspace,
+    io: &mut Io<'_>,
+) -> Result<i32> {
+    match command {
+        "add" => {
             let mut item = Map::new();
             item.insert("title".into(), Value::String(rest.join(" ")));
             for field in ["type", "priority", "assignee"] {
@@ -339,7 +402,6 @@ async fn command_result(
                     })?
                 }
             };
-            let ws = open(io, false)?;
             let result = ws.service.search(&ws.actor, &rest.join(" "), Some(limit), None)?;
             for item in &result.items {
                 (io.out)(&item_line(item));
@@ -352,22 +414,16 @@ async fn command_result(
         }
         "show" => {
             let key = rest.first().ok_or_else(|| RoduError::invalid("show needs an item key"))?;
-            let ws = open(io, false)?;
             (io.out)(&ws.service.context(key, None)?);
             Ok(0)
         }
-        "mv" => {
+        _ => {
             let status = rest.get(1..).unwrap_or_default();
             let Some(key) = rest.first().filter(|_| !status.is_empty()) else {
                 return Err(RoduError::invalid("mv needs an item key and a status"));
             };
-            let ws = open(io, false)?;
             (io.out)(&item_line(&ws.service.transition(&ws.actor, key, &status.join(" "))?));
             Ok(0)
-        }
-        _ => {
-            (io.err)(&format!("Unknown command \"{command}\"\n\n{USAGE}"));
-            Ok(1)
         }
     }
 }
@@ -405,6 +461,7 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
             .map_err(|_| RoduError::invalid("--port must be a whole number from 0 to 65535"))?,
     };
     let ws = open(io, false)?;
+    team::before(io, &ws);
     let (dist_dir, files) = match source {
         WebSource::Disk(dir) => (Some(dir), None),
         WebSource::Embedded => {
@@ -449,6 +506,7 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
                 .close()
                 .await
                 .map_err(|e| RoduError::internal(format!("Cannot stop the board: {e}")))?;
+            team::after_reopen(io, false);
         }
     }
     Ok(())
