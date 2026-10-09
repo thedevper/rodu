@@ -93,8 +93,11 @@ pub struct TeamFolder {
     root: PathBuf,
 }
 
+/// The path holds untrusted names from the folder and ends up in a terminal: control
+/// characters are escaped.
 fn folder_error(path: &Path, error: impl std::fmt::Display) -> RoduError {
-    RoduError::invalid(format!("Team folder {}: {error}", path.display()))
+    let shown = path.display().to_string();
+    RoduError::invalid(format!("Team folder {}: {error}", shown.escape_debug()))
 }
 
 fn peer_dir_name(peer: u64) -> String {

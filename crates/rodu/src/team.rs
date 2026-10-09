@@ -126,8 +126,15 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
     (io.out)(&format!(
         "Imported {} file(s), {} still arriving; numbered {numbered} card(s); {sent}",
         report.batch.imported.len(),
-        report.incomplete.len() + report.batch.waiting.len(),
+        report.incomplete.len(),
     ));
+    if !report.batch.waiting.is_empty() {
+        (io.out)(&format!(
+            "{} file(s) build on changes from another machine that have not arrived yet; \
+             they are read again until those do",
+            report.batch.waiting.len()
+        ));
+    }
     Ok(())
 }
 

@@ -11,6 +11,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 const CHILD_ENV: &str = "RODU_SYNC_FOLDER_CHECK_CHILD";
+const LOG_ENV: &str = "RODU_SYNC_FOLDER_CHECK_LOG";
 
 #[test]
 #[ignore = "the child process of the import checks, not a test of its own"]
@@ -18,7 +19,20 @@ fn check_child() {
     if std::env::var_os(CHILD_ENV).is_none() {
         return;
     }
-    let code = match run_check(&mut std::io::stdin().lock()) {
+    let mut input = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut input).unwrap();
+    if let Some(log) = std::env::var_os(LOG_ENV) {
+        // How many updates this check replays: after the snapshot, [peer, length, bytes]...
+        let word = |at: usize| u64::from_le_bytes(input[at..at + 8].try_into().unwrap()) as usize;
+        let (mut at, mut count) = (8 + word(0), 0);
+        while at < input.len() {
+            at += 16 + word(at + 8);
+            count += 1;
+        }
+        let mut file = std::fs::OpenOptions::new().append(true).create(true).open(log).unwrap();
+        std::io::Write::write_all(&mut file, format!("{count}\n").as_bytes()).unwrap();
+    }
+    let code = match run_check(&mut input.as_slice()) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{e}");
@@ -29,8 +43,12 @@ fn check_child() {
 }
 
 fn checker() -> Checker {
+    checker_logging(None)
+}
+
+fn checker_logging(log: Option<std::path::PathBuf>) -> Checker {
     Checker::new(
-        || {
+        move || {
             let mut c = Command::new(std::env::current_exe().unwrap());
             c.args([
                 "--ignored",
@@ -41,6 +59,9 @@ fn checker() -> Checker {
                 "-q",
             ]);
             c.env(CHILD_ENV, "1");
+            if let Some(log) = &log {
+                c.env(LOG_ENV, log);
+            }
             c
         },
         Duration::from_secs(30),
@@ -323,6 +344,34 @@ fn a_file_waiting_for_another_replicas_changes_is_read_again() {
     assert!(report.batch.waiting.is_empty(), "{report:?}");
     let item = again.store.get_item(&made[0].id).unwrap().expect("bob's card");
     assert_eq!(item.title, "Renamed by cat");
+}
+
+#[test]
+fn a_file_still_waiting_is_replayed_before_each_later_check() {
+    let (root, folder) = team();
+    let a = first(&folder);
+    let mut pair = [join(&folder, "bob"), join(&folder, "cat")];
+    pair.sort_by_key(|m| m.store().peer());
+    // Files are read in peer order: the earlier peer's file builds on the later peer's.
+    let [earlier, later] = &pair;
+    a.sync(&folder);
+    let made =
+        later.svc.create_items(&later.me, "DEMO", &[json!({ "title": "Base" })], None).unwrap();
+    folder.push(later.store()).unwrap();
+    earlier.sync(&folder);
+    let renamed = json!({ "title": "Built on it" });
+    earlier.svc.update_item(&earlier.me, &made[0].key, &renamed, None).unwrap();
+    folder.push(earlier.store()).unwrap();
+
+    // One file per check: the earlier peer's file lands first and waits.
+    a.store().set_import_group_cap(1);
+    let log = root.path().join("checks.log");
+    let report = folder.pull(a.store(), &checker_logging(Some(log.clone()))).unwrap();
+    assert_eq!(report.batch.imported.len(), 2, "{report:?}");
+    // The second check replayed the waiting file before the new one, as this process applied them.
+    let counts = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(counts.lines().collect::<Vec<_>>(), ["1", "2"], "{counts}");
+    assert_eq!(a.store().get_item(&made[0].id).unwrap().unwrap().title, "Built on it");
 }
 
 #[test]
