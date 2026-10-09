@@ -68,15 +68,6 @@ pub struct WebServerOptions<S: Store> {
     pub token: Option<String>,
 }
 
-/// How a server syncs while it runs: a pull and a push every `every`, and a push after each write.
-pub struct LiveOptions<S: Store> {
-    pub sync: Arc<dyn LiveSync<S>>,
-    pub every: std::time::Duration,
-}
-
-/// The interval `rodu web` syncs at.
-pub const LIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
-
 pub struct RunningServer {
     pub url: String,
     pub port: u16,
@@ -105,6 +96,15 @@ impl RunningServer {
         }
     }
 }
+
+/// How a server syncs while it runs: a pull and a push every `every`, and a push after each write.
+pub struct LiveOptions<S: Store> {
+    pub sync: Arc<dyn LiveSync<S>>,
+    pub every: std::time::Duration,
+}
+
+/// The interval `rodu web` syncs at.
+pub const LIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A failure answered with the shared error JSON.
 enum Failure {
