@@ -69,8 +69,12 @@ pub trait Store {
     ) -> Result<Option<String>>;
     fn insert_item(&self, item: &Item) -> Result<()>;
     fn get_item(&self, id: &str) -> Result<Option<Item>>;
+    /// Looks up by key or provisional key, ignoring case.
     fn get_item_by_key(&self, key: &str) -> Result<Option<Item>>;
-    /// Writes `item` only if the stored version equals `expected_version`; false otherwise.
+    /// Cards in the collection still waiting for a number, oldest (lowest id) first.
+    fn list_unnumbered_items(&self, collection_id: &str) -> Result<Vec<Item>>;
+    /// Writes `item` (number and key included) only if the stored version equals
+    /// `expected_version`; false otherwise.
     fn save_item(&self, item: &Item, expected_version: i64) -> Result<bool>;
     fn list_children(&self, parent_id: &str) -> Result<Vec<Item>>;
     fn list_items_in_cycle(&self, cycle_id: &str) -> Result<Vec<Item>>;
