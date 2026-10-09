@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "rodu"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "rodu-core",
  "rodu-http",
@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "rodu-api"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "rodu-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "regex",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "rodu-http"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "getrandom",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "rodu-mcp"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "rmcp",
  "rodu-core",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "rodu-store"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "rodu-core",
  "rusqlite",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "rodu-web"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "gloo-net 0.7.0",
  "js-sys",
@@ -2737,7 +2737,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "serde_json",

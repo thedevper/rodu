@@ -11,9 +11,9 @@ publish.workspace = true
 axum = "0.8.9"
 getrandom = "0.4.3"
 hex = "0.4.3"
-rodu-api = { version = "0.1.0", path = "../rodu-api" }
-rodu-core = { version = "0.1.0", path = "../rodu-core" }
-rodu-store = { version = "0.1.0", path = "../rodu-store" }
+rodu-api = { version = "0.3.0", path = "../rodu-api" }
+rodu-core = { version = "0.3.0", path = "../rodu-core" }
+rodu-store = { version = "0.3.0", path = "../rodu-store" }
 serde = "1.0.229"
 serde_json = "1.0.151"
 serde_urlencoded = "0.7.1"

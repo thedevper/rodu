@@ -8,10 +8,10 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-rodu-core = { version = "0.1.0", path = "../rodu-core" }
-rodu-http = { version = "0.1.0", path = "../rodu-http" }
-rodu-mcp = { version = "0.1.0", path = "../rodu-mcp" }
-rodu-store = { version = "0.1.0", path = "../rodu-store" }
+rodu-core = { version = "0.3.0", path = "../rodu-core" }
+rodu-http = { version = "0.3.0", path = "../rodu-http" }
+rodu-mcp = { version = "0.3.0", path = "../rodu-mcp" }
+rodu-store = { version = "0.3.0", path = "../rodu-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal"] }
