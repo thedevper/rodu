@@ -1,0 +1,25 @@
+# `cargo audit --deny warnings` runs in CI. Each advisory accepted here says why it does not
+# reach a Rodu user; any other advisory fails the build. Remove an entry as soon as the crate is
+# gone from Cargo.lock.
+
+[advisories]
+ignore = [
+    # Loro's version vectors use im::HashMap. Unmaintained; replaced by the maintained fork imbl in
+    # loro-dev/loro#1122, which we take when it is released (docs/adr/0001-sync-crdt.md).
+    "RUSTSEC-2026-0248",
+    # im: aliasing violation in OrdSet insertion. Loro does not use OrdSet.
+    "RUSTSEC-2023-0126",
+    # sized-chunks (under im): unmaintained, same fix as im.
+    "RUSTSEC-2026-0251",
+    # sized-chunks: unsound when a panic unwinds through Chunk, RingBuffer or InlineArray. Release
+    # builds use panic = "abort", so a panic never unwinds.
+    "RUSTSEC-2026-0255",
+    # bitmaps (under im): unmaintained, same fix as im.
+    "RUSTSEC-2026-0247",
+    # paste: unmaintained proc macro that Leptos uses at compile time. It runs on the build machine
+    # and is not part of anything shipped.
+    "RUSTSEC-2024-0436",
+    # atomic-polyfill: unmaintained; heapless needs it only on targets without native atomics. No
+    # Rodu target compiles it (macOS, Windows, Linux x64, wasm32).
+    "RUSTSEC-2023-0089",
+]

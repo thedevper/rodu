@@ -44,12 +44,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-about
+          tool: cargo-about,cargo-audit
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy -p rodu-web --target wasm32-unknown-unknown --locked -- -D warnings
       # Fails on any shipped crate whose licence is not accepted in about.toml.
       - run: cargo xtask notices
+      # Fails on any RustSec advisory not accepted, with its reason, in .cargo/audit.toml.
+      - run: cargo audit --deny warnings
 
   test:
     strategy:

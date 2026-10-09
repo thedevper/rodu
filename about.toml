@@ -22,3 +22,16 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 # Rodu's own crates are covered by LICENSE and NOTICE.
 private = { ignore = true }
+
+# MPL-2.0 is accepted for these crates only, which Loro (rodu-sync) depends on; any other MPL
+# crate still fails the build. (A `[crate-name]` table's `accepted` adds licences for that crate
+# alone: `KrateConfig` in cargo-about 0.9.2, src/licenses/config.rs.) MPL-2.0 needs its text (below) and where to get each crate's
+# source, which THIRD-PARTY-NOTICES.txt gives for every crate. See docs/adr/0001-sync-crdt.md.
+[im]
+accepted = ["MPL-2.0"]
+
+[sized-chunks]
+accepted = ["MPL-2.0"]
+
+[bitmaps]
+accepted = ["MPL-2.0"]

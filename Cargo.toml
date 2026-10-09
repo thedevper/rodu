@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
-default-members = ["crates/rodu-core", "crates/rodu-store", "crates/rodu-api", "crates/rodu-mcp", "crates/rodu-http", "crates/rodu"]
+default-members = ["crates/rodu-core", "crates/rodu-store", "crates/rodu-sync", "crates/rodu-api", "crates/rodu-mcp", "crates/rodu-http", "crates/rodu"]
 
 [workspace.package]
 version = "0.3.0"
