@@ -89,6 +89,9 @@ fn warn_report(io: &mut Io<'_>, report: &PullReport) {
     for line in report.damaged.iter().chain(&report.batch.refused) {
         warn(io, &format!("skipped {line}"));
     }
+    for line in report.batch.notes.iter() {
+        warn(io, line);
+    }
     for line in report.batch.index.problems.iter().chain(&report.batch.index.conflicts) {
         warn(io, line);
     }

@@ -88,6 +88,12 @@ pub struct Incoming {
     pub bytes: Vec<u8>,
 }
 
+/// Marks a held file whose check crashed or timed out once (see [`LoroStore::import_batch`]).
+/// File keys start with a peer's 16 hex digits, so this never names a file.
+fn strike_key(key: &str) -> String {
+    format!("strike:{key}")
+}
+
 /// The files still pending, then `files`, as the child should replay them.
 fn with_held<'a>(held: &[&'a Incoming], files: &[&'a Incoming]) -> Vec<Untrusted<'a>> {
     held.iter().chain(files).map(|f| untrusted(f)).collect()
@@ -107,6 +113,8 @@ pub struct BatchReport {
     /// Keys of files imported but holding operations that wait for another replica's earlier
     /// ones: read again next time, until every operation in them has landed.
     pub waiting: Vec<String>,
+    /// Why files wait that were not refused: a check that crashed or could not run.
+    pub notes: Vec<String>,
     pub index: IndexReport,
 }
 
@@ -436,8 +444,18 @@ impl LoroStore {
                         report.waiting.extend(group.iter().map(|f| f.key.clone()));
                         continue;
                     }
+                    // A check that replays held files and passes clears their strikes: a crash or
+                    // timeout counts against a file only twice in a row. (A file's own check is no
+                    // evidence: it passes whenever its operations stay pending.)
+                    let cleared = |held: &[&Incoming]| -> Result<()> {
+                        for h in held {
+                            self.sql.forget_sync_seen(&strike_key(&h.key))?;
+                        }
+                        Ok(())
+                    };
                     let accepted: Vec<&Incoming> =
                         if check_import(&doc, &with_held(&held, &group), checker).is_ok() {
+                            cleared(&held)?;
                             group
                         } else {
                             let mut accepted = Vec::new();
@@ -452,6 +470,7 @@ impl LoroStore {
                                 // from this group so far are imported before this one.
                                 let Err(e) = check_import(&doc, &with_held(&held, &files), checker)
                                 else {
+                                    cleared(&held)?;
                                     accepted.push(file);
                                     continue;
                                 };
@@ -482,7 +501,7 @@ impl LoroStore {
                                             // fails now is its doing. A crash or timeout may
                                             // also be the machine's, so it counts against the
                                             // file only the second time, in a later batch.
-                                            let strike = format!("strike:{}", h.key);
+                                            let strike = strike_key(&h.key);
                                             let refuse = match &found {
                                                 Err(SyncError::InvalidData(_)) => true,
                                                 Err(
@@ -493,13 +512,20 @@ impl LoroStore {
                                                     | SyncError::TimedOut(_)),
                                                 ) => {
                                                     self.sql.mark_sync_seen(&strike)?;
-                                                    report.refused.push(format!(
-                                                        "{}: {e}; read again next time",
+                                                    report.notes.push(format!(
+                                                        "{}: {e}; checked again next time",
                                                         h.key
                                                     ));
                                                     false
                                                 }
-                                                _ => false,
+                                                Err(e) => {
+                                                    report.notes.push(format!(
+                                                        "{}: {e}; checked again next time",
+                                                        h.key
+                                                    ));
+                                                    false
+                                                }
+                                                Ok(()) => false,
                                             };
                                             if let (true, Err(e)) = (refuse, found) {
                                                 self.sql.mark_sync_seen(&h.key)?;
