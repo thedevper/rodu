@@ -211,9 +211,12 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   group that passes is imported; when one is refused, each of its files is checked alone, against
   the document with the files accepted so far, so one bad file never holds the rest back. Files
   are remembered by folder, name and SHA-256: a file rewritten under a seen name is checked and
-  imported again, and operations Loro already holds are ignored by their ids. A file found
-  invalid or damaged is remembered and reported once; one the child could not finish (a crash
-  or timeout) is tried again next time.
+  imported again, and operations Loro already holds are ignored by their ids. A file is
+  remembered as done only once every operation in it is in the log: Loro keeps operations whose
+  predecessors have not arrived pending in memory, and a saved document leaves them out, so such
+  a file is read again each time until they land. A file found invalid or damaged is remembered
+  and reported once; one the child could not finish (a crash or timeout) is tried again next
+  time. File names are escaped before they are shown.
 - **Writing.** Under the workspace write lock, a replica exports its own operations from the
   counter it last exported to and writes them as its next file. A folder without
   `rodu-team.json` (a cloud drive not mounted) is never written to.

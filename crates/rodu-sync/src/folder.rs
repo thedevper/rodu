@@ -222,8 +222,14 @@ impl TeamFolder {
             }
             files.sort();
             for (name, path) in files {
-                let shown = format!("{}/{name}", peer_dir_name(peer));
-                let size = fs::metadata(&path).map_err(|e| folder_error(&path, e))?.len();
+                // The name is untrusted and ends up in a terminal: control characters are escaped.
+                let shown = format!("{}/{}", peer_dir_name(peer), name.escape_debug());
+                let size = match fs::metadata(&path) {
+                    Ok(meta) => meta.len(),
+                    // Deleted or moved by the folder app since it was listed.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(folder_error(&path, e)),
+                };
                 if size > (MAX_IMPORT_BYTES + HEADER) as u64 {
                     let key = format!("{shown}/size-{size}");
                     if !store.sync_seen(&key)? {

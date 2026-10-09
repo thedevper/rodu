@@ -236,6 +236,8 @@ fn damaged_files_and_files_with_another_peers_ops_are_refused() {
     let mut damaged = frame(b"whatever");
     *damaged.last_mut().unwrap() ^= 1;
     std::fs::write(b_dir.join("0000000051.update"), damaged).unwrap();
+    // A damaged file whose name would move the cursor and clear the screen.
+    std::fs::write(b_dir.join("0000000052\u{1b}[2J.update"), frame(b"x")[..20].repeat(4)).unwrap();
     // And a good one from bob.
     b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Real" })], None).unwrap();
     folder.push(b.store()).unwrap();
@@ -243,7 +245,8 @@ fn damaged_files_and_files_with_another_peers_ops_are_refused() {
     let report = a.sync(&folder);
     let refused = report.batch.refused.join("\n");
     assert!(refused.contains("0000000050.update") && refused.contains("other than"), "{refused}");
-    assert_eq!(report.damaged.len(), 1, "{report:?}");
+    assert_eq!(report.damaged.len(), 2, "{report:?}");
+    assert!(report.damaged.iter().all(|line| !line.contains('\u{1b}')), "{report:?}");
     assert!(a.titles().contains(&"Real".to_owned()), "a bad file does not hold the rest back");
     let raw_a = LoroDoc::new();
     raw_a.import(&a.store().updates_since(&LoroDoc::new().oplog_vv().encode()).unwrap()).unwrap();
@@ -290,6 +293,36 @@ fn a_backlog_is_checked_in_groups_and_a_bad_file_only_holds_back_itself() {
     for n in 0..6 {
         assert!(a.titles().contains(&format!("B{n}")), "B{n} arrived");
     }
+}
+
+#[test]
+fn a_file_waiting_for_another_replicas_changes_is_read_again() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let c = join(&folder, "cat");
+    a.sync(&folder);
+    let made = b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "From bob" })], None).unwrap();
+    let bobs = folder.push(b.store()).unwrap().unwrap();
+    c.sync(&folder);
+    c.svc.update_item(&c.me, &made[0].key, &json!({ "title": "Renamed by cat" }), None).unwrap();
+    folder.push(c.store()).unwrap();
+    // bob's file is still syncing at ann's when cat's, which builds on it, has arrived.
+    let whole = std::fs::read(&bobs).unwrap();
+    std::fs::write(&bobs, &whole[..whole.len() / 2]).unwrap();
+    let report = a.sync(&folder);
+    assert_eq!(report.batch.waiting.len(), 1, "{report:?}");
+    let Machine { svc, dir: kept, .. } = a;
+    drop(svc);
+    let dir = kept.path().to_path_buf();
+
+    // Opened again, as the next command would: cat's operations were not lost.
+    std::fs::write(&bobs, &whole).unwrap();
+    let again = RoduService::new(LoroStore::open(&dir).unwrap());
+    let report = folder.pull(&again.store, &checker()).unwrap();
+    assert!(report.batch.waiting.is_empty(), "{report:?}");
+    let item = again.store.get_item(&made[0].id).unwrap().expect("bob's card");
+    assert_eq!(item.title, "Renamed by cat");
 }
 
 #[test]
