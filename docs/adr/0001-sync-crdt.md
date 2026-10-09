@@ -312,10 +312,11 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   as no peer. After every pull (each command, `rodu sync`, and each tick of a running `web` or
   `mcp`) a machine numbers cards only if the document names it, and records its role in its
   config so the next command starts right. A team made before the document named one keeps the
-  config's choice: its creator names itself at its next sync.
+  config's choice: its creator names itself at its next sync that reaches the folder, never
+  offline, so a take-over already in the folder arrives before it could be undone.
   - `rodu team take-numbering --yes` makes this machine the numbering peer, for when the one that
-    numbered is gone for good: it pulls, names itself, numbers waiting cards and pushes. Without
-    `--yes` it refuses, since two machines numbering at once give out the same numbers. `rodu team`
+    numbered is gone for good: it pulls, names itself, numbers waiting cards and pushes. On the
+    machine that already numbers it writes nothing. Without `--yes` it refuses, since two machines numbering at once give out the same numbers. `rodu team`
     shows which machine numbers.
   - The old machine, once it syncs, says once that numbering moved and makes provisional cards
     from then on. Cards it numbered while offline after the hand-over can clash with the new
