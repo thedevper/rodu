@@ -998,6 +998,15 @@ fn a_reader_says_when_a_compacted_file_has_not_arrived() {
     let report = folder.pull(a.store(), &checker()).unwrap();
     assert!(report.missing.is_empty(), "{report:?}");
     assert_eq!(a.titles().iter().filter(|t| t.starts_with("Card")).count(), 3);
+
+    // A damaged file planted under a high number, then removed, raises nothing.
+    let planted = left[0].with_file_name("9999999999.update");
+    std::fs::write(&planted, b"not a sync file at all, just bytes").unwrap();
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(report.damaged.len(), 1, "{report:?}");
+    std::fs::remove_file(&planted).unwrap();
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert!(report.missing.is_empty(), "{report:?}");
 }
 
 /// macOS lets a user make their own file immutable, so its removal fails without root.

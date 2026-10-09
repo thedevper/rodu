@@ -269,7 +269,11 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   - a reader cannot tell a file still in transit from one that will never come, so it keeps saying
     so until the file arrives.
 
-  The same message appears if a replica's folder is emptied by hand.
+  Only files that landed raise the mark, so a damaged or refused file planted under a high number
+  raises nothing. Someone who can write the folder can still rename a file that lands to a high
+  number and remove it later; teammates are then warned until that replica's numbers pass it. They
+  could as well delete files, which is worse. The same message appears if a replica's folder is
+  emptied by hand.
 - **Commands.** `rodu team create --folder <path> --no-encrypt` turns the workspace in place
   into a team workspace: the document is built from every row of its index, so events,
   idempotency records and versions stay. It prints an invite code, `rodu1-<workspace id>`, which
