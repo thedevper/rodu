@@ -138,9 +138,12 @@ pub struct Cycle {
 pub struct Item {
     pub id: String,
     pub collection_id: String,
-    pub number: i64,
-    /// Human-readable short id, e.g. DEMO-12.
+    /// None until the workspace's numbering peer gives the card a number.
+    pub number: Option<i64>,
+    /// Human-readable short id: DEMO-12 once numbered, the provisional key before that.
     pub key: String,
+    /// The key the card had before it was numbered, e.g. DEMO-KQMRTZ; it keeps resolving.
+    pub provisional_key: Option<String>,
     #[serde(rename = "type")]
     pub item_type: ItemType,
     pub title: String,

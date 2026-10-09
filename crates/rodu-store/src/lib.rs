@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::compile::{CompileContext, compile_query};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE principals (
@@ -42,32 +42,6 @@ CREATE TABLE cycles (
   state TEXT NOT NULL CHECK (state IN ('planned', 'active', 'closed')),
   UNIQUE (collection_id, name COLLATE NOCASE)
 );
-CREATE TABLE items (
-  id TEXT PRIMARY KEY,
-  collection_id TEXT NOT NULL REFERENCES collections(id),
-  number INTEGER NOT NULL,
-  key TEXT NOT NULL UNIQUE,
-  type TEXT NOT NULL,
-  title TEXT NOT NULL,
-  body TEXT NOT NULL,
-  status TEXT NOT NULL,
-  category TEXT NOT NULL,
-  priority TEXT NOT NULL,
-  assignee_id TEXT REFERENCES principals(id),
-  parent_id TEXT REFERENCES items(id),
-  cycle_id TEXT REFERENCES cycles(id),
-  estimate REAL,
-  rank TEXT NOT NULL,
-  due_at TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  UNIQUE (collection_id, number)
-);
-CREATE INDEX items_rank ON items (collection_id, rank);
-CREATE INDEX items_assignee ON items (assignee_id);
-CREATE INDEX items_cycle ON items (cycle_id);
-CREATE INDEX items_parent ON items (parent_id);
 CREATE VIRTUAL TABLE items_fts USING fts5 (item_id UNINDEXED, title, body);
 CREATE TABLE comments (
   id TEXT PRIMARY KEY,
@@ -105,6 +79,46 @@ CREATE TABLE idempotency (
   result TEXT NOT NULL
 );
 ";
+
+/// The items table and its indexes, apart from the rest so that migrations can rebuild it.
+/// Unnumbered cards have a NULL number (UNIQUE ignores NULLs); keys compare ignoring case.
+const ITEMS_TABLE: &str = "
+CREATE TABLE items (
+  id TEXT PRIMARY KEY,
+  collection_id TEXT NOT NULL REFERENCES collections(id),
+  number INTEGER,
+  key TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  provisional_key TEXT UNIQUE COLLATE NOCASE,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL,
+  category TEXT NOT NULL,
+  priority TEXT NOT NULL,
+  assignee_id TEXT REFERENCES principals(id),
+  parent_id TEXT REFERENCES items(id),
+  cycle_id TEXT REFERENCES cycles(id),
+  estimate REAL,
+  rank TEXT NOT NULL,
+  due_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  UNIQUE (collection_id, number)
+);
+";
+
+const ITEMS_INDEXES: &str = "
+CREATE INDEX items_rank ON items (collection_id, rank);
+CREATE INDEX items_assignee ON items (assignee_id);
+CREATE INDEX items_cycle ON items (cycle_id);
+CREATE INDEX items_parent ON items (parent_id);
+";
+
+/// Schema 1 -> 2: number becomes nullable and provisional_key appears. SQLite cannot drop NOT NULL
+/// in place, so the table is rebuilt (https://sqlite.org/lang_altertable.html#otheralter).
+const ITEMS_COLUMNS_V1: &str = "id, collection_id, number, key, type, title, body, status, category, \
+priority, assignee_id, parent_id, cycle_id, estimate, rank, due_at, created_at, updated_at, version";
 
 /// Storage failures are internal: the message is for logs and the local CLI, never for remote
 /// callers (HTTP and MCP replace it with a generic one).
@@ -161,6 +175,7 @@ fn to_item(r: &Row<'_>) -> rusqlite::Result<Item> {
         collection_id: r.get("collection_id")?,
         number: r.get("number")?,
         key: r.get("key")?,
+        provisional_key: r.get("provisional_key")?,
         item_type: parse(r.get("type")?)?,
         title: r.get("title")?,
         body: r.get("body")?,
@@ -255,10 +270,43 @@ impl SqliteStore {
         if version == 0 {
             self.transaction(TxMode::Write, || {
                 self.conn.execute_batch(SCHEMA).map_err(db)?;
+                self.conn.execute_batch(ITEMS_TABLE).map_err(db)?;
+                self.conn.execute_batch(ITEMS_INDEXES).map_err(db)?;
                 self.conn.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(db)
             })?;
         }
+        if version == 1 {
+            self.migrate_to_2()?;
+        }
         Ok(())
+    }
+
+    fn migrate_to_2(&self) -> Result<()> {
+        // Dropping the old table must not cascade into comments and links, and the pragma only
+        // takes effect outside a transaction.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF").map_err(db)?;
+        let result = self.transaction(TxMode::Write, || {
+            let rebuild = format!(
+                "{create}
+                 INSERT INTO items_v2 ({ITEMS_COLUMNS_V1}) SELECT {ITEMS_COLUMNS_V1} FROM items;
+                 DROP TABLE items;
+                 ALTER TABLE items_v2 RENAME TO items;
+                 {ITEMS_INDEXES}",
+                create = ITEMS_TABLE.replacen("CREATE TABLE items (", "CREATE TABLE items_v2 (", 1),
+            );
+            self.conn.execute_batch(&rebuild).map_err(db)?;
+            let broken: i64 = self
+                .one("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?
+                .unwrap_or(0);
+            if broken != 0 {
+                return Err(RoduError::internal(format!(
+                    "Upgrading the database found {broken} broken references; nothing was changed"
+                )));
+            }
+            self.conn.pragma_update(None, "user_version", 2).map_err(db)
+        });
+        self.conn.execute_batch("PRAGMA foreign_keys = ON").map_err(db)?;
+        result
     }
 
     fn one<T>(
@@ -438,14 +486,16 @@ impl Store for SqliteStore {
 
     fn insert_item(&self, i: &Item) -> Result<()> {
         self.run(
-            "INSERT INTO items (id, collection_id, number, key, type, title, body, status, category,
-              priority, assignee_id, parent_id, cycle_id, estimate, rank, due_at, created_at, updated_at,
-              version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO items (id, collection_id, number, key, provisional_key, type, title, body,
+              status, category, priority, assignee_id, parent_id, cycle_id, estimate, rank, due_at,
+              created_at, updated_at, version)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 i.id,
                 i.collection_id,
                 i.number,
                 i.key,
+                i.provisional_key,
                 i.item_type.as_str(),
                 i.title,
                 i.body,
@@ -475,15 +525,25 @@ impl Store for SqliteStore {
     }
 
     fn get_item_by_key(&self, key: &str) -> Result<Option<Item>> {
-        self.one("SELECT * FROM items WHERE key = ?", [key], to_item)
+        self.one("SELECT * FROM items WHERE key = ?1 OR provisional_key = ?1", [key], to_item)
+    }
+
+    fn list_unnumbered_items(&self, collection_id: &str) -> Result<Vec<Item>> {
+        self.all(
+            "SELECT * FROM items WHERE collection_id = ? AND number IS NULL ORDER BY id",
+            [collection_id],
+            to_item,
+        )
     }
 
     fn save_item(&self, i: &Item, expected_version: i64) -> Result<bool> {
         let changed = self.run(
-            "UPDATE items SET type = ?, title = ?, body = ?, status = ?, category = ?, priority = ?,
-              assignee_id = ?, parent_id = ?, cycle_id = ?, estimate = ?, rank = ?, due_at = ?,
-              updated_at = ?, version = ? WHERE id = ? AND version = ?",
+            "UPDATE items SET number = ?, key = ?, type = ?, title = ?, body = ?, status = ?,
+              category = ?, priority = ?, assignee_id = ?, parent_id = ?, cycle_id = ?, estimate = ?,
+              rank = ?, due_at = ?, updated_at = ?, version = ? WHERE id = ? AND version = ?",
             params![
+                i.number,
+                i.key,
                 i.item_type.as_str(),
                 i.title,
                 i.body,
