@@ -31,6 +31,8 @@ struct Opts<'a> {
     body: Option<Value>,
     raw: Option<String>,
     headers: Vec<(&'a str, &'a str)>,
+    /// A Content-Length to claim instead of the payload's real length.
+    declared: Option<usize>,
 }
 
 /// Raw HTTP/1.1 so tests can send any Host or Authorization header.
@@ -50,11 +52,12 @@ async fn send(server: &RunningServer, method: &str, path: &str, opts: Opts<'_>) 
         }
     }
     let payload = payload.unwrap_or_default();
+    let length = opts.declared.unwrap_or(payload.len());
     let mut request = format!("{method} {path} HTTP/1.1\r\n");
     for (name, value) in headers {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
-    request.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", payload.len()));
+    request.push_str(&format!("Content-Length: {length}\r\nConnection: close\r\n\r\n"));
     let mut bytes = request.into_bytes();
     bytes.extend(payload.into_bytes());
 
@@ -196,7 +199,9 @@ async fn requires_json_and_limits_body_size() {
     let form =
         raw("collection=DEMO".into(), vec![("Content-Type", "application/x-www-form-urlencoded")]);
     assert_eq!(send(s, "POST", "/api/items", form).await.status, 415);
-    let big = raw(format!("\"{}\"", "x".repeat(1024 * 1024 + 10)), vec![]);
+    // Only the headers go out: a server that closes with unread upload data makes Windows reset
+    // the connection, and the reset discards the 413 the client already received.
+    let big = Opts { declared: Some(1024 * 1024 + 10), ..raw(String::new(), vec![]) };
     assert_eq!(send(s, "POST", "/api/items", big).await.status, 413);
     assert_eq!(send(s, "POST", "/api/items", raw("{nope".into(), vec![])).await.status, 400);
 }
