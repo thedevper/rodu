@@ -204,24 +204,26 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   (reported). Files are written under a hidden temporary name and renamed into place.
 - **Reading the folder.** Everything in it is untrusted. Directory and file names are parsed,
   never joined into paths; links, dotfiles and files over the import cap are skipped; conflict
-  copies (`0000000003 (1).update`) are read like any other file. A replica folder named for peer
-  0 is ignored: Loro never gives that id. A file is the unit of import, whole or not at all. New
+  copies (`0000000003 (1).update`) are read like any other file. A replica folder named for peer 0
+  is ignored: Loro never gives that id. A file is the unit of import, whole or not at all. New
   files are replayed in a child process (`rodu __check-import`) in groups under the import cap;
   the child also refuses a file holding operations of any peer but the one its folder names. A
   group that passes is imported; when one is refused, each of its files is checked alone, against
   the document with the files accepted so far, so one bad file never holds the rest back. Files
   are remembered by folder, name and SHA-256: a file rewritten under a seen name is checked and
-  imported again, and operations Loro already holds are ignored by their ids. A file is
-  remembered as done only once every operation in it is in the log: Loro keeps operations whose
-  predecessors have not arrived pending in memory, and a saved document leaves them out, so such
-  a file is read again each time until they land. Each check replays the files still pending
-  first, so the child applies their operations exactly when this process does. When such a check
-  fails, the new file is checked without them: if it passes, the held file that breaks once it
-  is released (refused, or crashing or hanging the child) is refused, and the rest of the batch waits for the next one, which starts from
-  the saved document. After any import that leaves operations pending, the next one starts from
-  the saved document too, so pending operations never reach a later import unchecked. A file found invalid or damaged is remembered
-  and reported once; one the child could not finish (a crash or timeout) is tried again next
-  time. File names are escaped before they are shown.
+  imported again, and operations Loro already holds are ignored by their ids. A file is remembered
+  as done only once every operation in it is in the log: Loro keeps operations whose predecessors
+  have not arrived pending in memory, and a saved document leaves them out, so such a file is read
+  again each time until they land. Each check replays the files still pending first, so the child
+  applies their operations exactly when this process does. When such a check fails, the new file
+  is checked without them: if it passes, the held file that breaks once it is released is refused
+  (at once when the child finds it invalid; when it crashes or hangs the child, only the second
+  time, in a later batch, since that may be the machine's doing), and the rest of the batch waits
+  for the next one, which starts from the saved document. After any import that leaves operations
+  pending, the next one starts from the saved document too, so pending operations never reach a
+  later import unchecked. A file found invalid or damaged is remembered and reported once; a file
+  the child could not finish on its own (a crash or timeout) is tried again next time. File names
+  are escaped before they are shown.
 - **Writing.** Under the workspace write lock, a replica exports its own operations from the
   counter it last exported to and writes them as its next file. A folder without
   `rodu-team.json` (a cloud drive not mounted) is never written to.

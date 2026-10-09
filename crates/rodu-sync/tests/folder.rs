@@ -505,10 +505,20 @@ fn held_file_blamed(crash: bool) {
     let (card, _) = base_and_build(&folder, &later, &earlier);
     a.store().set_import_group_cap(1);
     let poisoned = checker_poisoned_by(earlier.store().peer(), true, crash);
+    let blamed = format!("{:016x}", earlier.store().peer());
+    if crash {
+        // A crash may be the machine's: the first one only puts the batch off.
+        let report = folder.pull(a.store(), &poisoned).unwrap();
+        assert_eq!(report.batch.refused.len(), 1, "{report:?}");
+        assert!(report.batch.refused[0].ends_with("read again next time"), "{report:?}");
+        assert!(report.batch.imported.is_empty(), "{report:?}");
+    }
     let report = folder.pull(a.store(), &poisoned).unwrap();
     assert_eq!(report.batch.refused.len(), 1, "{report:?}");
-    assert!(report.batch.refused[0].starts_with(&format!("{:016x}", earlier.store().peer())));
-    // The honest file was put off, not refused: the next sync imports it.
+    assert!(report.batch.refused[0].starts_with(&blamed), "{report:?}");
+    assert!(!report.batch.refused[0].ends_with("read again next time"), "{report:?}");
+    // The honest file was put off, not refused, and the blamed one stays out: the next sync
+    // imports only the honest one.
     let report = folder.pull(a.store(), &checker()).unwrap();
     assert_eq!(report.batch.imported.len(), 1, "{report:?}");
     assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Base");

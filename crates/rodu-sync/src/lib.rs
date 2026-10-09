@@ -37,6 +37,10 @@ pub enum SyncError {
     TooLarge { size: usize, max: usize },
     #[error("Sync file refused: checking it {0}")]
     Refused(String),
+    #[error("Sync file refused: checking it crashed ({0})")]
+    Crashed(String),
+    #[error("Sync file refused: checking it took over {0:?}")]
+    TimedOut(Duration),
 }
 
 /// How to start the child process that checks an untrusted import: a command that runs
@@ -52,7 +56,8 @@ impl Checker {
     }
 
     /// Runs the child on `input`: `Ok` when it exits 0, `InvalidData` with its message when it
-    /// exits 2, `Refused` when it crashes, exits otherwise or runs past the timeout.
+    /// exits 2, `Crashed` when it crashes or exits otherwise, `TimedOut` when it runs past the
+    /// timeout, and `Refused` when it cannot be run.
     fn run(&self, input: Vec<u8>) -> Result<(), SyncError> {
         let mut child = (self.command)()
             .stdin(Stdio::piped())
@@ -82,7 +87,7 @@ impl Checker {
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(SyncError::Refused(format!("took over {:?}", self.timeout)));
+                    return Err(SyncError::TimedOut(self.timeout));
                 }
                 Err(e) => return Err(SyncError::Refused(format!("failed: {e}"))),
             }
@@ -92,7 +97,7 @@ impl Checker {
         match status.code() {
             Some(0) => Ok(()),
             Some(2) => Err(SyncError::InvalidData(message.trim().to_owned())),
-            _ => Err(SyncError::Refused(format!("crashed ({status})"))),
+            _ => Err(SyncError::Crashed(status.to_string())),
         }
     }
 }
@@ -437,7 +442,7 @@ mod tests {
         let update = sample().updates_since(&Replica::new(9).unwrap().version()).unwrap();
         let crash = checker(Duration::from_secs(30), &[("RODU_SYNC_CHECK_ABORT", "1")]);
         let refused = a.import_untrusted(&update, &crash);
-        assert!(matches!(refused, Err(SyncError::Refused(_))), "{refused:?}");
+        assert!(matches!(refused, Err(SyncError::Crashed(_))), "{refused:?}");
         assert_eq!(a.version(), before);
         assert_eq!(a.field("c3", "status").as_deref(), Some("Done"));
     }
@@ -463,7 +468,7 @@ mod tests {
         assert_eq!(b.field("c3", "status").as_deref(), Some("Done"));
         let crash = checker(Duration::from_secs(30), &[("RODU_SYNC_CHECK_ABORT", "1")]);
         let refused = Replica::from_untrusted_snapshot(&snapshot, 2, &crash);
-        assert!(matches!(refused, Err(SyncError::Refused(_))));
+        assert!(matches!(refused, Err(SyncError::Crashed(_))));
     }
 
     #[test]
@@ -472,7 +477,7 @@ mod tests {
         let update = a.updates_since(&Replica::new(9).unwrap().version()).unwrap();
         let hang = checker(Duration::from_millis(500), &[("RODU_SYNC_CHECK_HANG", "1")]);
         let start = Instant::now();
-        assert!(matches!(a.import_untrusted(&update, &hang), Err(SyncError::Refused(_))));
+        assert!(matches!(a.import_untrusted(&update, &hang), Err(SyncError::TimedOut(_))));
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 
