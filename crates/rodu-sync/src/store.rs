@@ -478,11 +478,30 @@ impl LoroStore {
                                                 &with_held(&[], &released),
                                                 checker,
                                             );
-                                            // The same files without it just passed, so
-                                            // a crash or timeout here is its doing too.
-                                            if let Err(e) = found
-                                                && !matches!(e, SyncError::TooLarge { .. })
-                                            {
+                                            // The same files without it just passed: what
+                                            // fails now is its doing. A crash or timeout may
+                                            // also be the machine's, so it counts against the
+                                            // file only the second time, in a later batch.
+                                            let strike = format!("strike:{}", h.key);
+                                            let refuse = match &found {
+                                                Err(SyncError::InvalidData(_)) => true,
+                                                Err(
+                                                    SyncError::Crashed(_) | SyncError::TimedOut(_),
+                                                ) if self.sql.is_sync_seen(&strike)? => true,
+                                                Err(
+                                                    e @ (SyncError::Crashed(_)
+                                                    | SyncError::TimedOut(_)),
+                                                ) => {
+                                                    self.sql.mark_sync_seen(&strike)?;
+                                                    report.refused.push(format!(
+                                                        "{}: {e}; read again next time",
+                                                        h.key
+                                                    ));
+                                                    false
+                                                }
+                                                _ => false,
+                                            };
+                                            if let (true, Err(e)) = (refuse, found) {
                                                 self.sql.mark_sync_seen(&h.key)?;
                                                 report.refused.push(format!("{}: {e}", h.key));
                                                 blamed.push(&h.key);
