@@ -75,16 +75,18 @@ fn secret_line(parts: &[&str]) -> zeroize::Zeroizing<String> {
 /// The team folder as this workspace syncs it: sealed with its key when it is encrypted. A key
 /// that is missing, or there when the workspace is plain, stops the sync rather than guess.
 fn team_folder(dir: &Path, team: &TeamConfig) -> Result<TeamFolder> {
-    match (team.encrypted, load_key(dir)?) {
+    // The fix is in the message itself: the warnings before and after a command show no hint.
+    const REJOIN: &str = "join the team again with the invite code, in a new folder";
+    let key = load_key(dir).map_err(|e| RoduError::invalid(format!("{}; {REJOIN}", e.message)))?;
+    match (team.encrypted, key) {
         (true, Some(key)) => {
             Ok(TeamFolder::sealed(&team.folder, key).expecting(&team.workspace_id))
         }
         (false, None) => Ok(TeamFolder::new(&team.folder).expecting(&team.workspace_id)),
         (true, None) => Err(RoduError::invalid(format!(
-            "this workspace's team key is missing ({})",
+            "this workspace's team key is missing ({}); {REJOIN}",
             dir.join(KEY_FILE).display()
-        ))
-        .with_hint("Join the team again in a new folder: rodu team join <invite code> ...")),
+        ))),
         (false, Some(_)) => Err(RoduError::invalid(format!(
             "{} is here, but this workspace syncs in plain",
             dir.join(KEY_FILE).display()

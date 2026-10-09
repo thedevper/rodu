@@ -355,9 +355,19 @@ fn a_missing_team_key_stops_the_sync_and_never_falls_back_to_plain() {
     let run = rodu(&team.ann, &["add", "Written without a key"]);
     assert_eq!(run.code, 0, "{}", run.err);
     assert!(run.err.contains("team key is missing"), "{}", run.err);
+    assert!(run.err.contains("join the team again with the invite code"), "{}", run.err);
     let sync = rodu(&team.ann, &["sync"]);
     assert_eq!(sync.code, 0, "{}", sync.err);
     assert!(sync.out.contains("Nothing was synced"), "{}", sync.out);
+    assert!(sync.err.contains("join the team again with the invite code"), "{}", sync.err);
+    assert_eq!(files(&team.folder), before, "nothing was written to the folder");
+    // A key file that does not hold a key stops it the same way.
+    std::fs::write(team.ann.join(".rodu/team.key"), "not a key\n").unwrap();
+    let sync = rodu(&team.ann, &["sync"]);
+    assert_eq!(sync.code, 0, "{}", sync.err);
+    assert!(sync.out.contains("Nothing was synced"), "{}", sync.out);
+    assert!(sync.err.contains("does not hold a team key"), "{}", sync.err);
+    assert!(sync.err.contains("join the team again with the invite code"), "{}", sync.err);
     assert_eq!(files(&team.folder), before, "nothing was written to the folder");
 }
 
