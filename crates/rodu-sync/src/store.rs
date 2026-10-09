@@ -478,7 +478,11 @@ impl LoroStore {
                                                 &with_held(&[], &released),
                                                 checker,
                                             );
-                                            if let Err(e @ SyncError::InvalidData(_)) = found {
+                                            // The same files without it just passed, so
+                                            // a crash or timeout here is its doing too.
+                                            if let Err(e) = found
+                                                && !matches!(e, SyncError::TooLarge { .. })
+                                            {
                                                 self.sql.mark_sync_seen(&h.key)?;
                                                 report.refused.push(format!("{}: {e}", h.key));
                                                 blamed.push(&h.key);
