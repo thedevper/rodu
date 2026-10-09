@@ -258,12 +258,12 @@ fn conflict_copies_are_imported_and_arriving_files_wait() {
     let b = join(&folder, "bob");
     a.sync(&folder);
     b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Copied" })], None).unwrap();
-    let written = folder.push(b.store()).unwrap().unwrap();
+    let written = folder.push(b.store()).unwrap().written.unwrap();
     // The folder app kept the file only as a conflict copy, and another one is half synced.
     let copy = written.with_file_name("0000000099 (1).update");
     std::fs::rename(&written, &copy).unwrap();
     b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Arriving" })], None).unwrap();
-    let next = folder.push(b.store()).unwrap().unwrap();
+    let next = folder.push(b.store()).unwrap().written.unwrap();
     let whole = std::fs::read(&next).unwrap();
     std::fs::write(&next, &whole[..whole.len() / 2]).unwrap();
 
@@ -366,7 +366,7 @@ fn a_file_waiting_for_another_replicas_changes_is_read_again() {
     let c = join(&folder, "cat");
     a.sync(&folder);
     let made = b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "From bob" })], None).unwrap();
-    let bobs = folder.push(b.store()).unwrap().unwrap();
+    let bobs = folder.push(b.store()).unwrap().written.unwrap();
     c.sync(&folder);
     c.svc.update_item(&c.me, &made[0].key, &json!({ "title": "Renamed by cat" }), None).unwrap();
     folder.push(c.store()).unwrap();
@@ -436,7 +436,7 @@ fn base_and_build(
 ) -> (rodu_core::Item, std::path::PathBuf) {
     let made =
         base.svc.create_items(&base.me, "DEMO", &[json!({ "title": "Base" })], None).unwrap();
-    let file = folder.push(base.store()).unwrap().unwrap();
+    let file = folder.push(base.store()).unwrap().written.unwrap();
     builder.sync(folder);
     let renamed = json!({ "title": "Built on it" });
     builder.svc.update_item(&builder.me, &made[0].key, &renamed, None).unwrap();
@@ -580,7 +580,7 @@ fn a_replica_folder_named_for_peer_zero_is_ignored() {
     let b = join(&folder, "bob");
     a.sync(&folder);
     b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Hidden" })], None).unwrap();
-    let written = folder.push(b.store()).unwrap().unwrap();
+    let written = folder.push(b.store()).unwrap().written.unwrap();
     // bob's real file copied under peer 0, then removed from bob's folder.
     let zero = folder.root().join("sync").join(format!("{:016x}", 0));
     std::fs::create_dir_all(&zero).unwrap();
@@ -672,7 +672,7 @@ fn sealed_files_that_were_changed_moved_or_made_elsewhere_are_refused_once() {
     a.sync(&folder);
     let b_folder = sealed_at(root.path(), KEY);
     b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Kept" })], None).unwrap();
-    let good = b_folder.push(b.store()).unwrap().unwrap();
+    let good = b_folder.push(b.store()).unwrap().written.unwrap();
     let b_dir = good.parent().unwrap().to_path_buf();
 
     // One bit changed after sealing, with the outer hash fixed up so only the seal catches it.
@@ -761,7 +761,7 @@ fn a_team_file_naming_another_workspace_stops_the_sync_and_writes_nothing() {
     assert_eq!(files_of(&folder, a.store().peer()).len(), files, "nothing sealed for it");
     // Put back, the change goes out and opens for a teammate.
     std::fs::write(&team_file, real).unwrap();
-    folder.push(a.store()).unwrap().unwrap();
+    folder.push(a.store()).unwrap().written.unwrap();
     let b = join(&sealed_at(root.path(), KEY).expecting(id), "bob");
     assert!(b.titles().contains(&"During the swap".to_owned()));
 }
@@ -776,11 +776,265 @@ fn a_planted_high_sequence_number_never_stops_pushes() {
         a.svc
             .create_items(&a.me, "DEMO", &[json!({ "title": format!("After {n}") })], None)
             .unwrap();
-        folder.push(a.store()).unwrap().unwrap();
+        folder.push(a.store()).unwrap().written.unwrap();
     }
     assert!(dir.join("10000000001.update").exists());
     // At the very end of the numbers: an error, not a panic or a lost change.
     std::fs::write(dir.join(format!("{}.update", u64::MAX)), frame(b"planted")).unwrap();
     a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "Stuck" })], None).unwrap();
     assert!(folder.push(a.store()).unwrap_err().message.contains("past any sequence"));
+}
+
+// --- compaction ---------------------------------------------------------------------------------
+
+/// The numbered files of a replica's own folder, by number.
+fn numbered(folder: &TeamFolder, peer: u64) -> Vec<std::path::PathBuf> {
+    files_of(folder, peer)
+        .into_iter()
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            name.strip_suffix(".update").is_some_and(|d| d.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect()
+}
+
+/// `count` cards from `m`, each written as its own file.
+fn write_each(m: &Machine, folder: &TeamFolder, prefix: &str, count: usize) {
+    for n in 0..count {
+        m.svc
+            .create_items(&m.me, "DEMO", &[json!({ "title": format!("{prefix}{n}") })], None)
+            .unwrap();
+        folder.push(m.store()).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pull_does_not_read_files_it_already_has() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    write_each(&b, &folder, "B", 3);
+    a.sync(&folder);
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with('B')).count(), 3);
+    let bobs = numbered(&folder, b.store().peer());
+    for path in &bobs {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    // Run as root, the files stay readable and the pull would prove nothing.
+    let proves = std::fs::read(&bobs[0]).is_err();
+    let again = folder.pull(a.store(), &checker());
+    for path in &bobs {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    if proves {
+        let again = again.expect("a landed file is not opened again");
+        assert!(again.damaged.is_empty() && again.batch.imported.is_empty(), "{again:?}");
+    }
+
+    // A file rewritten in place, even to the same size, is read again.
+    let mut bytes = std::fs::read(&bobs[1]).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&bobs[1], &bytes).unwrap();
+    let rewritten = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(rewritten.damaged.len(), 1, "{rewritten:?}");
+    // And so is one rewritten with other content of another size.
+    let raw = LoroDoc::new();
+    raw.set_peer_id(99).unwrap();
+    raw.get_map("principals").insert("x", 1).unwrap();
+    raw.commit();
+    std::fs::write(&bobs[2], frame(&raw.export(loro::ExportMode::all_updates()).unwrap())).unwrap();
+    let rewritten = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(rewritten.batch.refused.len(), 1, "{rewritten:?}");
+}
+
+#[test]
+fn a_replica_compacts_its_own_files_and_nobody_loses_a_card() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let b_peer = b.store().peer();
+    write_each(&b, &folder, "Early", 10);
+    a.sync(&folder);
+    // A folder app's conflict copy in bob's folder, and ann's own files, are not bob's to remove.
+    let early = numbered(&folder, b_peer)[1].clone();
+    let copy = early.with_file_name("0000000002 (1).update");
+    std::fs::copy(&early, &copy).unwrap();
+    let anns = files_of(&folder, a.store().peer());
+    write_each(&b, &folder, "Late", 30);
+
+    let left = numbered(&folder, b_peer);
+    assert!(left.len() < 32, "{} numbered files left", left.len());
+    assert!(copy.exists(), "the conflict copy survives");
+    assert_eq!(files_of(&folder, a.store().peer()), anns, "ann's files are untouched");
+
+    // ann had the early files: the compacted one brings nothing new and nothing to report.
+    let report = a.sync(&folder);
+    assert!(report.batch.refused.is_empty() && report.damaged.is_empty(), "{report:?}");
+    let bobs_cards = |m: &Machine| {
+        m.titles().into_iter().filter(|t| t.starts_with("Early") || t.starts_with("Late")).count()
+    };
+    assert_eq!(bobs_cards(&a), 40);
+    // A teammate who joins now gets every card from far fewer files.
+    let c = join(&folder, "cat");
+    assert_eq!(bobs_cards(&c), 40);
+    assert!(c.titles().contains(&"Made alone".to_owned()));
+}
+
+#[test]
+fn removals_that_arrive_before_the_compacted_file_only_make_a_reader_wait() {
+    let (root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let b_peer = b.store().peer();
+    write_each(&b, &folder, "Card", 40);
+    assert!(numbered(&folder, b_peer).len() < 32, "bob compacted");
+    let compacted = numbered(&folder, b_peer)
+        .into_iter()
+        .max_by_key(|p| std::fs::metadata(p).unwrap().len())
+        .expect("the compacted file");
+    write_each(&b, &folder, "After", 1);
+    // A teammate's folder app has applied the removals but not yet brought the compacted file.
+    let hidden = compacted.with_file_name(".in-transit");
+    std::fs::rename(&compacted, &hidden).unwrap();
+    let c_dir = tempfile::tempdir().unwrap();
+    let c = RoduService::new(LoroStore::open(c_dir.path()).unwrap()).with_numbering(false);
+    let report = folder.pull(&c.store, &checker()).unwrap();
+    assert!(!report.batch.waiting.is_empty(), "bob's later file waits: {report:?}");
+    assert!(report.batch.refused.is_empty() && report.damaged.is_empty(), "{report:?}");
+
+    std::fs::rename(&hidden, &compacted).unwrap();
+    let report = folder.pull(&c.store, &checker()).unwrap();
+    assert!(report.batch.waiting.is_empty(), "{report:?}");
+    let me = a.me.clone();
+    let titles: Vec<String> =
+        c.search(&me, "", Some(100), None).unwrap().items.into_iter().map(|i| i.title).collect();
+    assert_eq!(titles.iter().filter(|t| t.starts_with("Card")).count(), 40);
+    assert!(titles.contains(&"After0".to_owned()));
+    drop(root);
+}
+
+#[test]
+fn old_files_left_by_a_compaction_that_stopped_are_harmless_and_removed_later() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let b_peer = b.store().peer();
+    write_each(&b, &folder, "Card", 20);
+    a.sync(&folder);
+    let saved: Vec<(std::path::PathBuf, Vec<u8>)> = numbered(&folder, b_peer)
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    write_each(&b, &folder, "More", 20);
+    // As if the compaction stopped after writing its file: the old files are back.
+    for (path, bytes) in &saved {
+        if !path.exists() {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+    let report = a.sync(&folder);
+    assert!(report.batch.refused.is_empty() && report.damaged.is_empty(), "{report:?}");
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with("More")).count(), 20);
+    // The next compaction removes them.
+    write_each(&b, &folder, "Last", 40);
+    assert!(saved.iter().all(|(path, _)| !path.exists()), "old files removed");
+    assert!(numbered(&folder, b_peer).len() < 32);
+    a.sync(&folder);
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with("Last")).count(), 40);
+}
+
+#[test]
+fn a_replica_does_not_compact_past_the_import_cap() {
+    let (_root, folder) = team();
+    let b_folder = TeamFolder::new(folder.root()).compacting(4, 1);
+    let _a = first(&folder);
+    let b = join(&b_folder, "bob");
+    write_each(&b, &b_folder, "Card", 8);
+    // Every file is still there: one holding everything would be over the (lowered) cap.
+    assert_eq!(numbered(&b_folder, b.store().peer()).len(), 9);
+}
+
+#[test]
+fn an_encrypted_team_compacts_into_a_sealed_file() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = sealed_at(root.path(), KEY);
+    let a = first(&folder);
+    let b_folder = sealed_at(root.path(), KEY);
+    let b = join(&b_folder, "bob");
+    write_each(&b, &b_folder, "Secret", 40);
+    assert!(numbered(&folder, b.store().peer()).len() < 32);
+    let c = join(&sealed_at(root.path(), KEY), "cat");
+    assert_eq!(c.titles().iter().filter(|t| t.starts_with("Secret")).count(), 40);
+    a.sync(&folder);
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with("Secret")).count(), 40);
+    let bytes = folder_bytes(&folder);
+    assert!(!bytes.windows(6).any(|w| w == b"Secret"), "the compacted file is sealed");
+}
+
+#[test]
+fn a_reader_says_when_a_compacted_file_has_not_arrived() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b_folder = TeamFolder::new(folder.root()).compacting(4, usize::MAX);
+    let b = join(&b_folder, "bob");
+    let b_peer = b.store().peer();
+    a.sync(&folder);
+    // bob's fourth file sets off a compaction: one file is left, holding everything.
+    write_each(&b, &b_folder, "Card", 3);
+    let left = numbered(&folder, b_peer);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let hidden = left[0].with_file_name(".in-transit");
+    std::fs::rename(&left[0], &hidden).unwrap();
+
+    for _ in 0..2 {
+        let report = folder.pull(a.store(), &checker()).unwrap();
+        assert_eq!(report.missing.len(), 1, "said on every pull: {report:?}");
+        assert!(report.batch.refused.is_empty() && report.damaged.is_empty(), "{report:?}");
+    }
+    std::fs::rename(&hidden, &left[0]).unwrap();
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert!(report.missing.is_empty(), "{report:?}");
+    assert_eq!(a.titles().iter().filter(|t| t.starts_with("Card")).count(), 3);
+
+    // A damaged file planted under a high number, then removed, raises nothing.
+    let planted = left[0].with_file_name("9999999999.update");
+    std::fs::write(&planted, b"not a sync file at all, just bytes").unwrap();
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(report.damaged.len(), 1, "{report:?}");
+    std::fs::remove_file(&planted).unwrap();
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert!(report.missing.is_empty(), "{report:?}");
+}
+
+/// macOS lets a user make their own file immutable, so its removal fails without root.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_compaction_that_cannot_remove_a_file_warns_and_the_push_still_counts() {
+    let (_root, folder) = team();
+    let _a = first(&folder);
+    let b_folder = TeamFolder::new(folder.root()).compacting(4, usize::MAX);
+    let b = join(&b_folder, "bob");
+    write_each(&b, &b_folder, "Card", 2);
+    let stuck = numbered(&folder, b.store().peer())[0].clone();
+    let flags = |flag: &str| {
+        let ok = Command::new("chflags").arg(flag).arg(&stuck).status().unwrap().success();
+        assert!(ok, "chflags {flag}");
+    };
+    flags("uchg");
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Fourth" })], None).unwrap();
+    let pushed = b_folder.push(b.store());
+    flags("nouchg");
+    let pushed = pushed.expect("the push itself succeeded");
+    assert!(pushed.written.is_some());
+    assert_eq!(pushed.warnings.len(), 1, "{pushed:?}");
+    assert!(pushed.warnings[0].contains("the next compaction removes it"), "{pushed:?}");
+    assert!(stuck.exists());
+    // The next compaction removes it.
+    write_each(&b, &b_folder, "More", 4);
+    assert!(!stuck.exists());
 }
