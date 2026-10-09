@@ -236,20 +236,76 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   that stopped half way (the creator's replica folder is made before the team file for this).
   `rodu team join <code> --folder <path> --name <you>` makes a workspace from
   the folder; a join that fails removes what it made. `rodu team` shows the folder, code and role;
-  `rodu sync` syncs by hand. `--encrypt` is refused until step 4b, and giving neither flag is an
-  error, so there is no silent default.
+  `rodu sync` syncs by hand. Giving neither `--encrypt` nor `--no-encrypt` is an error, so
+  there is no silent default.
 - **Automatic sync.** In a team workspace `add`, `ls`, `show` and `mv` read the folder first and
   write to it after; the numbering peer (the machine that created the team) numbers new cards in
   between. `web` and `mcp` sync when they start and when they stop. A folder that cannot be read
   is a warning, and the command, `rodu sync` included, works on what the machine has.
-- **Left for later steps.** 4b: encryption. 4c: the readable copy, `web` and `mcp` watching the
+- **Left for later steps.** 4c: the readable copy, `web` and `mcp` watching the
   folder while they run, compaction (today every command reads every file in the folder), and the
   command that hands numbering to another machine. A file waiting on operations that never arrive
   (its predecessor refused, or never written) is read and checked again on every command, with no
   limit yet; `rodu sync` lists such files. Held files count toward the import cap of each later
   check, so a replica that writes close to 64 MiB of files that never land can hold back what
-  others write until they are removed. A join that fails after its principal reached
+  others write until they are removed. A frame's length is not authenticated: a length past
+  what any sync file holds marks the file damaged, but one changed to a larger length still within
+  that bound cannot be told from a file still arriving, so it is listed as arriving for good (and
+  never imported). A join that fails after its principal reached
   the folder leaves that principal behind; joining again under the same name then shows `bob2`.
+
+## Encrypted teams (built 2026-10-09)
+
+Step 4b: `rodu team create --folder <path> --encrypt` seals every sync file, so the folder's
+provider cannot read the board.
+
+- **Cipher.** XChaCha20-Poly1305 from RustCrypto's `chacha20poly1305` 0.11.0 (Apache-2.0 OR
+  MIT), with a 256-bit team key and a fresh random 24-byte nonce for each file. Random nonces are
+  safe at any number of files with a 192-bit nonce; if the random source fails, nothing is
+  written.
+- **Wire format.** A sealed file is framed like a plain one, under the magic `RODU-SEALED1`:
+  magic, the sealed payload's length (u64 LE), its SHA-256, then `nonce || ciphertext || tag`.
+  The frame still tells a file being synced from a damaged one before anything is decrypted. The
+  associated data is `"rodu-sync-seal-1" 0x00`, the workspace id's byte length (u64 LE), the
+  workspace id as written in the team file (UTF-8), and the writer's peer id (u64 LE). So a file
+  moved into another replica's folder, copied from another team, or changed by one bit does not
+  open; it is reported once, like a damaged file. A unit test pins a test vector computed by an
+  independent implementation written from RFC 8439 and the XChaCha draft.
+- **Team file.** Format 2: `{"format": 2, "workspaceId", "encryption": "xchacha20poly1305",
+  "keyCheck"}`, where `keyCheck` is the hex SHA-256 of `"rodu-team-key-check-1" 0x00 || key`.
+  Plain teams stay format 1, and a rodu that knows only format 1 refuses a format 2 folder.
+- **Which side decides.** The workspace, never the folder: `config.json` records
+  `"encrypted": true` and the key is in `.rodu/team.key`. The folder must match, or nothing is
+  synced and the command warns:
+  - an encrypted workspace and a format 1 folder (a team file turned back to plain);
+  - a key whose check does not match;
+  - a team file naming another workspace id than the config's. Files are sealed for the
+    config's id, never the folder's, so a team file with only its id changed cannot make
+    teammates write files nobody can open later;
+  - a plain workspace and a format 2 folder;
+  - an encrypted workspace without its key file, or a plain one with a key file.
+
+  A provider that rewrites the team file can stop the sync, but it can never make a workspace
+  write plain files. Create writes the key first, then the document, the team file and the first
+  file, and the config last; a create that stopped half way carries on with the key it left, and
+  a plain create there is refused.
+- **Key.** It is stored as hex in `.rodu/team.key`, created with mode 0600 on Unix, never in
+  `config.json`, and held in memory in zeroizing buffers. The invite code of an encrypted team is
+  `rodu1-<workspace id>.<key, 64 hex>`. `team create` prints it once, with a warning that it is a
+  secret. `rodu team` hides it unless `--show-invite` is given. `rodu team join -` reads it from
+  stdin, so it stays out of shell history and other users' process lists. Join checks the key
+  against `keyCheck` before it writes anything. A wrong key, a missing key, or a key on a plain
+  team's code is refused.
+- **Untrusted input.** A sealed file is opened, and so authenticated, before its plaintext goes
+  through the same child-process import check as a plain file's. Files are read with a bound, so
+  one that grows after its size was checked is refused like an oversize one. Encryption keeps
+  the provider out, not a teammate: anyone with the invite code can write files the team
+  accepts. It protects what the board says, not whether it syncs: whoever can write to the
+  folder can still delete files, put back old ones (harmless, since operations already held
+  are ignored) or stop the sync, and that is not detected.
+- **Left for later.** The readable copy (4c). Turning encryption on or off for an existing team,
+  and changing the key, which needs a new team today. On Windows, `team.key` relies on the
+  user profile's permissions, since there is no 0600.
 
 ## Proposed design for the open problems
 
@@ -321,9 +377,10 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
 4. Shared-folder transport with automatic sync, `rodu team create` and `rodu team join`, and
    the encryption and readable-copy options. Test it with two and three workspaces on one folder
    in CI on macOS and Windows, including a folder app's conflict copies (`file (1).update`) and
-   half-written files. Split in three: 4a (transport, team commands, automatic sync) is done,
-   described under "The team folder" above; 4b adds encryption; 4c the readable copy, live
-   watching in `web` and `mcp`, compaction and the numbering hand-over.
+   half-written files. Split in three: 4a (transport, team commands, automatic sync) and 4b
+   (encryption) are done, described under "The team folder" and "Encrypted teams" above; 4c
+   adds the readable copy, live watching in `web` and `mcp`, compaction and the numbering
+   hand-over.
 5. Later: `rodu relay` for live sync.
 6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.

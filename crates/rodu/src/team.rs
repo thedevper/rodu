@@ -9,6 +9,7 @@ use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
 use rodu_sync::folder::{PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
+use rodu_sync::seal::TeamKey;
 use rodu_sync::{Checker, LoroStore};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,8 @@ use crate::{
 /// stdin, replays it, and exits 0 if it is valid, 2 if not (anything else: it crashed).
 pub const CHECK_COMMAND: &str = "__check-import";
 const INVITE_PREFIX: &str = "rodu1-";
+/// An encrypted team's key, in the workspace folder; never in `config.json`.
+const KEY_FILE: &str = "team.key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +34,82 @@ pub struct TeamConfig {
     pub workspace_id: String,
     /// Whether this machine is the team's numbering peer.
     pub numbering: bool,
+    /// Whether the team's files are sealed with the key in `team.key`. This setting, not the
+    /// folder, decides how the workspace syncs.
+    #[serde(default)]
+    pub encrypted: bool,
+}
+
+/// The team key in `dir`, if there is one.
+fn load_key(dir: &Path) -> Result<Option<TeamKey>> {
+    let path = dir.join(KEY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => zeroize::Zeroizing::new(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(RoduError::invalid(format!("Cannot read {}: {e}", path.display()))),
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| TeamKey::from_hex(text.trim()))
+        .map(Some)
+        .ok_or_else(|| RoduError::invalid(format!("{} does not hold a team key", path.display())))
+}
+
+fn save_key(dir: &Path, key: &TeamKey) -> Result<()> {
+    let path = dir.join(KEY_FILE);
+    write_private_file(&path, &secret_line(&[key.to_hex().as_str(), "\n"]))
+        .map_err(|e| RoduError::invalid(format!("Cannot write {}: {e}", path.display())))
+}
+
+/// `parts` joined in a buffer that is wiped when dropped, sized up front so no copy is left
+/// behind by a reallocation.
+fn secret_line(parts: &[&str]) -> zeroize::Zeroizing<String> {
+    let mut line =
+        zeroize::Zeroizing::new(String::with_capacity(parts.iter().map(|p| p.len()).sum()));
+    for part in parts {
+        line.push_str(part);
+    }
+    line
+}
+
+/// The team folder as this workspace syncs it: sealed with its key when it is encrypted. A key
+/// that is missing, or there when the workspace is plain, stops the sync rather than guess.
+fn team_folder(dir: &Path, team: &TeamConfig) -> Result<TeamFolder> {
+    // The fix is in the message itself: the warnings before and after a command show no hint.
+    const REJOIN: &str = "join the team again with the invite code, in a new folder";
+    let key = load_key(dir).map_err(|e| RoduError::invalid(format!("{}; {REJOIN}", e.message)))?;
+    match (team.encrypted, key) {
+        (true, Some(key)) => {
+            Ok(TeamFolder::sealed(&team.folder, key).expecting(&team.workspace_id))
+        }
+        (false, None) => Ok(TeamFolder::new(&team.folder).expecting(&team.workspace_id)),
+        (true, None) => Err(RoduError::invalid(format!(
+            "this workspace's team key is missing ({}); {REJOIN}",
+            dir.join(KEY_FILE).display()
+        ))),
+        (false, Some(_)) => Err(RoduError::invalid(format!(
+            "{} is here, but this workspace syncs in plain",
+            dir.join(KEY_FILE).display()
+        ))),
+    }
+}
+
+/// `rodu1-<workspace id>`, then `.<key>` for an encrypted team.
+fn invite_code(workspace_id: &str, key: Option<&TeamKey>) -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(match key {
+        Some(key) => format!("{INVITE_PREFIX}{workspace_id}.{}", key.to_hex().as_str()),
+        None => format!("{INVITE_PREFIX}{workspace_id}"),
+    })
+}
+
+/// The workspace id and, for an encrypted team, the key an invite code holds.
+fn parse_invite(code: &str) -> Option<(String, Option<TeamKey>)> {
+    let rest = code.trim().strip_prefix(INVITE_PREFIX)?;
+    let (id, key) = match rest.split_once('.') {
+        Some((id, key)) => (id, Some(TeamKey::from_hex(key)?)),
+        None => (rest, None),
+    };
+    is_uuid(id).then(|| (id.to_owned(), key))
 }
 
 /// Runs the import check in a child process of this very executable.
@@ -58,7 +137,7 @@ fn user_actor(config: &Config) -> Actor {
 /// peer, numbers new cards. Problems are warnings: the command runs on what this machine has.
 pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
     let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else { return };
-    match TeamFolder::new(&team.folder).pull(store, &checker()) {
+    match team_folder(&ws.dir, team).and_then(|folder| folder.pull(store, &checker())) {
         Ok(report) => warn_report(io, &report),
         Err(e) => warn(io, &format!("{} (working offline)", e.message)),
     }
@@ -72,7 +151,7 @@ pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
 /// After a command in a team workspace: writes this machine's new changes to the folder.
 pub(crate) fn after(io: &mut Io<'_>, ws: &Workspace) {
     let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else { return };
-    if let Err(e) = TeamFolder::new(&team.folder).push(store) {
+    if let Err(e) = team_folder(&ws.dir, team).and_then(|folder| folder.push(store)) {
         warn(io, &format!("{} (your changes stay here and go out next time)", e.message));
     }
 }
@@ -104,9 +183,19 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
         return Err(RoduError::invalid("This is not a team workspace")
             .with_hint("Make it one: rodu team create --folder <shared folder> --no-encrypt"));
     };
-    let folder = TeamFolder::new(&team.folder);
     // Like every other command, a sync by hand keeps working on what this machine has when the
     // folder cannot be reached, and says so.
+    let folder = match team_folder(&ws.dir, team) {
+        Ok(folder) => folder,
+        Err(e) => {
+            warn(io, &e.message);
+            if let Some(hint) = &e.hint {
+                (io.err)(&format!("hint: {hint}"));
+            }
+            (io.out)("Nothing was synced");
+            return Ok(());
+        }
+    };
     let report = match folder.pull(store, &checker()) {
         Ok(report) => report,
         Err(e) => {
@@ -141,13 +230,33 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
     Ok(())
 }
 
-/// `rodu team`: where this workspace syncs.
-pub(crate) fn status(io: &mut Io<'_>) -> Result<()> {
+/// `rodu team [--show-invite]`: where this workspace syncs. An encrypted team's invite code
+/// holds its key, so it is shown only when asked for.
+pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
     let ws = open(io, false)?;
     match (&ws.config.team, ws.service.store.team()) {
         (Some(team), Some(store)) => {
             (io.out)(&format!("Team folder: {}", team.folder));
-            (io.out)(&format!("Invite code: {INVITE_PREFIX}{}", team.workspace_id));
+            if !team.encrypted {
+                (io.out)("Encryption: off");
+                (io.out)(&format!(
+                    "Invite code: {}",
+                    invite_code(&team.workspace_id, None).as_str()
+                ));
+            } else if args.flag("show-invite") {
+                (io.out)("Encryption: on");
+                let key = load_key(&ws.dir)?
+                    .ok_or_else(|| RoduError::invalid("This workspace's team key is missing"))?;
+                let code = invite_code(&team.workspace_id, Some(&key));
+                (io.out)(&secret_line(&["Invite code: ", code.as_str()]));
+                (io.out)("Keep it secret: it holds the team key.");
+            } else {
+                (io.out)("Encryption: on");
+                (io.out)(
+                    "Invite code: hidden, it holds the team key. Show it with: \
+                     rodu team --show-invite",
+                );
+            }
             (io.out)(&format!("This machine: {:016x}", store.peer()));
             (io.out)(if team.numbering {
                 "Numbering: this machine gives new cards their numbers"
@@ -168,12 +277,12 @@ fn folder_arg(io: &Io<'_>, args: &Args) -> Result<PathBuf> {
     Ok(resolve(&io.cwd, folder))
 }
 
-fn encryption_choice(args: &Args) -> Result<()> {
+/// Whether the new team is encrypted.
+fn encryption_choice(args: &Args) -> Result<bool> {
     match (args.flag("encrypt"), args.flag("no-encrypt")) {
         (true, true) => Err(RoduError::invalid("Choose one of --encrypt and --no-encrypt")),
-        (true, false) => Err(RoduError::invalid("Encrypted teams are not available yet")
-            .with_hint("Use --no-encrypt for now: the folder's provider can then read the board")),
-        (false, true) => Ok(()),
+        (true, false) => Ok(true),
+        (false, true) => Ok(false),
         (false, false) => Err(RoduError::invalid("Choose --encrypt or --no-encrypt").with_hint(
             "--no-encrypt keeps the sync files readable to anyone with access to the folder",
         )),
@@ -192,10 +301,11 @@ fn save_config(dir: &Path, config: &Config) -> Result<()> {
         .map_err(|e| RoduError::invalid(format!("Cannot write {}: {e}", path.display())))
 }
 
-/// `rodu team create --folder <path> --no-encrypt`: makes this workspace a team workspace.
+/// `rodu team create --folder <path> --encrypt|--no-encrypt`: makes this workspace a team
+/// workspace.
 pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     let folder_path = folder_arg(io, args)?;
-    encryption_choice(args)?;
+    let encrypted = encryption_choice(args)?;
     let ws = open(io, false)?;
     if let Some(team) = &ws.config.team {
         return Err(RoduError::conflict(format!(
@@ -208,11 +318,30 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     // A create that stopped half way left the document, and maybe its first file: carry on.
     let resumed = ws.service.store.team().map(LoroStore::peer);
     drop(ws);
+    // A key left by an encrypted create that stopped half way is carried on with; one with a
+    // plain create would mean two answers to how this workspace syncs.
+    let left = load_key(&dir)?;
+    let key = match (encrypted, left) {
+        (true, Some(key)) => Some(key),
+        (true, None) => Some(TeamKey::generate()?),
+        (false, None) => None,
+        (false, Some(_)) => {
+            return Err(RoduError::conflict(
+                "An encrypted team create stopped half way here: run it again with --encrypt",
+            ));
+        }
+    };
     // The folder is checked before anything here changes. A folder naming a team may only be
     // taken over by the create that started it: one whose only replica folder is this one's.
-    let folder = TeamFolder::new(&folder_path);
     let workspace_id = if folder_path.join(TEAM_FILE).exists() {
-        let info = folder.info()?;
+        let info = TeamFolder::new(&folder_path).info()?;
+        // Checked before a key is written: a half-made team carries on only as what it was.
+        if resumed.is_some() && info.encrypted() != encrypted {
+            let was = if info.encrypted() { "--encrypt" } else { "--no-encrypt" };
+            return Err(RoduError::conflict(format!(
+                "A team create stopped half way here: run it again with {was}"
+            )));
+        }
         match resumed {
             Some(peer) if wrote_alone(&folder_path, peer) => info.workspace_id,
             _ => {
@@ -226,22 +355,51 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     } else {
         uuidv7(now_ms())
     };
+    // Written in this order, so each step finds what the one before it left: the key, the
+    // document, the team file and first sync file, and the config last.
+    if let Some(key) = &key
+        && !dir.join(KEY_FILE).exists()
+    {
+        save_key(&dir, key)?;
+    }
+    let code = invite_code(&workspace_id, key.as_ref());
     let store = if resumed.is_some() { LoroStore::open(&dir)? } else { LoroStore::adopt(&dir)? };
+    let folder = match key {
+        Some(key) => TeamFolder::sealed(&folder_path, key),
+        None => TeamFolder::new(&folder_path),
+    }
+    .expecting(&workspace_id);
     folder.create(&workspace_id, store.peer())?;
     folder.push(&store)?;
     config.team = Some(TeamConfig {
         folder: folder_path.display().to_string(),
         workspace_id: workspace_id.clone(),
         numbering: true,
+        encrypted,
     });
     save_config(&dir, &config)?;
     (io.out)(&format!("This workspace now syncs through {}", folder_path.display()));
-    (io.out)(&format!("Invite code: {INVITE_PREFIX}{workspace_id}"));
-    (io.out)(&format!(
-        "A teammate joins with: rodu team join {INVITE_PREFIX}{workspace_id} \
-         --folder <the same folder on their machine> --name <their name>"
-    ));
-    (io.out)("The sync files are not encrypted: anyone with access to the folder can read them.");
+    (io.out)(&secret_line(&["Invite code: ", code.as_str()]));
+    if encrypted {
+        // The code is printed once: the join reads it from stdin, out of shell history.
+        (io.out)(
+            "A teammate joins with: rodu team join - --folder <the same folder on their machine> \
+             --name <their name>, then pastes the invite code",
+        );
+        (io.out)(
+            "Keep the invite code secret: it holds the team key. The sync files are encrypted; \
+             anyone with the code and the folder can read and change the board.",
+        );
+    } else {
+        (io.out)(&secret_line(&[
+            "A teammate joins with: rodu team join ",
+            code.as_str(),
+            " --folder <the same folder on their machine> --name <their name>",
+        ]));
+        (io.out)(
+            "The sync files are not encrypted: anyone with access to the folder can read them.",
+        );
+    }
     Ok(())
 }
 
@@ -262,25 +420,60 @@ fn now_ms() -> u64 {
 
 /// `rodu team join <code> --folder <path> --name <you>`: a new workspace here, from the folder.
 pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Result<()> {
-    let workspace_id = code
-        .and_then(|c| c.strip_prefix(INVITE_PREFIX))
-        .filter(|id| is_uuid(id))
-        .ok_or_else(|| {
-            RoduError::invalid("team join needs an invite code such as rodu1-0190…")
-                .with_hint("The teammate who created the team sees it in: rodu team")
-        })?
-        .to_owned();
+    // `-` reads the code from stdin, so an encrypted team's key stays out of the shell's history
+    // and other users' process lists.
+    let read;
+    let code = match code.map(String::as_str) {
+        Some("-") => {
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                (io.err)("Paste the invite code, then press Enter:");
+            }
+            let mut line = zeroize::Zeroizing::new(String::new());
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| RoduError::invalid(format!("Cannot read the invite code: {e}")))?;
+            read = line;
+            Some(read.as_str())
+        }
+        other => other,
+    };
+    let (workspace_id, key) = code.and_then(parse_invite).ok_or_else(|| {
+        RoduError::invalid("team join needs an invite code such as rodu1-0190…")
+            .with_hint("The teammate who created the team sees it in: rodu team --show-invite")
+    })?;
     let name =
         args.value("name").ok_or_else(|| RoduError::invalid("team join needs --name <you>"))?;
     let folder_path = folder_arg(io, args)?;
-    let folder = TeamFolder::new(&folder_path);
-    let info = folder.info()?;
+    let info = TeamFolder::new(&folder_path).info()?;
     if info.workspace_id != workspace_id {
         return Err(RoduError::invalid(format!(
             "{} holds another team than this invite code",
             folder_path.display()
         )));
     }
+    // The key is checked before anything is written.
+    let key_hex = key.as_ref().map(TeamKey::to_hex);
+    let folder = match (info.key_check.as_deref(), key) {
+        (None, None) => TeamFolder::new(&folder_path).expecting(&workspace_id),
+        (Some(check), Some(key)) if key.matches(check) => {
+            TeamFolder::sealed(&folder_path, key).expecting(&workspace_id)
+        }
+        (Some(_), Some(_)) => {
+            return Err(RoduError::invalid("The invite code's key does not open this team")
+                .with_hint("Ask for the invite code again: rodu team --show-invite"));
+        }
+        (Some(_), None) => {
+            return Err(RoduError::invalid(
+                "This team is encrypted: the invite code needs its key",
+            )
+            .with_hint("Ask for the whole code: rodu team --show-invite"));
+        }
+        (None, Some(_)) => {
+            return Err(RoduError::invalid(
+                "This team is not encrypted, but the invite code holds a key",
+            ));
+        }
+    };
     let dir = match var(io, "RODU_DIR") {
         Some(dir) => resolve(&io.cwd, dir),
         None => io.cwd.join(".rodu"),
@@ -291,6 +484,13 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
             dir.display()
         )));
     }
+    // A failed join removes the key file it wrote; one that was there before is not its own.
+    if dir.join(KEY_FILE).exists() {
+        return Err(RoduError::conflict(format!(
+            "{} is already there: move it away to join here",
+            dir.join(KEY_FILE).display()
+        )));
+    }
     if find_dir(io).is_some_and(|found| found != dir) {
         // Not an error: a workspace inside another one is allowed, but say which one this is.
         (io.err)(&format!("note: creating a new workspace at {}", dir.display()));
@@ -298,10 +498,12 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
     let existed = dir.exists();
     create_private_dir(&dir)
         .map_err(|e| RoduError::invalid(format!("Cannot create {}: {e}", dir.display())))?;
-    let result = join_into(io, &dir, &folder, &folder_path, name, workspace_id);
+    let result = join_into(io, &dir, &folder, &folder_path, name, workspace_id, key_hex);
     if result.is_err() {
         // Only what this join made, so it can simply be run again.
-        for file in ["rodu.db", "rodu.db-wal", "rodu.db-shm", "rodu.loro", "config.json.tmp"] {
+        let made =
+            ["rodu.db", "rodu.db-wal", "rodu.db-shm", "rodu.loro", "config.json.tmp", KEY_FILE];
+        for file in made {
             let _ = std::fs::remove_file(dir.join(file));
         }
         if !existed {
@@ -318,7 +520,12 @@ fn join_into(
     folder_path: &Path,
     name: &str,
     workspace_id: String,
+    key_hex: Option<zeroize::Zeroizing<String>>,
 ) -> Result<()> {
+    if let Some(hex) = &key_hex {
+        let key = TeamKey::from_hex(hex).expect("a key from the invite code");
+        save_key(dir, &key)?;
+    }
     let db = dir.join("rodu.db");
     write_private_file(&db, "")
         .map_err(|e| RoduError::invalid(format!("Cannot create {}: {e}", db.display())))?;
@@ -349,6 +556,7 @@ fn join_into(
                 folder: folder_path.display().to_string(),
                 workspace_id,
                 numbering: false,
+                encrypted: key_hex.is_some(),
             }),
         })
     })?;
