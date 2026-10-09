@@ -550,6 +550,7 @@ fn orders_unnumbered_cards_after_numbered_ones() {
     let f = numbering(f, true);
     f.service.create_items(&f.alice, "DEMO", &items(&["Two"]), None).unwrap();
     assert_eq!(keys(&f, "ORDER BY key"), ["DEMO-1".to_string(), "DEMO-2".into(), p.key.clone()]);
+    assert_eq!(keys(&f, "ORDER BY key DESC"), [p.key.clone(), "DEMO-2".into(), "DEMO-1".into()]);
     assert_eq!(keys(&f, &format!("parent IS EMPTY AND key = {}", p.key)), [p.key]);
 }
 

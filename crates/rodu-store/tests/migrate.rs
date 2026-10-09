@@ -55,6 +55,24 @@ fn upgrades_a_version_1_workspace_and_keeps_every_row() {
 }
 
 #[test]
+fn upgrades_a_version_1_workspace_whose_keys_differ_only_by_case() {
+    // Rodu always wrote upper-case keys, but schema 1 allowed this, so a hand-edited file may have it.
+    let (_dir, path) = v1_workspace();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO items SELECT 'i-3', collection_id, 9, 'demo-1', type, title, body, status,
+               category, priority, NULL, NULL, NULL, NULL, 'a2', NULL, created_at, updated_at, 1
+             FROM items WHERE id = 'i-1'",
+            [],
+        )
+        .unwrap();
+    let service = RoduService::new(SqliteStore::open(&path).unwrap());
+    assert_eq!(user_version(&path), 2);
+    assert_eq!(service.item("demo-1").unwrap().id, "i-1");
+}
+
+#[test]
 fn opening_a_current_workspace_again_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rodu.db");

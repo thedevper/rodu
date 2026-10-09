@@ -81,13 +81,15 @@ CREATE TABLE idempotency (
 ";
 
 /// The items table and its indexes, apart from the rest so that migrations can rebuild it.
-/// Unnumbered cards have a NULL number (UNIQUE ignores NULLs); keys compare ignoring case.
+/// Unnumbered cards have a NULL number (UNIQUE ignores NULLs). Keys are stored and looked up in
+/// upper case; `key` keeps schema 1's exact UNIQUE so every schema 1 file still migrates, while
+/// provisional keys are unique ignoring case.
 const ITEMS_TABLE: &str = "
 CREATE TABLE items (
   id TEXT PRIMARY KEY,
   collection_id TEXT NOT NULL REFERENCES collections(id),
   number INTEGER,
-  key TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  key TEXT NOT NULL UNIQUE,
   provisional_key TEXT UNIQUE COLLATE NOCASE,
   type TEXT NOT NULL,
   title TEXT NOT NULL,
