@@ -37,6 +37,8 @@ const HEADER: usize = MAGIC.len() + 8 + 32;
 /// What sealing adds to a payload: the nonce and the tag.
 const SEAL_OVERHEAD: usize = seal::NONCE_LEN + 16;
 const SUFFIX: &str = ".update";
+/// A replica compacts its own files once it wrote this many since it last did.
+const COMPACT_AT: usize = 32;
 
 /// What `rodu-team.json` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +136,9 @@ pub struct TeamFolder {
     /// The team this workspace belongs to. The folder must name it, and sealing uses it rather
     /// than what the folder says, so a rewritten team file cannot make files nobody can open.
     workspace_id: Option<String>,
+    /// Compaction: after how many files, and the largest payload a compacted file may hold.
+    compact_at: usize,
+    compact_max: usize,
 }
 
 /// The path holds untrusted names from the folder and ends up in a terminal: control
@@ -165,6 +170,29 @@ fn own_seq(name: &str) -> Option<u64> {
         .flatten()
 }
 
+/// What in `dir` is named like this replica's own numbered files, by number, and whether each
+/// is a regular file (not a link or a folder).
+fn own_files(dir: &Path) -> Result<Vec<(u64, PathBuf, bool)>> {
+    let mut own = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| folder_error(dir, e))? {
+        let entry = entry.map_err(|e| folder_error(dir, e))?;
+        let kind = entry.file_type().map_err(|e| folder_error(dir, e))?;
+        if let Some(seq) = entry.file_name().to_str().and_then(own_seq) {
+            own.push((seq, entry.path(), kind.is_file()));
+        }
+    }
+    own.sort();
+    Ok(own)
+}
+
+/// The number after the highest of `own`; every name counts, so no number is used twice.
+fn next_seq(own: &[(u64, PathBuf, bool)], dir: &Path) -> Result<u64> {
+    // Only a file planted in this replica's folder gets near the end of u64.
+    own.last()
+        .map_or(Some(1), |(seq, _, _)| seq.checked_add(1))
+        .ok_or_else(|| folder_error(dir, "holds a file numbered past any sequence"))
+}
+
 /// A regular file (not a link), not hidden, named like a sync file. Folder apps' conflict copies
 /// (`0000000003 (1).update`, `0000000003.sync-conflict-....update`) qualify too.
 fn is_candidate(name: &str, kind: fs::FileType) -> bool {
@@ -174,12 +202,26 @@ fn is_candidate(name: &str, kind: fs::FileType) -> bool {
 impl TeamFolder {
     /// The folder of a plain team.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), key: None, workspace_id: None }
+        Self {
+            root: root.into(),
+            key: None,
+            workspace_id: None,
+            compact_at: COMPACT_AT,
+            compact_max: MAX_IMPORT_BYTES,
+        }
     }
 
     /// The folder of an encrypted team with key `key`.
     pub fn sealed(root: impl Into<PathBuf>, key: TeamKey) -> Self {
-        Self { root: root.into(), key: Some(key), workspace_id: None }
+        Self { key: Some(key), ..Self::new(root) }
+    }
+
+    /// For tests: compact after `at` files, and only into a payload of at most `max_bytes`.
+    #[doc(hidden)]
+    pub fn compacting(mut self, at: usize, max_bytes: usize) -> Self {
+        self.compact_at = at.max(1);
+        self.compact_max = max_bytes.min(MAX_IMPORT_BYTES);
+        self
     }
 
     /// Syncs only while the folder names team `workspace_id`.
@@ -287,30 +329,71 @@ impl TeamFolder {
         let mut written = None;
         store.export_own(|payload| {
             fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
-            let mut next = 1u64;
-            for entry in fs::read_dir(&dir).map_err(|e| folder_error(&dir, e))? {
-                let name = entry.map_err(|e| folder_error(&dir, e))?.file_name();
-                if let Some(seq) = name.to_str().and_then(own_seq) {
-                    // Only a file planted in this replica's folder gets near the end of u64.
-                    let after = seq.checked_add(1).ok_or_else(|| {
-                        folder_error(&dir, "holds a file numbered past any sequence")
-                    })?;
-                    next = next.max(after);
-                }
-            }
-            let path = dir.join(format!("{next:010}{SUFFIX}"));
-            let framed = match &self.key {
-                Some(key) => frame_as(
-                    SEALED_MAGIC,
-                    &seal::seal(key, self.team_id(&info), store.peer(), payload)?,
-                ),
-                None => frame(payload),
-            };
-            write_new(&dir, &path, &framed)?;
+            let path = dir.join(format!("{:010}{SUFFIX}", next_seq(&own_files(&dir)?, &dir)?));
+            write_new(&dir, &path, &self.framed(&info, store.peer(), payload)?)?;
             written = Some(path);
             Ok(())
         })?;
+        self.compact(store, &info, &dir)?;
         Ok(written)
+    }
+
+    /// A payload framed, and sealed first for an encrypted team.
+    fn framed(&self, info: &TeamInfo, peer: u64, payload: &[u8]) -> Result<Vec<u8>> {
+        Ok(match &self.key {
+            Some(key) => {
+                frame_as(SEALED_MAGIC, &seal::seal(key, self.team_id(info), peer, payload)?)
+            }
+            None => frame(payload),
+        })
+    }
+
+    /// Once this replica wrote `compact_at` files since it last compacted, writes every operation
+    /// it published so far as its next file, then removes its own lower-numbered files. Each of
+    /// them held a part of what the new file holds (operations from counter 0 up to the last one
+    /// exported), so a reader loses nothing whichever order the folder app delivers the new file
+    /// and the removals in: a later file whose operations build on removed ones waits, as any file
+    /// does whose predecessors have not arrived, until the new file brings them. A stop between
+    /// the write and the removals leaves files whose operations readers ignore by their ids; the
+    /// next compaction removes them. Only regular files named like this replica's own numbered
+    /// files are removed: never conflict copies, links, dotfiles or other replicas' files.
+    fn compact(&self, store: &LoroStore, info: &TeamInfo, dir: &Path) -> Result<()> {
+        let mut failed = None;
+        store.compact_own(|last, export| {
+            let own = match own_files(dir) {
+                Ok(own) => own,
+                Err(_) if !dir.exists() => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let since = own.iter().filter(|(seq, _, _)| last.is_none_or(|l| *seq > l)).count();
+            if since < self.compact_at {
+                return Ok(None);
+            }
+            let next = next_seq(&own, dir)?;
+            let payload = export()?;
+            if payload.len() > self.compact_max {
+                // Too large to be imported in one piece: tried again after as many files more.
+                return Ok(Some(next - 1));
+            }
+            let path = dir.join(format!("{next:010}{SUFFIX}"));
+            write_new(dir, &path, &self.framed(info, store.peer(), &payload)?)?;
+            for (_, old, _) in own.into_iter().filter(|(_, _, file)| *file) {
+                match fs::remove_file(&old) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        failed.get_or_insert((old, e));
+                    }
+                }
+            }
+            Ok(Some(next))
+        })?;
+        match failed {
+            None => Ok(()),
+            Some((path, e)) => {
+                Err(folder_error(&path, format!("{e}; the next compaction removes it")))
+            }
+        }
     }
 
     /// Imports every complete file other replicas wrote that this one has not dealt with yet.
@@ -320,6 +403,9 @@ impl TeamFolder {
         let sync = self.root.join(SYNC_DIR);
         let mut report = PullReport::default();
         let mut incoming = Vec::new();
+        // (content key, file key) of each file read: a file whose content was dealt with is
+        // then remembered by its name, size and modification time, and not read again.
+        let mut read: Vec<(String, String)> = Vec::new();
         let mut peers: Vec<(u64, PathBuf)> = Vec::new();
         for entry in fs::read_dir(&sync).map_err(|e| folder_error(&sync, e))? {
             let entry = entry.map_err(|e| folder_error(&sync, e))?;
@@ -344,12 +430,19 @@ impl TeamFolder {
             for (name, path) in files {
                 // The name is untrusted and ends up in a terminal: control characters are escaped.
                 let shown = format!("{}/{}", peer_dir_name(peer), name.escape_debug());
-                let size = match fs::metadata(&path) {
-                    Ok(meta) => meta.len(),
+                let meta = match fs::metadata(&path) {
+                    Ok(meta) => meta,
                     // Deleted or moved by the folder app since it was listed.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(folder_error(&path, e)),
                 };
+                let size = meta.len();
+                let stat = file_key(&shown, &meta);
+                if let Some(stat) = &stat
+                    && store.sync_seen(stat)?
+                {
+                    continue;
+                }
                 let limit = (MAX_IMPORT_BYTES + HEADER + SEAL_OVERHEAD) as u64;
                 if size > limit {
                     report_too_large(store, &mut report, &shown, size)?;
@@ -366,6 +459,9 @@ impl TeamFolder {
                     Err(e) => return Err(folder_error(&path, e)),
                 };
                 let key = format!("{shown}/{}", hex::encode(Sha256::digest(&bytes)));
+                if let Some(stat) = stat {
+                    read.push((key.clone(), stat));
+                }
                 // A sealed payload is opened, and so authenticated, here; the plaintext then goes
                 // through the import check like a plain one.
                 let opened = match unframe_as(magic, &bytes) {
@@ -397,8 +493,22 @@ impl TeamFolder {
             }
         }
         report.batch = store.import_batch(&incoming, checker)?;
+        // Landed, refused or reported: never read again while its name, size and time hold.
+        // A file still waiting for other operations is not, so it is read again next time.
+        for (key, stat) in read {
+            if store.sync_seen(&key)? {
+                store.mark_sync_seen(&stat)?;
+            }
+        }
         Ok(report)
     }
+}
+
+/// A file as its name, size and modification time give it, if the time can be read. A file
+/// rewritten in place changes its size or time, and is then read again.
+fn file_key(shown: &str, meta: &fs::Metadata) -> Option<String> {
+    let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(format!("{shown}/stat-{}-{}", meta.len(), modified.as_nanos()))
 }
 
 /// Reports a file over the size cap, once per size.
