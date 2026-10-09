@@ -5,13 +5,18 @@ use std::time::Duration;
 
 use loro::LoroDoc;
 use rodu_core::{Actor, PrincipalKind, RoduService, Store};
-use rodu_sync::folder::{TeamFolder, frame};
-use rodu_sync::{Checker, LoroStore, run_check};
+use rodu_sync::folder::{Frame, TeamFolder, frame, unframe};
+use rodu_sync::{Checker, LoroStore, Replica, run_check};
 use serde_json::json;
 use tempfile::TempDir;
 
 const CHILD_ENV: &str = "RODU_SYNC_FOLDER_CHECK_CHILD";
 const LOG_ENV: &str = "RODU_SYNC_FOLDER_CHECK_LOG";
+/// Makes the child refuse any check replaying this peer's files, as if they broke Loro.
+const POISON_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON";
+/// With [`POISON_ENV`]: only when replayed with other files, as if they broke Loro once their
+/// pending operations were released.
+const POISON_WITH_OTHERS_ENV: &str = "RODU_SYNC_FOLDER_CHECK_POISON_WITH_OTHERS";
 
 #[test]
 #[ignore = "the child process of the import checks, not a test of its own"]
@@ -21,16 +26,25 @@ fn check_child() {
     }
     let mut input = Vec::new();
     std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut input).unwrap();
+    // The peers of the updates this check replays: after the snapshot, [peer, length, bytes]...
+    let word = |at: usize| u64::from_le_bytes(input[at..at + 8].try_into().unwrap());
+    let mut peers = Vec::new();
+    let mut at = 8 + word(0) as usize;
+    while at < input.len() {
+        peers.push(word(at));
+        at += 16 + word(at + 8) as usize;
+    }
     if let Some(log) = std::env::var_os(LOG_ENV) {
-        // How many updates this check replays: after the snapshot, [peer, length, bytes]...
-        let word = |at: usize| u64::from_le_bytes(input[at..at + 8].try_into().unwrap()) as usize;
-        let (mut at, mut count) = (8 + word(0), 0);
-        while at < input.len() {
-            at += 16 + word(at + 8);
-            count += 1;
-        }
         let mut file = std::fs::OpenOptions::new().append(true).create(true).open(log).unwrap();
-        std::io::Write::write_all(&mut file, format!("{count}\n").as_bytes()).unwrap();
+        std::io::Write::write_all(&mut file, format!("{}\n", peers.len()).as_bytes()).unwrap();
+    }
+    if let Some(poison) = std::env::var_os(POISON_ENV) {
+        let poison: u64 = poison.to_str().unwrap().parse().unwrap();
+        let others = std::env::var_os(POISON_WITH_OTHERS_ENV).is_some();
+        if peers.contains(&poison) && (!others || peers.len() > 1) {
+            eprintln!("poisoned");
+            std::process::exit(2);
+        }
     }
     let code = match run_check(&mut input.as_slice()) {
         Ok(()) => 0,
@@ -43,10 +57,24 @@ fn check_child() {
 }
 
 fn checker() -> Checker {
-    checker_logging(None)
+    checker_with(Vec::new())
 }
 
-fn checker_logging(log: Option<std::path::PathBuf>) -> Checker {
+fn checker_logging(log: std::path::PathBuf) -> Checker {
+    checker_with(vec![(LOG_ENV, log.into_os_string())])
+}
+
+/// A checker that refuses `peer`'s files, or, with `with_others`, only when other files are
+/// replayed with them.
+fn checker_poisoned(peer: u64, with_others: bool) -> Checker {
+    let mut env = vec![(POISON_ENV, peer.to_string().into())];
+    if with_others {
+        env.push((POISON_WITH_OTHERS_ENV, "1".into()));
+    }
+    checker_with(env)
+}
+
+fn checker_with(env: Vec<(&'static str, std::ffi::OsString)>) -> Checker {
     Checker::new(
         move || {
             let mut c = Command::new(std::env::current_exe().unwrap());
@@ -59,9 +87,7 @@ fn checker_logging(log: Option<std::path::PathBuf>) -> Checker {
                 "-q",
             ]);
             c.env(CHILD_ENV, "1");
-            if let Some(log) = &log {
-                c.env(LOG_ENV, log);
-            }
+            c.envs(env.iter().map(|(k, v)| (k, v)));
             c
         },
         Duration::from_secs(30),
@@ -366,12 +392,104 @@ fn a_file_still_waiting_is_replayed_before_each_later_check() {
     // One file per check: the earlier peer's file lands first and waits.
     a.store().set_import_group_cap(1);
     let log = root.path().join("checks.log");
-    let report = folder.pull(a.store(), &checker_logging(Some(log.clone()))).unwrap();
+    let report = folder.pull(a.store(), &checker_logging(log.clone())).unwrap();
     assert_eq!(report.batch.imported.len(), 2, "{report:?}");
     // The second check replayed the waiting file before the new one, as this process applied them.
     let counts = std::fs::read_to_string(&log).unwrap();
     assert_eq!(counts.lines().collect::<Vec<_>>(), ["1", "2"], "{counts}");
     assert_eq!(a.store().get_item(&made[0].id).unwrap().unwrap().title, "Built on it");
+}
+
+/// ann, and two teammates in peer order: the files of `pair[0]` are read before `pair[1]`'s.
+fn three() -> (TempDir, TeamFolder, Machine, [Machine; 2]) {
+    let (root, folder) = team();
+    let a = first(&folder);
+    let mut pair = [join(&folder, "bob"), join(&folder, "cat")];
+    pair.sort_by_key(|m| m.store().peer());
+    for m in [&a, &pair[0], &pair[1], &a] {
+        m.sync(&folder);
+    }
+    (root, folder, a, pair)
+}
+
+/// `base` makes a card and `builder` renames it; returns the card and `base`'s file.
+fn base_and_build(
+    folder: &TeamFolder,
+    base: &Machine,
+    builder: &Machine,
+) -> (rodu_core::Item, std::path::PathBuf) {
+    let made =
+        base.svc.create_items(&base.me, "DEMO", &[json!({ "title": "Base" })], None).unwrap();
+    let file = folder.push(base.store()).unwrap().unwrap();
+    builder.sync(folder);
+    let renamed = json!({ "title": "Built on it" });
+    builder.svc.update_item(&builder.me, &made[0].key, &renamed, None).unwrap();
+    folder.push(builder.store()).unwrap();
+    (made.into_iter().next().unwrap(), file)
+}
+
+#[test]
+fn pending_operations_never_carry_over_unchecked_into_the_next_batch() {
+    let (_root, folder, a, [earlier, later]) = three();
+    let (card, base) = base_and_build(&folder, &earlier, &later);
+    // The base is still syncing: the later peer's file lands and waits.
+    let whole = std::fs::read(&base).unwrap();
+    std::fs::write(&base, &whole[..whole.len() / 2]).unwrap();
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(report.batch.waiting.len(), 1, "{report:?}");
+
+    // Same process, next batch: the base arrives first, and the waiting file is now refused. Its
+    // operations must not be released by the base.
+    std::fs::write(&base, &whole).unwrap();
+    a.store().set_import_group_cap(1);
+    let report = folder.pull(a.store(), &checker_poisoned(later.store().peer(), false)).unwrap();
+    assert_eq!(report.batch.refused.len(), 1, "{report:?}");
+    assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Base");
+}
+
+#[test]
+fn an_import_by_hand_never_leaves_operations_for_the_next_batch() {
+    let (_root, folder, a, [earlier, later]) = three();
+    let (card, _) = base_and_build(&folder, &earlier, &later);
+    let built = files_of(&folder, later.store().peer()).pop().unwrap();
+    let framed = std::fs::read(&built).unwrap();
+    let Frame::Complete(payload) = unframe(&framed) else { panic!() };
+    let payload = payload.to_vec();
+    std::fs::remove_file(&built).unwrap();
+    a.store().import_untrusted(&payload, &checker()).unwrap();
+    // The base arrives in a batch whose checker would refuse the builder's operations.
+    folder.pull(a.store(), &checker_poisoned(later.store().peer(), false)).unwrap();
+    assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Base");
+
+    // The same for a bare replica: operations waiting on others are dropped, not kept.
+    let empty = Replica::new(9).unwrap().version();
+    let mut base = Replica::new(1).unwrap();
+    base.set_field("c1", "title", "Base").unwrap();
+    let mut builder = Replica::new(2).unwrap();
+    builder.import_trusted(&base.updates_since(&empty).unwrap()).unwrap();
+    builder.set_field("c1", "status", "Done").unwrap();
+    let built = builder.updates_since(&base.version()).unwrap();
+    let mut target = Replica::new(3).unwrap();
+    target.import_untrusted(&built, &checker()).unwrap();
+    target.import_trusted(&base.updates_since(&empty).unwrap()).unwrap();
+    assert_eq!(target.field("c1", "title").as_deref(), Some("Base"));
+    assert_eq!(target.field("c1", "status"), None);
+}
+
+#[test]
+fn a_held_file_that_breaks_once_released_is_blamed_not_the_file_it_waits_for() {
+    let (_root, folder, a, [earlier, later]) = three();
+    // The earlier peer's file is read first and builds on the later peer's honest one.
+    let (card, _) = base_and_build(&folder, &later, &earlier);
+    a.store().set_import_group_cap(1);
+    let poisoned = checker_poisoned(earlier.store().peer(), true);
+    let report = folder.pull(a.store(), &poisoned).unwrap();
+    assert_eq!(report.batch.refused.len(), 1, "{report:?}");
+    assert!(report.batch.refused[0].starts_with(&format!("{:016x}", earlier.store().peer())));
+    // The honest file was put off, not refused: the next sync imports it.
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(report.batch.imported.len(), 1, "{report:?}");
+    assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Base");
 }
 
 #[test]

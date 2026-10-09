@@ -253,7 +253,15 @@ impl Replica {
     /// import on a copy of this replica in a child process and the child survived.
     pub fn import_untrusted(&mut self, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
         check_import(&self.doc, &[Untrusted { bytes, peer: None }], checker)?;
-        self.import_trusted(bytes)
+        if self.doc.import(bytes).map_err(invalid)?.pending.is_some() {
+            // Operations waiting on others would be applied, unchecked, by a later import:
+            // dropped instead, by starting again from a snapshot, which leaves them out.
+            let peer = self.doc.peer_id();
+            let doc = LoroDoc::from_snapshot(&self.snapshot()).map_err(invalid)?;
+            doc.set_peer_id(peer).map_err(invalid)?;
+            self.doc = doc;
+        }
+        Ok(())
     }
 
     /// The whole document, for a new replica or compaction.

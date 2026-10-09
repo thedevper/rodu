@@ -363,7 +363,10 @@ impl LoroStore {
                     .map_err(from_sync)?;
                 let before = doc.oplog_frontiers();
                 self.dirty.set(true);
-                doc.import(bytes).map_err(internal)?;
+                if doc.import(bytes).map_err(internal)?.pending.is_some() {
+                    // Operations waiting on others are dropped, not released unchecked later.
+                    self.forget_pending.set(true);
+                }
                 touched(&doc, &before, &doc.oplog_frontiers())?
             };
             self.load_nodes();
@@ -417,29 +420,73 @@ impl LoroStore {
                 };
                 let mut landed: Vec<&Incoming> = Vec::new();
                 let mut held: Vec<&Incoming> = Vec::new();
+                // Held files found to fail once released: refused, and left out at the end.
+                let mut blamed: Vec<&str> = Vec::new();
+                // A blamed file's operations are still pending in this document, so nothing
+                // more can be imported safely in this batch: the rest wait for the next one,
+                // which starts from the file.
+                let mut stalled = false;
                 let import = |file: &Incoming| -> Result<()> {
                     self.dirty.set(true);
                     doc.import(&file.bytes).map_err(internal)?;
                     Ok(())
                 };
                 for group in groups.into_iter().filter(|g| !g.is_empty()) {
+                    if stalled {
+                        report.waiting.extend(group.iter().map(|f| f.key.clone()));
+                        continue;
+                    }
                     let accepted: Vec<&Incoming> =
                         if check_import(&doc, &with_held(&held, &group), checker).is_ok() {
                             group
                         } else {
                             let mut accepted = Vec::new();
                             for file in group {
+                                if stalled {
+                                    report.waiting.push(file.key.clone());
+                                    continue;
+                                }
                                 let mut files = accepted.clone();
                                 files.push(file);
                                 // Checked on the document as it will be: the files accepted
                                 // from this group so far are imported before this one.
-                                match check_import(&doc, &with_held(&held, &files), checker) {
-                                    Ok(()) => accepted.push(file),
+                                let Err(e) = check_import(&doc, &with_held(&held, &files), checker)
+                                else {
+                                    accepted.push(file);
+                                    continue;
+                                };
+                                // With files held, the fault may be theirs: only a file that
+                                // fails without them is blamed for it.
+                                let alone = if held.is_empty() {
+                                    Err(e)
+                                } else {
+                                    check_import(&doc, &with_held(&[], &files), checker)
+                                };
+                                match alone {
                                     Err(e) => {
                                         if matches!(e, SyncError::InvalidData(_)) {
                                             self.sql.mark_sync_seen(&file.key)?;
                                         }
                                         report.refused.push(format!("{}: {e}", file.key));
+                                    }
+                                    Ok(()) => {
+                                        for h in &held {
+                                            let mut released = vec![*h];
+                                            released.extend(&files);
+                                            let found = check_import(
+                                                &doc,
+                                                &with_held(&[], &released),
+                                                checker,
+                                            );
+                                            if let Err(e @ SyncError::InvalidData(_)) = found {
+                                                self.sql.mark_sync_seen(&h.key)?;
+                                                report.refused.push(format!("{}: {e}", h.key));
+                                                blamed.push(&h.key);
+                                            }
+                                        }
+                                        stalled = true;
+                                        self.forget_pending.set(true);
+                                        report.waiting.push(file.key.clone());
                                     }
                                 }
                             }
@@ -457,6 +504,9 @@ impl LoroStore {
                     }
                 }
                 for file in landed {
+                    if blamed.contains(&file.key.as_str()) {
+                        continue;
+                    }
                     if in_log(file)? {
                         self.sql.mark_sync_seen(&file.key)?;
                         report.imported.push(file.key.clone());
