@@ -13,8 +13,10 @@
 
 use loro::{LoroMap, LoroValue, ValueOrContainer};
 use rodu_core::clock::is_iso;
+use rodu_core::format::links_to_item;
 use rodu_core::ids::is_uuid;
 use rodu_core::input::{MAX_BODY, MAX_ESTIMATE, MAX_TITLE, check_date, is_single_line};
+use rodu_core::service::check_web_url;
 use rodu_core::workflow::validate_workflow;
 use rodu_core::{Collection, Comment, Cycle, Item, Link, Principal};
 use sha2::{Digest, Sha256};
@@ -164,7 +166,7 @@ impl<'a> Reader<'a> {
     /// control or invisible format characters (they could forge structure shown to an agent).
     fn opt_line(&self, field: &str, max: usize) -> Result<Option<String>, String> {
         match self.opt_text_max(field, max)? {
-            Some(s) if s.trim().is_empty() || !is_single_line(&s) => {
+            Some(s) if s.trim().is_empty() || s.trim() != s || !is_single_line(&s) => {
                 Err(self.wrong(field, "one line of text"))
             }
             other => Ok(other),
@@ -334,6 +336,10 @@ pub fn link(key: &str, map: &LoroMap) -> Result<Link, String> {
         target: r.line("target", 2000)?,
         created_at: r.stamp("created_at")?,
     };
+    // The same targets a local link may have: a card id, or for a pull request an http(s) URL.
+    let target_ok =
+        if links_to_item(l.kind) { is_uuid(&l.target) } else { check_web_url(&l.target).is_ok() };
+    check(target_ok, || format!("link {key}: target is not allowed for {}", l.kind.as_str()))?;
     check(link_key(&l.from_item_id, l.kind.as_str(), &l.target) == key, || {
         format!("link {key}: stored under the wrong key")
     })?;

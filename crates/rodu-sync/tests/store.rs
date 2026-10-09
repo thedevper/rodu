@@ -728,11 +728,37 @@ fn a_rebuild_keeps_card_versions_so_a_stale_write_still_fails() {
     let card = a.svc.item(&keys[0]).unwrap();
     assert_eq!(card.version, 2);
     a.store().rebuild_index().unwrap();
-    let rebuilt = a.svc.item(&keys[0]).unwrap();
-    assert!(rebuilt.version > card.version, "{} after {}", rebuilt.version, card.version);
+    assert_eq!(a.svc.item(&keys[0]).unwrap(), card, "an unchanged card keeps its version");
     let stale = rodu_core::Item { title: "Stale".into(), ..card.clone() };
     assert!(!a.store().save_item(&stale, 1).unwrap());
     assert_eq!(a.svc.item(&keys[0]).unwrap().title, "Second");
+
+    // A teammate's change bumps the version; a rebuild after it does not bump it again.
+    let b = Peer::join(&a, "bob");
+    b.patch(&keys[0], json!({ "title": "Third" }));
+    exchange(&a, &b);
+    let changed = a.svc.item(&keys[0]).unwrap();
+    assert_eq!((changed.title.as_str(), changed.version), ("Third", 3));
+    a.store().rebuild_index().unwrap();
+    assert_eq!(a.svc.item(&keys[0]).unwrap().version, 3);
+}
+
+#[test]
+fn imports_while_the_index_is_unsettled_keep_unchanged_versions() {
+    let a = Peer::first();
+    let b = Peer::join(&a, "bob");
+    let keys = a.create(&["Mine", "Theirs"]);
+    exchange(&a, &b);
+    // A bad node stays in the document, so every import rebuilds the whole index.
+    let (raw, start) = raw_copy(&b);
+    raw.get_tree("items").create(TreeParentId::Root).unwrap();
+    send_raw(&raw, &start, &b);
+    exchange(&a, &b);
+    let mine = a.svc.item(&keys[0]).unwrap();
+    b.patch(&keys[1], json!({ "title": "Edited by bob" }));
+    exchange(&a, &b);
+    assert_eq!(a.svc.item(&keys[0]).unwrap().version, mine.version);
+    a.patch(&keys[0], json!({ "title": "Still mine" }));
 }
 
 #[test]
@@ -814,4 +840,60 @@ fn a_card_held_by_two_tree_nodes_is_reported() {
     assert!(problems.contains(&format!("card {}: also in tree node", card.id)), "{problems}");
     assert_eq!(a.svc.item(&keys[0]).unwrap().title, "Card");
     assert_rebuild_matches(&a);
+}
+
+#[test]
+fn imported_links_and_padded_text_are_held_to_the_rules_of_local_writes() {
+    let a = Peer::first();
+    let keys = a.create(&["Card"]);
+    let card = a.svc.item(&keys[0]).unwrap();
+    let (raw, start) = raw_copy(&a);
+    let links = raw.get_map("links");
+    let mut bad = Vec::new();
+    for (kind, target) in [
+        ("implements_pr", "javascript:alert(1)"),
+        ("implements_pr", "file:///etc/passwd"),
+        ("blocks", "not-a-card"),
+    ] {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(format!("{}\n{kind}\n{target}", card.id));
+        let key = hex::encode(&digest[..16]);
+        let link = links.ensure_mergeable_map(&key).unwrap();
+        link.insert("id", "0190eeee-0000-7000-8000-000000000005").unwrap();
+        link.insert("from_item_id", card.id.as_str()).unwrap();
+        link.insert("kind", kind).unwrap();
+        link.insert("target", target).unwrap();
+        link.insert("created_at", "2026-01-01T00:00:00.000Z").unwrap();
+        bad.push(key);
+    }
+    let demo = a.svc.collection("DEMO").unwrap().id;
+    let padded = "0190aaaa-0000-7000-8000-000000000001";
+    let node = raw_card(&raw, padded, &demo, "DEMO", TreeParentId::Root, None);
+    raw.get_tree("items").get_meta(node).unwrap().insert("title", " Padded ").unwrap();
+
+    let report = send_raw(&raw, &start, &a);
+    let problems = report.problems.join("\n");
+    for key in &bad {
+        assert!(problems.contains(&format!("link {key}: target is not allowed")), "{problems}");
+    }
+    assert!(a.store().list_links(&card.id).unwrap().is_empty());
+    assert!(a.store().get_item(padded).unwrap().is_none(), "{problems}");
+    assert_rebuild_matches(&a);
+}
+
+#[test]
+fn a_snapshot_left_half_written_is_discarded() {
+    let a = Peer::first();
+    a.create(&["Kept"]);
+    let dir = a.dir.path().to_path_buf();
+    std::fs::write(dir.join("rodu.loro.abc.123.partial"), b"half").unwrap();
+    drop(a.svc);
+    let svc = RoduService::new(LoroStore::open(&dir).unwrap());
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".partial") || n.ends_with(".next"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(svc.item("DEMO-1").unwrap().title, "Kept");
 }

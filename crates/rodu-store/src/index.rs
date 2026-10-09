@@ -182,12 +182,11 @@ impl SqliteStore {
         self.insert_link(l)
     }
 
-    /// Each item's local version, so a rebuild can carry versions on and a client's stale
-    /// `expected_version` still fails after it.
-    pub fn item_versions(&self) -> Result<HashMap<String, i64>> {
-        let mut stmt = self.conn.prepare("SELECT id, version FROM items").map_err(db)?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(db)
+    /// Every item row by id, so a rebuild can keep each unchanged item's local version: a
+    /// client's stale `expected_version` still fails, and a current one still succeeds.
+    pub fn items_by_id(&self) -> Result<HashMap<String, Item>> {
+        let items = self.all("SELECT * FROM items", [], crate::to_item)?;
+        Ok(items.into_iter().map(|i| (i.id.clone(), i)).collect())
     }
 
     /// Lets the next number in each collection follow its highest number, so a replica that takes

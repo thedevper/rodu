@@ -1051,7 +1051,8 @@ fn to_json<T: Serialize>(value: &T) -> Value {
 }
 
 /// An http(s) URL with a host, as pull request links must be.
-fn check_web_url(target: &str) -> Result<String> {
+/// An http(s) URL with a host and no whitespace or control characters.
+pub fn check_web_url(target: &str) -> Result<String> {
     let invalid = || RoduError::invalid("Invalid target: expected an http(s) URL");
     let (scheme, rest) = target.split_once("://").ok_or_else(invalid)?;
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {

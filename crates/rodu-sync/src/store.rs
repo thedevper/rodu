@@ -49,6 +49,8 @@ const DOC_FILE: &str = "rodu.loro";
 /// A waiting snapshot is `{NEXT_PREFIX}{sha256}{NEXT_SUFFIX}`.
 const NEXT_PREFIX: &str = "rodu.loro.";
 const NEXT_SUFFIX: &str = ".next";
+/// A snapshot still being written, before it is renamed to its `.next` name.
+const PARTIAL_SUFFIX: &str = ".partial";
 const META_DOC: &str = "doc_sha256";
 const META_PEER: &str = "peer";
 /// How many entities the index holds differently from the document until something else arrives:
@@ -296,7 +298,9 @@ impl LoroStore {
         for entry in fs::read_dir(&self.dir).map_err(|e| io(e, &self.dir))? {
             let path = entry.map_err(|e| io(e, &self.dir))?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if !(name.starts_with(NEXT_PREFIX) && name.ends_with(NEXT_SUFFIX)) {
+            if !(name.starts_with(NEXT_PREFIX)
+                && (name.ends_with(NEXT_SUFFIX) || name.ends_with(PARTIAL_SUFFIX)))
+            {
                 continue;
             }
             let finish = Some(&path) == committed.as_ref()
@@ -408,7 +412,13 @@ impl LoroStore {
         doc.commit();
         let bytes = doc.export(ExportMode::Snapshot).map_err(internal)?;
         let hash = sha256(&bytes);
-        write_durably(&self.next_path(&hash), &bytes)?;
+        // Written whole under a name of its own, then renamed: the same snapshot can be staged
+        // again while another process's late rename is moving it, and must never be seen torn.
+        let partial =
+            self.dir.join(format!("{NEXT_PREFIX}{hash}.{}{PARTIAL_SUFFIX}", std::process::id()));
+        write_durably(&partial, &bytes)?;
+        let next = self.next_path(&hash);
+        fs::rename(&partial, &next).map_err(|e| io(e, &next))?;
         sync_dir(&self.dir)?;
         self.sql.set_index_meta(META_DOC, &hash)?;
         Ok(hash)
@@ -499,12 +509,12 @@ impl LoroStore {
         let mut report = IndexReport::default();
         self.unsettled.set(0);
         self.sql.defer_foreign_keys()?;
-        let versions = self.sql.item_versions()?;
+        let before = self.sql.items_by_id()?;
         self.sql.clear_shared()?;
         self.index_principals(&mut report)?;
         self.index_collections(&mut report)?;
         self.index_cycles(&mut report)?;
-        self.index_all_items(&versions, &mut report)?;
+        self.index_all_items(&before, &mut report)?;
         let doc = self.doc.borrow();
         for id in map_keys(&doc, COMMENTS) {
             self.index_comment(&doc, &id, &mut report)?;
@@ -674,15 +684,20 @@ impl LoroStore {
         Ok(clean)
     }
 
-    /// Writes a card's row; `prior` is the version its row had, if it had one.
+    /// Writes a card's row; `prior` is the row it had, if any. The local version goes up only when
+    /// the row changes, so rebuilding an index never makes a client's version stale.
     fn put_item(
         &self,
         mut item: Item,
-        prior: Option<i64>,
+        prior: Option<&Item>,
         replace_text: bool,
         report: &mut IndexReport,
     ) -> Result<()> {
-        item.version = prior.map_or(1, |v| v + 1);
+        item.version = match prior {
+            Some(old) if *old == Item { version: old.version, ..item.clone() } => old.version,
+            Some(old) => old.version + 1,
+            None => 1,
+        };
         self.sql.put_item(&item, replace_text)?;
         report.items.push(item.id);
         Ok(())
@@ -691,7 +706,7 @@ impl LoroStore {
     /// Indexes every card, giving each a unique key and alias by the lowest-id rule.
     fn index_all_items(
         &self,
-        versions: &HashMap<String, i64>,
+        before: &HashMap<String, Item>,
         report: &mut IndexReport,
     ) -> Result<()> {
         report.problems.extend(self.node_problems.borrow().iter().cloned());
@@ -724,7 +739,7 @@ impl LoroStore {
         self.sql.park_names(Parked::Items)?;
         self.sql.clear_item_text()?;
         for item in kept {
-            let prior = versions.get(&item.id).copied();
+            let prior = before.get(&item.id);
             self.put_item(item, prior, false, report)?;
         }
         Ok(())
@@ -775,8 +790,8 @@ impl LoroStore {
             }
         }
         for item in items {
-            let prior = self.sql.get_item(&item.id)?.map(|old| old.version);
-            self.put_item(item, prior, true, report)?;
+            let prior = self.sql.get_item(&item.id)?;
+            self.put_item(item, prior.as_ref(), true, report)?;
         }
         Ok(true)
     }
