@@ -2510,8 +2510,16 @@ dependencies = [
 name = "rodu-sync"
 version = "0.3.0"
 dependencies = [
+ "hex",
  "loro",
+ "rodu-core",
+ "rodu-store",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.21",
+ "time",
  "xxhash-rust",
 ]
 

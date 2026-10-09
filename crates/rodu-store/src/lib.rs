@@ -1,6 +1,7 @@
 //! The local store: one SQLite file per workspace.
 
 pub mod compile;
+pub mod index;
 
 use std::cell::Cell;
 use std::path::Path;
