@@ -509,19 +509,36 @@ fn held_file_blamed(crash: bool) {
     if crash {
         // A crash may be the machine's: the first one only puts the batch off.
         let report = folder.pull(a.store(), &poisoned).unwrap();
-        assert_eq!(report.batch.refused.len(), 1, "{report:?}");
-        assert!(report.batch.refused[0].ends_with("read again next time"), "{report:?}");
+        assert!(report.batch.refused.is_empty(), "{report:?}");
+        assert_eq!(report.batch.notes.len(), 1, "{report:?}");
         assert!(report.batch.imported.is_empty(), "{report:?}");
     }
     let report = folder.pull(a.store(), &poisoned).unwrap();
     assert_eq!(report.batch.refused.len(), 1, "{report:?}");
     assert!(report.batch.refused[0].starts_with(&blamed), "{report:?}");
-    assert!(!report.batch.refused[0].ends_with("read again next time"), "{report:?}");
     // The honest file was put off, not refused, and the blamed one stays out: the next sync
     // imports only the honest one.
     let report = folder.pull(a.store(), &checker()).unwrap();
     assert_eq!(report.batch.imported.len(), 1, "{report:?}");
     assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Base");
+}
+
+#[test]
+fn a_crash_counts_against_a_held_file_only_twice_in_a_row() {
+    let (_root, folder, a, [earlier, later]) = three();
+    let (card, _) = base_and_build(&folder, &later, &earlier);
+    a.store().set_import_group_cap(1);
+    let crashing = checker_poisoned_by(earlier.store().peer(), true, true);
+    let report = folder.pull(a.store(), &crashing).unwrap();
+    assert!(report.batch.refused.is_empty(), "{report:?}");
+    let held = report.batch.notes[0].split(": ").next().unwrap().to_owned();
+    let strike = format!("strike:{held}");
+    assert!(a.store().sync_seen(&strike).unwrap(), "the crash is remembered once");
+    // A check replaying it that passes clears the strike; the file then lands.
+    let report = folder.pull(a.store(), &checker()).unwrap();
+    assert_eq!(report.batch.imported.len(), 2, "{report:?}");
+    assert!(!a.store().sync_seen(&strike).unwrap(), "a passing check clears the strike");
+    assert_eq!(a.store().get_item(&card.id).unwrap().unwrap().title, "Built on it");
 }
 
 #[test]

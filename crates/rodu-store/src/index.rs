@@ -218,6 +218,11 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn forget_sync_seen(&self, key: &str) -> Result<()> {
+        self.run("DELETE FROM sync_seen WHERE key = ?", [key])?;
+        Ok(())
+    }
+
     /// Lets the next number in each collection follow its highest number, so a replica that takes
     /// over numbering never reuses one.
     pub fn raise_next_numbers(&self) -> Result<()> {
