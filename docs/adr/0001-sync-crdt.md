@@ -204,26 +204,33 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   (reported). Files are written under a hidden temporary name and renamed into place.
 - **Reading the folder.** Everything in it is untrusted. Directory and file names are parsed,
   never joined into paths; links, dotfiles and files over the import cap are skipped; conflict
-  copies (`0000000003 (1).update`) are read like any other file. All new files are replayed in one
-  child process (`rodu __check-import`), which also refuses a file holding operations of any peer
-  but the one its folder names. If the batch is refused, each file is checked alone so one bad
-  file never holds the rest back. Files are remembered by folder, name and SHA-256: a file
-  rewritten under a seen name is checked and imported again, and operations Loro already holds
-  are ignored by their ids. A file found invalid is remembered and reported once.
+  copies (`0000000003 (1).update`) are read like any other file. A replica folder named for peer
+  0 is ignored: Loro never gives that id. A file is the unit of import, whole or not at all. New
+  files are replayed in a child process (`rodu __check-import`) in groups under the import cap;
+  the child also refuses a file holding operations of any peer but the one its folder names. A
+  group that passes is imported; when one is refused, each of its files is checked alone, against
+  the document with the files accepted so far, so one bad file never holds the rest back. Files
+  are remembered by folder, name and SHA-256: a file rewritten under a seen name is checked and
+  imported again, and operations Loro already holds are ignored by their ids. A file found
+  invalid or damaged is remembered and reported once; one the child could not finish (a crash
+  or timeout) is tried again next time.
 - **Writing.** Under the workspace write lock, a replica exports its own operations from the
   counter it last exported to and writes them as its next file. A folder without
   `rodu-team.json` (a cloud drive not mounted) is never written to.
 - **Commands.** `rodu team create --folder <path> --no-encrypt` turns the workspace in place
   into a team workspace: the document is built from every row of its index, so events,
   idempotency records and versions stay. It prints an invite code, `rodu1-<workspace id>`, which
-  holds no secret yet. `rodu team join <code> --folder <path> --name <you>` makes a workspace from
+  holds no secret yet. The folder is checked before the workspace changes: one that already names
+  a team is refused, unless its only replica folder is this workspace's own, left by a create
+  that stopped half way (the creator's replica folder is made before the team file for this).
+  `rodu team join <code> --folder <path> --name <you>` makes a workspace from
   the folder; a join that fails removes what it made. `rodu team` shows the folder, code and role;
   `rodu sync` syncs by hand. `--encrypt` is refused until step 4b, and giving neither flag is an
   error, so there is no silent default.
 - **Automatic sync.** In a team workspace `add`, `ls`, `show` and `mv` read the folder first and
   write to it after; the numbering peer (the machine that created the team) numbers new cards in
   between. `web` and `mcp` sync when they start and when they stop. A folder that cannot be read
-  is a warning, and the command works on what the machine has.
+  is a warning, and the command, `rodu sync` included, works on what the machine has.
 - **Left for later steps.** 4b: encryption. 4c: the readable copy, `web` and `mcp` watching the
   folder while they run, compaction (today every command reads every file in the folder), and the
   command that hands numbering to another machine. A join that fails after its principal reached

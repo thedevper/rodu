@@ -8,7 +8,7 @@ use std::time::Duration;
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
-use rodu_sync::folder::{PullReport, TeamFolder};
+use rodu_sync::folder::{PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::{Checker, LoroStore};
 use serde::{Deserialize, Serialize};
 
@@ -102,16 +102,31 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
             .with_hint("Make it one: rodu team create --folder <shared folder> --no-encrypt"));
     };
     let folder = TeamFolder::new(&team.folder);
-    let report = folder.pull(store, &checker())?;
+    // Like every other command, a sync by hand keeps working on what this machine has when the
+    // folder cannot be reached, and says so.
+    let report = match folder.pull(store, &checker()) {
+        Ok(report) => report,
+        Err(e) => {
+            warn(io, &format!("{} (working offline)", e.message));
+            (io.out)("Could not reach the team folder; nothing was synced");
+            return Ok(());
+        }
+    };
     warn_report(io, &report);
     let numbered =
         if team.numbering { ws.service.assign_numbers(&user_actor(&ws.config))?.len() } else { 0 };
-    let pushed = folder.push(store)?;
+    let sent = match folder.push(store) {
+        Ok(Some(_)) => "sent your changes",
+        Ok(None) => "nothing new to send",
+        Err(e) => {
+            warn(io, &format!("{} (your changes stay here and go out next time)", e.message));
+            "could not send your changes"
+        }
+    };
     (io.out)(&format!(
-        "Imported {} file(s), {} still arriving; numbered {numbered} card(s); {}",
+        "Imported {} file(s), {} still arriving; numbered {numbered} card(s); {sent}",
         report.batch.imported.len(),
         report.incomplete.len(),
-        if pushed.is_some() { "sent your changes" } else { "nothing new to send" }
     ));
     Ok(())
 }
@@ -180,25 +195,29 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     }
     let dir = ws.dir.clone();
     let mut config = ws.config.clone();
-    // A create that stopped half way left the document: carry on with it.
-    let resumed = ws.service.store.team().is_some();
+    // A create that stopped half way left the document, and maybe its first file: carry on.
+    let resumed = ws.service.store.team().map(LoroStore::peer);
     drop(ws);
-    let store = if resumed { LoroStore::open(&dir)? } else { LoroStore::adopt(&dir)? };
+    // The folder is checked before anything here changes. A folder naming a team may only be
+    // taken over by the create that started it: one whose only replica folder is this one's.
     let folder = TeamFolder::new(&folder_path);
-    let workspace_id = match folder.info() {
-        // Only a folder this replica alone has written to may be taken over, e.g. by a create
-        // that stopped half way.
-        Ok(info) if only_peer(&folder_path, store.peer()) => info.workspace_id,
-        Ok(_) => {
-            return Err(RoduError::conflict(format!(
-                "{} already holds another team",
-                folder_path.display()
-            ))
-            .with_hint("To join it instead: rodu team join <invite code> --folder <path>"));
+    let workspace_id = if folder_path.join(TEAM_FILE).exists() {
+        let info = folder.info()?;
+        match resumed {
+            Some(peer) if wrote_alone(&folder_path, peer) => info.workspace_id,
+            _ => {
+                return Err(RoduError::conflict(format!(
+                    "{} already holds another team",
+                    folder_path.display()
+                ))
+                .with_hint("To join it instead: rodu team join <invite code> --folder <path>"));
+            }
         }
-        Err(_) => uuidv7(now_ms()),
+    } else {
+        uuidv7(now_ms())
     };
-    folder.create(&workspace_id)?;
+    let store = if resumed.is_some() { LoroStore::open(&dir)? } else { LoroStore::adopt(&dir)? };
+    folder.create(&workspace_id, store.peer())?;
     folder.push(&store)?;
     config.team = Some(TeamConfig {
         folder: folder_path.display().to_string(),
@@ -216,11 +235,13 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// True if `sync/` holds no replica's folder but `peer`'s.
-fn only_peer(root: &Path, peer: u64) -> bool {
-    let Ok(entries) = std::fs::read_dir(root.join("sync")) else { return true };
+/// True if `sync/` holds `peer`'s replica folder and no other.
+fn wrote_alone(root: &Path, peer: u64) -> bool {
+    let Ok(entries) = std::fs::read_dir(root.join(SYNC_DIR)) else { return false };
     let own = format!("{peer:016x}");
-    entries.flatten().all(|e| e.file_name().to_str() == Some(own.as_str()))
+    let names: Vec<String> =
+        entries.flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
+    names.contains(&own) && names.iter().all(|n| *n == own || n.starts_with('.'))
 }
 
 fn now_ms() -> u64 {

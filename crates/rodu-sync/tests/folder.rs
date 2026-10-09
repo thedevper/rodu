@@ -89,7 +89,7 @@ fn first(folder: &TeamFolder) -> Machine {
     plain.create_items(&me, "DEMO", &[json!({ "title": "Made alone" })], None).unwrap();
     drop(plain);
     let svc = RoduService::new(LoroStore::adopt(dir.path()).unwrap());
-    folder.create("0190aaaa-0000-7000-8000-00000000000a").unwrap();
+    folder.create("0190aaaa-0000-7000-8000-00000000000a", svc.store.peer()).unwrap();
     folder.push(&svc.store).unwrap();
     Machine { svc, me, dir }
 }
@@ -259,10 +259,63 @@ fn damaged_files_and_files_with_another_peers_ops_are_refused() {
 }
 
 #[test]
+fn a_backlog_is_checked_in_groups_and_a_bad_file_only_holds_back_itself() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    a.sync(&folder);
+    for n in 0..6 {
+        b.svc.create_items(&b.me, "DEMO", &[json!({ "title": format!("B{n}") })], None).unwrap();
+        folder.push(b.store()).unwrap();
+    }
+    // A forged file among them, written as bob's next one.
+    let raw = LoroDoc::new();
+    raw.set_peer_id(99).unwrap();
+    raw.get_map("principals").insert("x", 1).unwrap();
+    raw.commit();
+    let forged = raw.export(loro::ExportMode::all_updates()).unwrap();
+    let b_dir = folder.root().join("sync").join(format!("{:016x}", b.store().peer()));
+    std::fs::write(b_dir.join("0000000004 (1).update"), frame(&forged)).unwrap();
+    // Room for about two files per check: several groups, one of them refused.
+    let largest = files_of(&folder, b.store().peer())
+        .iter()
+        .map(|p| std::fs::metadata(p).unwrap().len() as usize)
+        .max()
+        .unwrap();
+    a.store().set_import_group_cap(largest * 2);
+
+    let report = a.sync(&folder);
+    assert_eq!(report.batch.imported.len(), 6, "{report:?}");
+    assert_eq!(report.batch.refused.len(), 1, "{report:?}");
+    for n in 0..6 {
+        assert!(a.titles().contains(&format!("B{n}")), "B{n} arrived");
+    }
+}
+
+#[test]
+fn a_replica_folder_named_for_peer_zero_is_ignored() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    a.sync(&folder);
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Hidden" })], None).unwrap();
+    let written = folder.push(b.store()).unwrap().unwrap();
+    // bob's real file copied under peer 0, then removed from bob's folder.
+    let zero = folder.root().join("sync").join(format!("{:016x}", 0));
+    std::fs::create_dir_all(&zero).unwrap();
+    std::fs::copy(&written, zero.join("0000000001.update")).unwrap();
+    std::fs::remove_file(&written).unwrap();
+
+    let report = a.sync(&folder);
+    assert!(report.batch.imported.is_empty() && report.batch.refused.is_empty(), "{report:?}");
+    assert!(!a.titles().contains(&"Hidden".to_owned()));
+}
+
+#[test]
 fn a_folder_holding_another_team_is_refused() {
     let (_root, folder) = team();
-    folder.create("0190aaaa-0000-7000-8000-00000000000a").unwrap();
-    assert!(folder.create("0190aaaa-0000-7000-8000-00000000000b").is_err());
+    folder.create("0190aaaa-0000-7000-8000-00000000000a", 1).unwrap();
+    assert!(folder.create("0190aaaa-0000-7000-8000-00000000000b", 2).is_err());
     assert_eq!(folder.info().unwrap().workspace_id, "0190aaaa-0000-7000-8000-00000000000a");
 }
 

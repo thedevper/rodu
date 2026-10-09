@@ -114,6 +114,41 @@ fn create_asks_for_an_encryption_choice_and_refuses_a_second_team() {
     ok(&other, &["init", "--name", "zed", "--key", "ZED"]);
     let taken = rodu(&other, &["team", "create", "--folder", f, "--no-encrypt"]);
     assert!(taken.err.contains("already holds another team"), "{}", taken.err);
+    assert!(!other.join(".rodu/rodu.loro").exists(), "a refused create converts nothing");
+
+    // A team folder whose replica folders have not synced yet is still another team's.
+    let early = root.path().join("early");
+    std::fs::create_dir_all(early.join("sync")).unwrap();
+    std::fs::copy(folder.join("rodu-team.json"), early.join("rodu-team.json")).unwrap();
+    let e = early.to_str().unwrap();
+    let taken = rodu(&other, &["team", "create", "--folder", e, "--no-encrypt"]);
+    assert!(taken.err.contains("already holds another team"), "{}", taken.err);
+    assert!(!other.join(".rodu/rodu.loro").exists());
+}
+
+#[test]
+fn a_create_that_stopped_half_way_can_be_run_again() {
+    let root = tempfile::tempdir().unwrap();
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok(&ann, &["init", "--name", "ann", "--key", "DEMO"]);
+    ok(&ann, &["add", "Made alone"]);
+    let folder = root.path().join("shared");
+    let f = folder.to_str().unwrap();
+    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    // As if it stopped after its first sync file and before the config.
+    let config_path = ann.join(".rodu/config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("team");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    let out = ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    assert!(out.contains("Invite code:"), "{out}");
+    let bob = root.path().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    let code = out.lines().find_map(|l| l.strip_prefix("Invite code: ")).unwrap();
+    ok(&bob, &["team", "join", code, "--folder", f, "--name", "bob"]);
+    assert!(ok(&bob, &["ls"]).contains("Made alone"));
 }
 
 #[test]
@@ -152,6 +187,10 @@ fn an_unreachable_folder_is_a_warning_and_changes_go_out_later() {
     assert_eq!(run.code, 0, "{}", run.err);
     assert!(run.err.contains("warning: sync") && run.err.contains("offline"), "{}", run.err);
     assert!(!team.folder.exists(), "nothing is written where the folder should be");
+    let manual = rodu(&bob, &["sync"]);
+    assert_eq!(manual.code, 0, "{}", manual.err);
+    assert!(manual.out.contains("Could not reach the team folder"), "{}", manual.out);
+    assert!(!team.folder.exists());
     std::fs::rename(&parked, &team.folder).unwrap();
     ok(&bob, &["sync"]);
     assert!(ok(&team.ann, &["ls"]).contains("Written offline"));
@@ -179,6 +218,7 @@ fn a_damaged_file_in_the_folder_is_reported_not_fatal() {
     let run = rodu(&bob, &["ls"]);
     assert_eq!(run.code, 0, "{}", run.err);
     assert!(run.err.contains("skipped"), "{}", run.err);
+    ok(&bob, &["ls"]);
 }
 
 #[test]

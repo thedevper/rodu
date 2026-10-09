@@ -42,7 +42,7 @@ use sha2::{Digest, Sha256};
 
 use crate::layout::{self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, PRINCIPALS};
 use crate::names::{self, Entry};
-use crate::{Checker, SyncError, Untrusted, check_import};
+use crate::{Checker, MAX_IMPORT_BYTES, SyncError, Untrusted, check_import};
 
 const DB_FILE: &str = "rodu.db";
 const DOC_FILE: &str = "rodu.loro";
@@ -142,6 +142,8 @@ pub struct LoroStore {
     node_problems: RefCell<Vec<String>>,
     /// [`LoroStore::adopt`] is building the document from a plain workspace's index.
     adopting: Cell<bool>,
+    /// The most bytes [`LoroStore::import_batch`] sends to the child in one check.
+    group_cap: Cell<usize>,
 }
 
 fn internal(error: impl Display) -> RoduError {
@@ -288,6 +290,7 @@ impl LoroStore {
             unsettled: Cell::new(0),
             node_problems: RefCell::new(Vec::new()),
             adopting: Cell::new(false),
+            group_cap: Cell::new(MAX_IMPORT_BYTES),
         };
         store.sql.transaction(TxMode::Write, || {
             let peer = match store.sql.index_meta(META_PEER)? {
@@ -307,6 +310,13 @@ impl LoroStore {
     /// This replica's Loro peer id.
     pub fn peer(&self) -> u64 {
         self.peer.get()
+    }
+
+    /// Lowers the bytes checked at once by [`LoroStore::import_batch`], so tests can split a
+    /// batch into groups without writing 64 MiB.
+    #[doc(hidden)]
+    pub fn set_import_group_cap(&self, cap: usize) {
+        self.group_cap.set(cap.min(MAX_IMPORT_BYTES));
     }
 
     /// The index this store reads from.
@@ -349,60 +359,67 @@ impl LoroStore {
         })
     }
 
-    /// Imports sync files from other replicas: each must hold only its writer's operations, and
-    /// a file whose key was imported or refused before is skipped. The batch is replayed in one
-    /// child process; if that refuses it, each file is checked alone, so one bad file never holds
-    /// the rest back. A file found invalid is remembered as refused, so it is reported once; one
-    /// that could not be checked (a crash or timeout) is tried again next time.
+    /// Imports sync files from other replicas. A file is the unit: it is imported whole, after a
+    /// child process replayed it on this document, or not at all. Each must hold only its
+    /// writer's operations (peer 0 is never a writer), and a file whose key was dealt with before
+    /// is skipped. Files go to the child in groups under the import cap, a whole group at once
+    /// when it passes; when a group is refused, each of its files is checked alone, against the
+    /// document with the files accepted so far, so one bad file never holds the rest back. A file
+    /// found invalid is remembered and reported once; one that could not be checked (a crash or
+    /// timeout) is tried again next time.
     pub fn import_batch(&self, incoming: &[Incoming], checker: &Checker) -> Result<BatchReport> {
         self.transaction(TxMode::Write, || {
             let mut report = BatchReport::default();
-            let mut fresh = Vec::new();
+            let mut groups: Vec<Vec<&Incoming>> = vec![Vec::new()];
+            let mut size = 0;
             for file in incoming {
-                if !self.sql.is_sync_seen(&file.key)? {
-                    fresh.push(file);
+                if self.sql.is_sync_seen(&file.key)? {
+                    continue;
                 }
-            }
-            if fresh.is_empty() {
-                return Ok(report);
+                if file.peer == 0 || file.bytes.len() > MAX_IMPORT_BYTES {
+                    self.sql.mark_sync_seen(&file.key)?;
+                    report.refused.push(format!("{}: not a valid sync file", file.key));
+                    continue;
+                }
+                if size + file.bytes.len() > self.group_cap.get() {
+                    groups.push(Vec::new());
+                    size = 0;
+                }
+                size += file.bytes.len();
+                groups.last_mut().expect("a group").push(file);
             }
             let touched = {
                 let doc = self.doc.borrow();
-                let all: Vec<Untrusted<'_>> = fresh.iter().map(|f| untrusted(f)).collect();
-                let accepted = if check_import(&doc, &all, checker).is_ok() {
-                    fresh
-                } else {
-                    let mut accepted = Vec::new();
-                    for file in fresh {
+                let before = doc.oplog_frontiers();
+                let import = |file: &Incoming, report: &mut BatchReport| -> Result<()> {
+                    self.dirty.set(true);
+                    doc.import(&file.bytes).map_err(internal)?;
+                    self.sql.mark_sync_seen(&file.key)?;
+                    report.imported.push(file.key.clone());
+                    Ok(())
+                };
+                for group in groups.into_iter().filter(|g| !g.is_empty()) {
+                    let all: Vec<Untrusted<'_>> = group.iter().map(|f| untrusted(f)).collect();
+                    if check_import(&doc, &all, checker).is_ok() {
+                        for file in group {
+                            import(file, &mut report)?;
+                        }
+                        continue;
+                    }
+                    for file in group {
                         match check_import(&doc, &[untrusted(file)], checker) {
-                            Ok(()) => accepted.push(file),
+                            Ok(()) => import(file, &mut report)?,
                             Err(e) => {
-                                if matches!(
-                                    e,
-                                    SyncError::InvalidData(_) | SyncError::TooLarge { .. }
-                                ) {
+                                if matches!(e, SyncError::InvalidData(_)) {
                                     self.sql.mark_sync_seen(&file.key)?;
                                 }
                                 report.refused.push(format!("{}: {e}", file.key));
                             }
                         }
                     }
-                    let rest: Vec<Untrusted<'_>> = accepted.iter().map(|f| untrusted(f)).collect();
-                    if !accepted.is_empty() && check_import(&doc, &rest, checker).is_err() {
-                        report.refused.push("the files together were refused".into());
-                        accepted.clear();
-                    }
-                    accepted
-                };
-                if accepted.is_empty() {
-                    return Ok(report);
                 }
-                let before = doc.oplog_frontiers();
-                self.dirty.set(true);
-                for file in accepted {
-                    doc.import(&file.bytes).map_err(internal)?;
-                    self.sql.mark_sync_seen(&file.key)?;
-                    report.imported.push(file.key.clone());
+                if report.imported.is_empty() {
+                    return Ok(report);
                 }
                 touched(&doc, &before, &doc.oplog_frontiers())?
             };
@@ -410,6 +427,16 @@ impl LoroStore {
             report.index = self.index_touched(&touched)?;
             Ok(report)
         })
+    }
+
+    /// Whether a sync file with this key was dealt with before.
+    pub fn sync_seen(&self, key: &str) -> Result<bool> {
+        self.sql.is_sync_seen(key)
+    }
+
+    /// Remembers a sync file that is not worth reading again (damaged), so it is reported once.
+    pub fn mark_sync_seen(&self, key: &str) -> Result<()> {
+        self.transaction(TxMode::Write, || self.sql.mark_sync_seen(key))
     }
 
     /// Exports this replica's own operations that no earlier call exported, if any, passing them
