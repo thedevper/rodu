@@ -518,7 +518,11 @@ impl TeamFolder {
                 if let Some(stat) = stat {
                     store.mark_sync_seen(&stat)?;
                 }
-                if let Some(seq) = seq {
+                // Only a file that landed counts: a damaged or refused one, planted under a high
+                // number and then removed, would otherwise raise a warning nothing can clear.
+                let landed =
+                    report.batch.imported.contains(&key) && !report.batch.waiting.contains(&key);
+                if let Some(seq) = seq.filter(|_| landed) {
                     store.raise_highest_seen(peer, seq)?;
                 }
             }
