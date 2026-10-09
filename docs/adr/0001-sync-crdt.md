@@ -228,6 +228,52 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
 - **Writing.** Under the workspace write lock, a replica exports its own operations from the
   counter it last exported to and writes them as its next file. A folder without
   `rodu-team.json` (a cloud drive not mounted) is never written to.
+- **Not reading a file twice (built 2026-10-09, step 4c).** Once a file's content has been dealt
+  with (landed, refused or reported damaged), the file is also remembered by its name, size,
+  modification time and (on Unix) inode, and a later pull skips it after a `stat`, without opening
+  it. A command so costs one `stat` per file instead of reading every byte in the folder. A file
+  rewritten in place or replaced gets a new time or inode and is read again; only a rewrite that
+  keeps the size and sets the time back, or falls within the file system's time resolution, is
+  missed, and a file a reader already dealt with holds nothing it lacks. A file still waiting for other operations is not
+  remembered this way, so it is read on every pull until it lands.
+- **Compaction (built 2026-10-09, step 4c).** Once a replica has written 32 files since it last
+  compacted, its push writes one more numbered file holding every operation it has published
+  (its own counters from 0 up to the last one exported), sealed like any other for an encrypted
+  team, and then removes its own lower-numbered files. It runs under the workspace write lock,
+  writes before it removes, and removes only regular files named like its own numbered files: never
+  conflict copies, links, dotfiles or another replica's files. Files stay one replica's own
+  operations, so the import rule that a file holds only its folder's peer is kept; a whole-document
+  snapshot would break it. If the merged payload would be over the 64 MiB import cap, the replica
+  does not compact and tries again after as many files more. Anything that goes wrong after the
+  push wrote its own file, such as an old file that cannot be removed, is a warning, not a failed
+  push; the next compaction removes the file.
+- **Readers during a compaction.** Readers never need to know which files a compacted one
+  replaces: what links them is the operations' ids, not the file names. The compacted file covers
+  every counter of its replica from 0 up to the last export, so it holds every operation of every
+  file it replaces. A folder app may deliver the new file and the removals in either order:
+  - new file first: the old files' operations are already in the reader's log, so Loro ignores
+    them by id and the file lands at once;
+  - removals first: a later file from that replica whose operations build on removed ones has
+    operations pending. It is the waiting case above: the file is not marked done, it is read and
+    checked again on every pull, `rodu sync` lists it as waiting, and it lands when the compacted
+    file arrives;
+  - stopped between write and removals: the old files hold nothing new, and a later compaction
+    removes them.
+
+  Removals first with no later file leave nothing to wait on, so a reader also keeps, per replica,
+  the highest number among the files it has dealt with. A replica's numbers only grow, and a
+  compacted file is numbered above every file it replaces. When none of that replica's files
+  present is numbered that high, its files were removed and the compacted file has not arrived:
+  - every pull says so (`rodu sync` and the warnings of other commands);
+  - the mark stays until a file numbered that high or higher is there, which resolves it;
+  - a reader cannot tell a file still in transit from one that will never come, so it keeps saying
+    so until the file arrives.
+
+  Only files that landed raise the mark, so a damaged or refused file planted under a high number
+  raises nothing. Someone who can write the folder can still rename a file that lands to a high
+  number and remove it later; teammates are then warned until that replica's numbers pass it. They
+  could as well delete files, which is worse. The same message appears if a replica's folder is
+  emptied by hand.
 - **Commands.** `rodu team create --folder <path> --no-encrypt` turns the workspace in place
   into a team workspace: the document is built from every row of its index, so events,
   idempotency records and versions stay. It prints an invite code, `rodu1-<workspace id>`, which
@@ -243,12 +289,14 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   between. `web` and `mcp` sync when they start and when they stop. A folder that cannot be read
   is a warning, and the command, `rodu sync` included, works on what the machine has.
 - **Left for later steps.** 4c: the readable copy, `web` and `mcp` watching the
-  folder while they run, compaction (today every command reads every file in the folder), and the
-  command that hands numbering to another machine. A file waiting on operations that never arrive
+  folder while they run, and the command that hands numbering to another machine. A file waiting on operations that never arrive
   (its predecessor refused, or never written) is read and checked again on every command, with no
   limit yet; `rodu sync` lists such files. Held files count toward the import cap of each later
   check, so a replica that writes close to 64 MiB of files that never land can hold back what
-  others write until they are removed. A frame's length is not authenticated: a length past
+  others write until they are removed. After a replica compacts, each teammate reads and checks
+  its whole history once, as one file. A compacted file holding an operation teammates once
+  refused is refused whole by anyone who joins later, so that replica's other operations reach
+  them only through its later files. A frame's length is not authenticated: a length past
   what any sync file holds marks the file damaged, but one changed to a larger length still within
   that bound cannot be told from a file still arriving, so it is listed as arriving for good (and
   never imported). A join that fails after its principal reached
@@ -329,8 +377,8 @@ provider cannot read the board.
    global version.
 5. **Transport (decided 2026-10-09: a shared folder first).** The team's sync folder is one it
    already shares: Google Drive, Dropbox, OneDrive, iCloud Drive or Syncthing. Each peer appends
-   update files under `sync/<peer-id>/<sequence>.update`, and a periodic compaction writes a
-   snapshot. Rodu never talks to those services; their own apps move the files. A self-hosted
+   update files under `sync/<peer-id>/<sequence>.update`, and each peer
+   periodically compacts its own files into one (built: see "The team folder"). Rodu never talks to those services; their own apps move the files. A self-hosted
    `rodu relay` comes later, for teams that want changes to arrive in under a second, carrying the
    same files. Git or S3 can carry them too.
 6. **Sync is automatic (decided 2026-10-09).** Nobody runs a sync command in normal use:
@@ -380,7 +428,7 @@ provider cannot read the board.
    half-written files. Split in three: 4a (transport, team commands, automatic sync) and 4b
    (encryption) are done, described under "The team folder" and "Encrypted teams" above; 4c
    adds the readable copy, live watching in `web` and `mcp`, compaction and the numbering
-   hand-over.
+   hand-over. Compaction is done, with the `stat` skip, under "The team folder".
 5. Later: `rodu relay` for live sync.
 6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.
