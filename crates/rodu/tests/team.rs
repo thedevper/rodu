@@ -427,7 +427,7 @@ fn a_join_never_removes_a_key_file_it_did_not_write() {
 struct Board {
     child: std::process::Child,
     host: String,
-    token: String,
+    bearer: String,
 }
 
 impl Drop for Board {
@@ -451,9 +451,9 @@ fn start_board(dir: &Path) -> Board {
     for line in stdout.lines() {
         let line = line.unwrap();
         if let Some(link) = line.strip_prefix("Open: ") {
-            let (base, token) = link.split_once("#token=").unwrap();
+            let (base, bearer) = link.split_once("#token=").unwrap();
             let host = base.trim_start_matches("http://").trim_end_matches('/').to_owned();
-            return Board { child, host, token: token.to_owned() };
+            return Board { child, host, bearer: bearer.to_owned() };
         }
     }
     let _ = child.kill();
@@ -467,7 +467,7 @@ impl Board {
         let mut stream = std::net::TcpStream::connect(&self.host).unwrap();
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-            self.host, self.token
+            self.host, self.bearer
         );
         stream.write_all(request.as_bytes()).unwrap();
         let mut raw = String::new();
