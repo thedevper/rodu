@@ -741,3 +741,44 @@ fn a_folder_of_the_other_kind_or_key_is_never_synced() {
     assert!(folder.push(a.store()).unwrap_err().message.contains("not encrypted"));
     assert_eq!(files_of(&folder, a.store().peer()).len(), files, "no plain file was written");
 }
+
+#[test]
+fn a_team_file_naming_another_workspace_stops_the_sync_and_writes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "0190aaaa-0000-7000-8000-00000000000a";
+    let folder = sealed_at(root.path(), KEY).expecting(id);
+    let a = first(&folder);
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "During the swap" })], None).unwrap();
+    // Someone who can write to the folder keeps keyCheck and changes only the team id.
+    let team_file = folder.root().join("rodu-team.json");
+    let real = std::fs::read_to_string(&team_file).unwrap();
+    std::fs::write(&team_file, real.replace(id, "0190aaaa-0000-7000-8000-0000000000ff")).unwrap();
+    let files = files_of(&folder, a.store().peer()).len();
+    assert!(folder.push(a.store()).unwrap_err().message.contains("another team"));
+    assert!(folder.pull(a.store(), &checker()).is_err());
+    assert_eq!(files_of(&folder, a.store().peer()).len(), files, "nothing sealed for it");
+    // Put back, the change goes out and opens for a teammate.
+    std::fs::write(&team_file, real).unwrap();
+    folder.push(a.store()).unwrap().unwrap();
+    let b = join(&sealed_at(root.path(), KEY).expecting(id), "bob");
+    assert!(b.titles().contains(&"During the swap".to_owned()));
+}
+
+#[test]
+fn a_planted_high_sequence_number_never_stops_pushes() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let dir = folder.root().join("sync").join(format!("{:016x}", a.store().peer()));
+    std::fs::write(dir.join("9999999999.update"), frame(b"planted")).unwrap();
+    for n in 0..2 {
+        a.svc
+            .create_items(&a.me, "DEMO", &[json!({ "title": format!("After {n}") })], None)
+            .unwrap();
+        folder.push(a.store()).unwrap().unwrap();
+    }
+    assert!(dir.join("10000000001.update").exists());
+    // At the very end of the numbers: an error, not a panic or a lost change.
+    std::fs::write(dir.join(format!("{}.update", u64::MAX)), frame(b"planted")).unwrap();
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "Stuck" })], None).unwrap();
+    assert!(folder.push(a.store()).unwrap_err().message.contains("past any sequence"));
+}

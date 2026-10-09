@@ -376,3 +376,35 @@ fn an_encrypted_create_that_stopped_half_way_keeps_its_key() {
     let out = ok(&team.ann, &["team", "create", "--folder", f, "--encrypt"]);
     assert!(out.contains(&format!("Invite code: {}", team.code)), "the same team and key: {out}");
 }
+
+#[test]
+fn a_half_made_team_carries_on_only_as_what_it_was() {
+    let root = tempfile::tempdir().unwrap();
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok(&ann, &["init", "--name", "ann", "--key", "DEMO"]);
+    let folder = root.path().join("shared");
+    let f = folder.to_str().unwrap();
+    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    let config_path = ann.join(".rodu/config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("team");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    let run = rodu(&ann, &["team", "create", "--folder", f, "--encrypt"]);
+    assert!(run.err.contains("run it again with --no-encrypt"), "{}", run.err);
+    assert!(!ann.join(".rodu/team.key").exists(), "no key was written");
+    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+}
+
+#[test]
+fn a_join_never_removes_a_key_file_it_did_not_write() {
+    let team = sealed_team();
+    let bob = team.root.path().join("bob");
+    std::fs::create_dir_all(bob.join(".rodu")).unwrap();
+    std::fs::write(bob.join(".rodu/team.key"), "kept\n").unwrap();
+    let f = team.folder.to_str().unwrap();
+    let run = rodu(&bob, &["team", "join", &team.code, "--folder", f, "--name", "bob"]);
+    assert!(run.err.contains("already there"), "{}", run.err);
+    assert_eq!(std::fs::read_to_string(bob.join(".rodu/team.key")).unwrap(), "kept\n");
+}
