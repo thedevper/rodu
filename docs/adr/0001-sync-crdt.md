@@ -136,7 +136,10 @@ Loro:
 ## Proposed design for the open problems
 
 1. **Card numbers (decided 2026-10-09: provisional keys).** A new card gets a provisional key
-   built from its id, such as `DEMO-~a3f9`, and keeps it until it is numbered. Exactly one peer per
+   built from the random bits of its id, six letters such as `DEMO-KQMRTZ` (no digits, so it never
+   looks like a real number; no I, L, O or U; growing to 8 or 10 letters if the key is taken), and
+   keeps it until it is numbered. Letters only, because `~` and the other symbols are JQL-lite
+   operators. Exactly one peer per
    workspace, the *numbering peer*, gives out real numbers: when it imports a provisional card, it
    assigns the next number and writes it to the card. Two peers numbering at once would collide
    again without a server, so no other peer ever numbers. The numbering peer is the one that ran
@@ -189,7 +192,10 @@ Loro:
    ships Loro without its notices.
 2. Design provisional keys and the numbering peer in the core model. This includes the alias
    lookup and the hand-over command. It also covers a single-user workspace, where the numbering
-   peer is the only peer and every card is numbered immediately, as today.
+   peer is the only peer and every card is numbered immediately, as today. Done except the
+   hand-over command and the setting that turns numbering off, which need `rodu team join`
+   (step 4): `Item.number` is optional, `RoduService::with_numbering` and `assign_numbers` exist,
+   and SQLite schema 2 migrates schema 1 workspaces in place.
 3. Build a Loro-backed store implementing `Store`, keeping the SQLite index in sync from the
    document's change events, and run the existing service tests against it.
 4. Shared-folder transport with automatic sync, `rodu team create` and `rodu team join`, and

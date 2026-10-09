@@ -484,3 +484,100 @@ fn reopens_a_workspace_file() {
     let svc = RoduService::new(SqliteStore::open(&path).unwrap());
     assert_eq!(svc.item("OPS-1").unwrap().title, "Persisted");
 }
+
+// --- provisional keys and the numbering peer ---
+
+fn numbering(f: Fixture, on: bool) -> Fixture {
+    Fixture { service: f.service.with_numbering(on), ..f }
+}
+
+fn is_provisional(key: &str) -> bool {
+    key.strip_prefix("DEMO-")
+        .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_uppercase()))
+}
+
+#[test]
+fn creates_provisional_cards_where_numbering_is_off() {
+    let f = numbering(fixture(), false);
+    let card =
+        f.service.create_items(&f.alice, "DEMO", &items(&["Offline"]), None).unwrap().remove(0);
+    assert!(is_provisional(&card.key), "{}", card.key);
+    assert_eq!(card.number, None);
+    assert_eq!(card.provisional_key.as_deref(), Some(card.key.as_str()));
+    assert_eq!(f.service.item(&card.key.to_lowercase()).unwrap().id, card.id);
+    assert_eq!(keys(&f, &format!("key = {}", card.key.to_lowercase())), [card.key]);
+}
+
+#[test]
+fn numbers_provisional_cards_in_creation_order_and_keeps_their_old_keys() {
+    let f = fixture();
+    f.service.create_items(&f.alice, "DEMO", &items(&["First"]), None).unwrap();
+    let f = numbering(f, false);
+    let offline = f.service.create_items(&f.alice, "DEMO", &items(&["A", "B"]), None).unwrap();
+    let f = numbering(f, true);
+
+    let numbered = f.service.assign_numbers(&f.alice).unwrap();
+    let got: Vec<(&str, Option<i64>)> =
+        numbered.iter().map(|i| (i.key.as_str(), i.number)).collect();
+    assert_eq!(got, [("DEMO-2", Some(2)), ("DEMO-3", Some(3))]);
+    assert_eq!(numbered[0].id, offline[0].id);
+    assert_eq!(numbered[0].provisional_key, offline[0].provisional_key);
+    assert_eq!(numbered[0].version, 2);
+
+    let old = offline[0].key.as_str();
+    assert_eq!(f.service.item(old).unwrap().key, "DEMO-2");
+    assert_eq!(keys(&f, &format!("key = {old}")), ["DEMO-2"]);
+    assert_eq!(
+        keys(&f, &format!("key IN ({}, DEMO-1) ORDER BY key", offline[1].key)),
+        ["DEMO-1", "DEMO-3"]
+    );
+    assert_eq!(keys(&f, &format!("key != {old} ORDER BY key")), ["DEMO-1", "DEMO-3"]);
+    assert_eq!(keys(&f, &format!("key NOT IN ({old}) ORDER BY key")), ["DEMO-1", "DEMO-3"]);
+    let events = f.service.store.list_events(&offline[0].id).unwrap();
+    assert_eq!(events.last().unwrap().action, "item.number");
+
+    assert!(f.service.assign_numbers(&f.alice).unwrap().is_empty());
+    let next = f.service.create_items(&f.alice, "DEMO", &items(&["After"]), None).unwrap();
+    assert_eq!(next[0].key, "DEMO-4");
+}
+
+#[test]
+fn orders_unnumbered_cards_after_numbered_ones() {
+    let f = fixture();
+    f.service.create_items(&f.alice, "DEMO", &items(&["One"]), None).unwrap();
+    let f = numbering(f, false);
+    let p = f.service.create_items(&f.alice, "DEMO", &items(&["Later"]), None).unwrap().remove(0);
+    let f = numbering(f, true);
+    f.service.create_items(&f.alice, "DEMO", &items(&["Two"]), None).unwrap();
+    assert_eq!(keys(&f, "ORDER BY key"), ["DEMO-1".to_string(), "DEMO-2".into(), p.key.clone()]);
+    assert_eq!(keys(&f, "ORDER BY key DESC"), [p.key.clone(), "DEMO-2".into(), "DEMO-1".into()]);
+    assert_eq!(keys(&f, &format!("parent IS EMPTY AND key = {}", p.key)), [p.key]);
+}
+
+#[test]
+fn refuses_to_number_cards_where_numbering_is_off() {
+    let f = numbering(fixture(), false);
+    f.service.create_items(&f.alice, "DEMO", &items(&["Offline"]), None).unwrap();
+    let e = err(f.service.assign_numbers(&f.alice));
+    assert_eq!(e.code, ErrorCode::Conflict);
+    assert!(e.hint.is_some());
+}
+
+#[test]
+fn resolves_a_provisional_parent_reference() {
+    let f = numbering(fixture(), false);
+    let parent =
+        f.service.create_items(&f.alice, "DEMO", &items(&["Epic"]), None).unwrap().remove(0);
+    let child = f
+        .service
+        .create_items(
+            &f.alice,
+            "DEMO",
+            &[json!({ "title": "Part", "parent": parent.key.to_lowercase() })],
+            None,
+        )
+        .unwrap()
+        .remove(0);
+    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(keys(&f, &format!("parent = {}", parent.key)), [child.key]);
+}
