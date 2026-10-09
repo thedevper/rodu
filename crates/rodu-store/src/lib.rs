@@ -172,7 +172,7 @@ fn to_cycle(r: &Row<'_>) -> rusqlite::Result<Cycle> {
     })
 }
 
-fn to_item(r: &Row<'_>) -> rusqlite::Result<Item> {
+pub(crate) fn to_item(r: &Row<'_>) -> rusqlite::Result<Item> {
     Ok(Item {
         id: r.get("id")?,
         collection_id: r.get("collection_id")?,
@@ -321,7 +321,7 @@ impl SqliteStore {
         self.conn.prepare_cached(sql).map_err(db)?.query_row(params, map).optional().map_err(db)
     }
 
-    fn all<T>(
+    pub(crate) fn all<T>(
         &self,
         sql: &str,
         params: impl rusqlite::Params,

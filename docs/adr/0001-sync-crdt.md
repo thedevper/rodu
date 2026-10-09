@@ -152,7 +152,9 @@ runs against it and against `SqliteStore`.
   renames it into place after the commit. Whoever next takes the write lock finishes the one the
   index names and deletes any other, so a transaction that failed never changes the document and
   one that committed is never lost. The hash is in the name because the rename after a commit
-  runs outside the lock: a late rename can only move its own file, never another process's; the directory is flushed after the file is created and after the
+  runs outside the lock: a late rename can only move its own file, never another process's. The
+  snapshot is first written whole as a `.partial` file and renamed to its `.next` name, so a file
+  under that name is never torn even when the same snapshot is staged again; the directory is flushed after the file is created and after the
   rename (on Unix). If the index does not match the document on open, or `rodu.db` is gone, the
   index is rebuilt from the document.
 - **One machine, several processes.** SQLite's write lock is the lock on the document: each write
@@ -161,18 +163,21 @@ runs against it and against `SqliteStore`.
 - **Import.** `import_untrusted` replays the import in a child process first (as `Replica` does),
   then indexes the entities in the document's diff. Every entity read from the document is
   validated as strictly as a local write (one-line titles and names without control or invisible
-  format characters, real dates and timestamps, known values); a bad one is left out and reported, and a reference the index cannot hold (an unknown
+  format characters, real dates and timestamps, known values, link targets that are a card id or,
+  for a pull request, an http(s) URL); a bad one is left out and reported, and a reference the index cannot hold (an unknown
   assignee, cycle or parent) is cleared and reported. Indexing never fails on what a teammate's
   machine wrote. Only clean changes are indexed one by one: cards, comments and links that decode
   and resolve without a clash. Anything else (a principal, collection or cycle changed, a malformed
   or unresolved entity, or an index still holding something cleared or left out) rebuilds the whole
   index, so a reference cleared today returns when what it points to arrives, and an entity an
-  update made malformed leaves the index. A rebuild carries each card's local version on, so a
-  client's stale `expected_version` still fails after it.
+  update made malformed leaves the index. A card's local version goes up only when its row
+  changes, so a rebuild (even one on every import) never makes a client's version stale.
 - **Writes keep the document's values.** The index can show what the document does not hold: a
   suffixed name, a fallback key, a cleared reference. An update writes to the document only the
   fields it changed against the index row it replaced, and moves a card only when its parent
   changed, so editing a card's title never erases an assignee the index could not resolve yet.
+  The cost: clearing a field the index already shows as cleared writes nothing, so the old
+  reference returns once what it points to arrives. Clear it again then.
 - **Clashes after a merge.** When two collections share a key, two principals a name, two cycles a
   name in one collection, two cards a number in one collection, or two cards a key, the one with
   the lowest id (the first made) keeps it. The others are shown as `OPS2`, `ann2`, `Sprint 1 (2)`,

@@ -40,7 +40,8 @@ pub const PROVISIONAL_LENGTHS: [usize; 3] = [6, 8, 10];
 pub fn provisional_key(collection_key: &str, item_id: &str, len: usize) -> String {
     let hex: String = item_id.chars().filter(char::is_ascii_hexdigit).collect();
     let tail = &hex[hex.len().saturating_sub(15)..];
-    // 15 hex digits are 60 random bits, more than 22^10 needs.
+    // The last 15 hex digits: the low 32 bits are random, the rest a counter that starts at a
+    // random value each millisecond (see `uuidv7`), so even the 10-letter key is hard to guess.
     let mut bits = u64::from_str_radix(tail, 16).unwrap_or(0);
     let mut suffix = String::with_capacity(len);
     for _ in 0..len {
