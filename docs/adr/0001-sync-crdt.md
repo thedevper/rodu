@@ -214,7 +214,8 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   imported again, and operations Loro already holds are ignored by their ids. A file is
   remembered as done only once every operation in it is in the log: Loro keeps operations whose
   predecessors have not arrived pending in memory, and a saved document leaves them out, so such
-  a file is read again each time until they land. A file found invalid or damaged is remembered
+  a file is read again each time until they land. Each check replays the files still pending
+  first, so the child applies their operations exactly when this process does. A file found invalid or damaged is remembered
   and reported once; one the child could not finish (a crash or timeout) is tried again next
   time. File names are escaped before they are shown.
 - **Writing.** Under the workspace write lock, a replica exports its own operations from the
@@ -236,7 +237,9 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   is a warning, and the command, `rodu sync` included, works on what the machine has.
 - **Left for later steps.** 4b: encryption. 4c: the readable copy, `web` and `mcp` watching the
   folder while they run, compaction (today every command reads every file in the folder), and the
-  command that hands numbering to another machine. A join that fails after its principal reached
+  command that hands numbering to another machine. A file waiting on operations that never arrive
+  (its predecessor refused, or never written) is read and checked again on every command, with no
+  limit yet; `rodu sync` lists such files. A join that fails after its principal reached
   the folder leaves that principal behind; joining again under the same name then shows `bob2`.
 
 ## Proposed design for the open problems
