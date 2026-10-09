@@ -3,6 +3,8 @@
 //! order they arrive in, so they upsert, and they run inside a transaction with foreign keys
 //! deferred to its end.
 
+use std::collections::HashMap;
+
 use rodu_core::{Collection, Comment, Cycle, Item, Link, Principal, Result, Store};
 use rusqlite::params;
 
@@ -178,6 +180,14 @@ impl SqliteStore {
             params![l.id, l.from_item_id, l.kind.as_str(), l.target],
         )?;
         self.insert_link(l)
+    }
+
+    /// Each item's local version, so a rebuild can carry versions on and a client's stale
+    /// `expected_version` still fails after it.
+    pub fn item_versions(&self) -> Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare("SELECT id, version FROM items").map_err(db)?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(db)
     }
 
     /// Lets the next number in each collection follow its highest number, so a replica that takes

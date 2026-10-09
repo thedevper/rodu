@@ -12,8 +12,9 @@
 //! and a bad one is an `Err` naming the problem, never a panic.
 
 use loro::{LoroMap, LoroValue, ValueOrContainer};
+use rodu_core::clock::is_iso;
 use rodu_core::ids::is_uuid;
-use rodu_core::input::{MAX_BODY, MAX_ESTIMATE, MAX_TITLE};
+use rodu_core::input::{MAX_BODY, MAX_ESTIMATE, MAX_TITLE, check_date, is_single_line};
 use rodu_core::workflow::validate_workflow;
 use rodu_core::{Collection, Comment, Cycle, Item, Link, Principal};
 use sha2::{Digest, Sha256};
@@ -159,6 +160,33 @@ impl<'a> Reader<'a> {
         self.text_max(field, MAX_FIELD)
     }
 
+    /// One line of text people wrote, as the service accepts it: not empty, no line breaks,
+    /// control or invisible format characters (they could forge structure shown to an agent).
+    fn opt_line(&self, field: &str, max: usize) -> Result<Option<String>, String> {
+        match self.opt_text_max(field, max)? {
+            Some(s) if s.trim().is_empty() || !is_single_line(&s) => {
+                Err(self.wrong(field, "one line of text"))
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn line(&self, field: &str, max: usize) -> Result<String, String> {
+        self.opt_line(field, max)?.ok_or_else(|| format!("{}: {field} is missing", self.what))
+    }
+
+    fn stamp(&self, field: &str) -> Result<String, String> {
+        let s = self.text(field)?;
+        if is_iso(&s) { Ok(s) } else { Err(self.wrong(field, "a timestamp")) }
+    }
+
+    fn opt_date(&self, field: &str) -> Result<Option<String>, String> {
+        match self.opt_text(field)? {
+            Some(s) if check_date(&s).is_err() => Err(self.wrong(field, "a date")),
+            other => Ok(other),
+        }
+    }
+
     fn id(&self, field: &str) -> Result<String, String> {
         let id = self.text(field)?;
         if is_uuid(&id) { Ok(id) } else { Err(self.wrong(field, "an id")) }
@@ -235,10 +263,10 @@ pub fn collection(id: &str, map: &LoroMap) -> Result<Collection, String> {
     Ok(Collection {
         id: id.into(),
         key,
-        name: r.text("name")?,
-        preset: r.text("preset")?,
+        name: r.line("name", MAX_FIELD)?,
+        preset: r.line("preset", MAX_FIELD)?,
         workflow,
-        created_at: r.text("created_at")?,
+        created_at: r.stamp("created_at")?,
     })
 }
 
@@ -248,9 +276,9 @@ pub fn cycle(id: &str, map: &LoroMap) -> Result<Cycle, String> {
     Ok(Cycle {
         id: id.into(),
         collection_id: r.id("collection_id")?,
-        name: r.text("name")?,
-        starts_on: r.opt_text("starts_on")?,
-        ends_on: r.opt_text("ends_on")?,
+        name: r.line("name", MAX_FIELD)?,
+        starts_on: r.opt_date("starts_on")?,
+        ends_on: r.opt_date("ends_on")?,
         state: r.parsed("state")?,
     })
 }
@@ -259,26 +287,25 @@ pub fn cycle(id: &str, map: &LoroMap) -> Result<Cycle, String> {
 pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
     let id = Reader::new(map, "card").id("id")?;
     let r = Reader::new(map, format!("card {id}"));
-    let key = r.text_max("key", 64)?;
-    check(!key.trim().is_empty(), || format!("card {id}: empty key"))?;
+    let key = r.line("key", 64)?;
     Ok(Item {
         collection_id: r.id("collection_id")?,
         number: r.opt_number("number")?,
-        provisional_key: r.opt_text("provisional_key")?,
+        provisional_key: r.opt_line("provisional_key", 64)?,
         item_type: r.parsed("type")?,
-        title: r.text_max("title", MAX_TITLE)?,
+        title: r.line("title", MAX_TITLE)?,
         body: r.opt_text_max("body", MAX_BODY)?.unwrap_or_default(),
-        status: r.text("status")?,
+        status: r.line("status", MAX_FIELD)?,
         category: r.parsed("category")?,
         priority: r.parsed("priority")?,
         assignee_id: r.opt_id("assignee_id")?,
         parent_id,
         cycle_id: r.opt_id("cycle_id")?,
         estimate: r.opt_estimate("estimate")?,
-        rank: r.text("rank")?,
-        due_at: r.opt_text("due_at")?,
-        created_at: r.text("created_at")?,
-        updated_at: r.text("updated_at")?,
+        rank: r.line("rank", MAX_FIELD)?,
+        due_at: r.opt_date("due_at")?,
+        created_at: r.stamp("created_at")?,
+        updated_at: r.stamp("updated_at")?,
         version: 0,
         id,
         key,
@@ -294,7 +321,7 @@ pub fn comment(id: &str, map: &LoroMap) -> Result<Comment, String> {
         author_id: r.id("author_id")?,
         via_agent_id: r.opt_id("via_agent_id")?,
         body: r.text_max("body", MAX_BODY)?,
-        created_at: r.text("created_at")?,
+        created_at: r.stamp("created_at")?,
     })
 }
 
@@ -304,8 +331,8 @@ pub fn link(key: &str, map: &LoroMap) -> Result<Link, String> {
         id: r.id("id")?,
         from_item_id: r.id("from_item_id")?,
         kind: r.parsed("kind")?,
-        target: r.text_max("target", 2000)?,
-        created_at: r.text("created_at")?,
+        target: r.line("target", 2000)?,
+        created_at: r.stamp("created_at")?,
     };
     check(link_key(&l.from_item_id, l.kind.as_str(), &l.target) == key, || {
         format!("link {key}: stored under the wrong key")

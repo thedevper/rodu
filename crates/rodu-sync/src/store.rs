@@ -8,10 +8,12 @@
 //!   and `index_meta`, which holds this replica's peer id and the SHA-256 of the document file
 //!   the index matches.
 //! - `rodu.loro`: the document, as a snapshot.
-//! - `rodu.loro.next`: a new snapshot waiting for its transaction. It is written and its hash put
-//!   in `index_meta` before SQLite commits, and renamed over `rodu.loro` after. Whoever next holds
-//!   the write lock finishes or discards it by comparing hashes, so a transaction that failed to
-//!   commit never changes the document, and one that committed is never lost.
+//! - `rodu.loro.<sha256>.next`: a new snapshot waiting for its transaction. It is written and its
+//!   hash put in `index_meta` before SQLite commits, and renamed over `rodu.loro` after. Whoever
+//!   next holds the write lock finishes the one `index_meta` names and deletes any other, so a
+//!   transaction that failed to commit never changes the document, and one that committed is never
+//!   lost. The name carries the hash because the rename after the commit runs outside the lock:
+//!   a late rename can only ever move the file its own transaction wrote, or find it already gone.
 //!
 //! SQLite's write lock is also the lock on the document: every outer write transaction first
 //! reloads the document if another process changed it, so two processes never write operations
@@ -44,7 +46,9 @@ use crate::{Checker, SyncError, check_import};
 
 const DB_FILE: &str = "rodu.db";
 const DOC_FILE: &str = "rodu.loro";
-const NEXT_FILE: &str = "rodu.loro.next";
+/// A waiting snapshot is `{NEXT_PREFIX}{sha256}{NEXT_SUFFIX}`.
+const NEXT_PREFIX: &str = "rodu.loro.";
+const NEXT_SUFFIX: &str = ".next";
 const META_DOC: &str = "doc_sha256";
 const META_PEER: &str = "peer";
 /// How many entities the index holds differently from the document until something else arrives:
@@ -57,6 +61,10 @@ const META_UNSETTLED: &str = "unsettled";
 pub struct IndexReport {
     /// Cards whose index row was written.
     pub items: Vec<String>,
+    /// Comments whose index row was written.
+    pub comments: Vec<String>,
+    /// Links whose index row was written, by their document key.
+    pub links: Vec<String>,
     /// Entities left out of the index, or with a reference cleared, and why.
     pub problems: Vec<String>,
     /// Entities shown under another name or key because theirs was taken.
@@ -102,6 +110,8 @@ pub struct LoroStore {
     last_report: RefCell<IndexReport>,
     /// Counts unsettled entities during a full index (see [`META_UNSETTLED`]).
     unsettled: Cell<usize>,
+    /// Tree nodes [`LoroStore::load_nodes`] could not map to a card, and why.
+    node_problems: RefCell<Vec<String>>,
 }
 
 fn internal(error: impl Display) -> RoduError {
@@ -206,6 +216,7 @@ impl LoroStore {
             depth: Cell::new(0),
             last_report: RefCell::new(IndexReport::default()),
             unsettled: Cell::new(0),
+            node_problems: RefCell::new(Vec::new()),
         };
         store.sql.transaction(TxMode::Write, || {
             let peer = match store.sql.index_meta(META_PEER)? {
@@ -272,8 +283,8 @@ impl LoroStore {
         self.dir.join(DOC_FILE)
     }
 
-    fn next_path(&self) -> PathBuf {
-        self.dir.join(NEXT_FILE)
+    fn next_path(&self, hash: &str) -> PathBuf {
+        self.dir.join(format!("{NEXT_PREFIX}{hash}{NEXT_SUFFIX}"))
     }
 
     /// Brings the document and the index in line, under the write lock: finishes or discards a
@@ -281,15 +292,25 @@ impl LoroStore {
     /// index if it does not match the document.
     fn settle(&self) -> Result<()> {
         let meta = self.sql.index_meta(META_DOC)?;
-        let next = self.next_path();
-        match fs::read(&next) {
-            Ok(bytes) if meta.as_deref() == Some(sha256(&bytes).as_str()) => {
-                ignore_missing(fs::rename(&next, self.doc_path()), &next)?;
-                sync_dir(&self.dir)?;
+        let committed = meta.as_deref().map(|hash| self.next_path(hash));
+        for entry in fs::read_dir(&self.dir).map_err(|e| io(e, &self.dir))? {
+            let path = entry.map_err(|e| io(e, &self.dir))?.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if !(name.starts_with(NEXT_PREFIX) && name.ends_with(NEXT_SUFFIX)) {
+                continue;
             }
-            Ok(_) => ignore_missing(fs::remove_file(&next), &next)?,
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(io(e, &next)),
+            let finish = Some(&path) == committed.as_ref()
+                && match fs::read(&path) {
+                    Ok(bytes) => meta.as_deref() == Some(sha256(&bytes).as_str()),
+                    Err(e) if e.kind() == ErrorKind::NotFound => false,
+                    Err(e) => return Err(io(e, &path)),
+                };
+            if finish {
+                ignore_missing(fs::rename(&path, self.doc_path()), &path)?;
+            } else {
+                ignore_missing(fs::remove_file(&path), &path)?;
+            }
+            sync_dir(&self.dir)?;
         }
         if self.loaded.borrow().as_ref() == Some(&meta) {
             return Ok(());
@@ -339,17 +360,35 @@ impl LoroStore {
         Ok(())
     }
 
-    /// Maps every card id to its node; if a document holds one id twice, the lowest node wins.
+    /// Maps every card id to its node. If a document holds one id in several nodes, a node whose
+    /// fields make a card wins over one whose do not, then the lowest node. Nodes left out are
+    /// kept in `node_problems`.
     fn load_nodes(&self) {
         let doc = self.doc.borrow();
         let tree = doc.get_tree(ITEMS);
+        let rank = |node: TreeID| {
+            let valid = tree.get_meta(node).is_ok_and(|meta| layout::item(&meta, None).is_ok());
+            (!valid, node)
+        };
         let mut nodes: HashMap<String, TreeID> = HashMap::new();
+        let mut problems = Vec::new();
         for node in tree.get_nodes(false) {
-            if let Some(id) = meta_id(&tree, node.id) {
-                nodes.entry(id).and_modify(|n| *n = (*n).min(node.id)).or_insert(node.id);
+            let Some(id) = meta_id(&tree, node.id) else {
+                problems.push(format!("tree node {}: no card id", node.id));
+                continue;
+            };
+            if let Some(kept) = nodes.get_mut(&id) {
+                let (win, lose) =
+                    if rank(node.id) < rank(*kept) { (node.id, *kept) } else { (*kept, node.id) };
+                *kept = win;
+                problems.push(format!("card {id}: also in tree node {lose}, left out"));
+            } else {
+                nodes.insert(id, node.id);
             }
         }
+        problems.sort();
         *self.nodes.borrow_mut() = nodes;
+        *self.node_problems.borrow_mut() = problems;
     }
 
     /// Discards in-memory document changes by reloading the file the index matches.
@@ -369,7 +408,7 @@ impl LoroStore {
         doc.commit();
         let bytes = doc.export(ExportMode::Snapshot).map_err(internal)?;
         let hash = sha256(&bytes);
-        write_durably(&self.next_path(), &bytes)?;
+        write_durably(&self.next_path(&hash), &bytes)?;
         sync_dir(&self.dir)?;
         self.sql.set_index_meta(META_DOC, &hash)?;
         Ok(hash)
@@ -460,11 +499,12 @@ impl LoroStore {
         let mut report = IndexReport::default();
         self.unsettled.set(0);
         self.sql.defer_foreign_keys()?;
+        let versions = self.sql.item_versions()?;
         self.sql.clear_shared()?;
         self.index_principals(&mut report)?;
         self.index_collections(&mut report)?;
         self.index_cycles(&mut report)?;
-        self.index_all_items(&mut report)?;
+        self.index_all_items(&versions, &mut report)?;
         let doc = self.doc.borrow();
         for id in map_keys(&doc, COMMENTS) {
             self.index_comment(&doc, &id, &mut report)?;
@@ -484,7 +524,12 @@ impl LoroStore {
     fn index_touched(&self, touched: &Touched) -> Result<IndexReport> {
         let unsettled: usize =
             self.sql.index_meta(META_UNSETTLED)?.and_then(|n| n.parse().ok()).unwrap_or(0);
-        if unsettled > 0 || touched.principals || touched.collections || touched.cycles {
+        if unsettled > 0
+            || touched.principals
+            || touched.collections
+            || touched.cycles
+            || !self.node_problems.borrow().is_empty()
+        {
             return self.index_all();
         }
         let mut report = IndexReport::default();
@@ -629,15 +674,27 @@ impl LoroStore {
         Ok(clean)
     }
 
-    fn put_item(&self, mut item: Item, replace_text: bool, report: &mut IndexReport) -> Result<()> {
-        item.version = self.sql.get_item(&item.id)?.map_or(1, |old| old.version + 1);
+    /// Writes a card's row; `prior` is the version its row had, if it had one.
+    fn put_item(
+        &self,
+        mut item: Item,
+        prior: Option<i64>,
+        replace_text: bool,
+        report: &mut IndexReport,
+    ) -> Result<()> {
+        item.version = prior.map_or(1, |v| v + 1);
         self.sql.put_item(&item, replace_text)?;
         report.items.push(item.id);
         Ok(())
     }
 
     /// Indexes every card, giving each a unique key and alias by the lowest-id rule.
-    fn index_all_items(&self, report: &mut IndexReport) -> Result<()> {
+    fn index_all_items(
+        &self,
+        versions: &HashMap<String, i64>,
+        report: &mut IndexReport,
+    ) -> Result<()> {
+        report.problems.extend(self.node_problems.borrow().iter().cloned());
         let mut items = Vec::new();
         {
             let doc = self.doc.borrow();
@@ -667,7 +724,8 @@ impl LoroStore {
         self.sql.park_names(Parked::Items)?;
         self.sql.clear_item_text()?;
         for item in kept {
-            self.put_item(item, false, report)?;
+            let prior = versions.get(&item.id).copied();
+            self.put_item(item, prior, false, report)?;
         }
         Ok(())
     }
@@ -717,14 +775,18 @@ impl LoroStore {
             }
         }
         for item in items {
-            self.put_item(item, true, report)?;
+            let prior = self.sql.get_item(&item.id)?.map(|old| old.version);
+            self.put_item(item, prior, true, report)?;
         }
         Ok(true)
     }
 
     /// Indexes one comment; false if it was left out or changed.
     fn index_comment(&self, doc: &LoroDoc, id: &str, report: &mut IndexReport) -> Result<bool> {
-        let Some(map) = map_child(&doc.get_map(COMMENTS), id) else { return Ok(true) };
+        let Some(map) = map_child(&doc.get_map(COMMENTS), id) else {
+            report.problems.push(format!("comment {id}: not a map"));
+            return Ok(false);
+        };
         let mut c = match layout::comment(id, &map) {
             Ok(c) => c,
             Err(problem) => {
@@ -745,15 +807,20 @@ impl LoroStore {
             clean = false;
         }
         self.sql.put_comment(&c)?;
+        report.comments.push(c.id);
         Ok(clean)
     }
 
     /// Indexes one link; false if it was left out.
     fn index_link(&self, doc: &LoroDoc, key: &str, report: &mut IndexReport) -> Result<bool> {
-        let Some(map) = map_child(&doc.get_map(LINKS), key) else { return Ok(true) };
+        let Some(map) = map_child(&doc.get_map(LINKS), key) else {
+            report.problems.push(format!("link {key}: not a map"));
+            return Ok(false);
+        };
         match layout::link(key, &map) {
             Ok(l) if self.sql.get_item(&l.from_item_id)?.is_some() => {
                 self.sql.put_link(&l)?;
+                report.links.push(key.to_owned());
                 Ok(true)
             }
             Ok(_) => {
@@ -935,7 +1002,7 @@ impl Store for LoroStore {
         self.pending.borrow_mut().clear();
         match (&result, staged.take()) {
             (Ok(_), Some(hash)) => {
-                let next = self.next_path();
+                let next = self.next_path(&hash);
                 // If this rename fails, whoever next takes the write lock finishes it.
                 let _ = ignore_missing(fs::rename(&next, self.doc_path()), &next)
                     .and_then(|()| sync_dir(&self.dir));
@@ -944,8 +1011,8 @@ impl Store for LoroStore {
                 result
             }
             (Err(_), staged) if staged.is_some() || self.dirty.get() => {
-                if staged.is_some() {
-                    let next = self.next_path();
+                if let Some(hash) = staged {
+                    let next = self.next_path(&hash);
                     let _ = ignore_missing(fs::remove_file(&next), &next);
                 }
                 // The in-memory document may hold changes the index does not: start again from
