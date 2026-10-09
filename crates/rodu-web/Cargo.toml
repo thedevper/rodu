@@ -8,7 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-rodu-api = { version = "0.1.0", path = "../rodu-api" }
+rodu-api = { version = "0.3.0", path = "../rodu-api" }
 
 # The board itself only runs in the browser; on the host only the pure board logic builds, so
 # `cargo test -p rodu-web` stays fast and needs no browser.
