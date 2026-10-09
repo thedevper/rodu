@@ -142,11 +142,37 @@ Loro:
    merged writes silently. Parent cycles are broken as described above.
 4. **`expected_version`** stays a local optimistic check on this replica. It no longer means a
    global version.
-5. **Transport layout.** Each peer appends update files under
-   `sync/<peer-id>/<sequence>.update`, and a periodic compaction writes a snapshot. The same
-   folder works in Git, S3 or a synced drive. A relay can come later as a faster path for the
-   same files.
-6. **Identity.** Each person's replica has its own client id, and agents write through their
+5. **Transport (decided 2026-10-09: a shared folder first).** The team's sync folder is one it
+   already shares: Google Drive, Dropbox, OneDrive, iCloud Drive or Syncthing. Each peer appends
+   update files under `sync/<peer-id>/<sequence>.update`, and a periodic compaction writes a
+   snapshot. Rodu never talks to those services; their own apps move the files. A self-hosted
+   `rodu relay` comes later, for teams that want changes to arrive in under a second, carrying the
+   same files. Git or S3 can carry them too.
+6. **Sync is automatic (decided 2026-10-09).** Nobody runs a sync command in normal use:
+   - every CLI command imports what is new in the folder before it runs and writes its own update
+     file right after;
+   - `rodu web` and `rodu mcp` watch the folder while they run, so a teammate's change appears on
+     the board without a refresh;
+   - offline work stays local and goes out the next time a command or the board runs.
+
+   `rodu sync` remains for running a sync by hand and for diagnosing one.
+7. **Joining a team.** `rodu team create --folder <path>` turns a workspace into a team workspace
+   and prints an invite code holding the workspace id and, when encrypted, the team key.
+   `rodu team join <code> --folder <path>` sets up a teammate's replica from the folder. The invite
+   code is a secret when it holds a key, and the CLI says so.
+8. **Encryption is the team's choice (decided 2026-10-09).** `team create` takes `--encrypt` or
+   `--no-encrypt` and asks when neither is given, so there is no silent default.
+   - Encrypted: each update file and snapshot is sealed with the team key (an authenticated
+     cipher, so a changed file is refused, not merged), and the folder's provider cannot read the
+     board.
+   - Not encrypted: the files are plain Loro updates. They are still binary, not something a
+     person reads in Drive.
+   - `--readable-copy`, on either setting, also keeps a plain Markdown copy of the board (one file
+     per card) in the folder, for reading it from Drive or a phone. That copy is never encrypted,
+     and `team create` warns that anyone with access to the folder can read it.
+   - Turning encryption on later re-keys from that point. Earlier plain files may survive in the
+     provider's file history, and the CLI says so.
+9. **Identity.** Each person's replica has its own peer id, and agents write through their
    owner's replica, as `via_agent_id` records today.
 
 ## Next steps
@@ -158,7 +184,10 @@ Loro:
    peer is the only peer and every card is numbered immediately, as today.
 3. Build a Loro-backed store implementing `Store`, keeping the SQLite index in sync from the
    document's change events, and run the existing service tests against it.
-4. Add a `rodu sync <folder>` command for the shared-folder transport, and test it with two
-   workspaces in CI on macOS and Windows.
-5. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
+4. Shared-folder transport with automatic sync, `rodu team create` and `rodu team join`, and
+   the encryption and readable-copy options. Test it with two and three workspaces on one folder
+   in CI on macOS and Windows, including a folder app's conflict copies (`file (1).update`) and
+   half-written files.
+5. Later: `rodu relay` for live sync.
+6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.
