@@ -74,17 +74,12 @@ pub struct RunningServer {
     pub token: String,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<std::io::Result<()>>,
-    /// The live sync timer, stopped on close.
-    ticker: Option<JoinHandle<()>>,
 }
 
 impl RunningServer {
     /// Stops accepting connections and lets in-flight requests finish, for up to five seconds;
     /// a client that stalls longer is cut off so Ctrl+C always exits.
     pub async fn close(self) -> std::io::Result<()> {
-        if let Some(ticker) = &self.ticker {
-            ticker.abort();
-        }
         let _ = self.shutdown.send(());
         let abort = self.task.abort_handle();
         match tokio::time::timeout(SHUTDOWN_GRACE, self.task).await {
@@ -162,24 +157,23 @@ where
         live: options.live.as_ref().map(|live| Live::new(Arc::clone(&live.sync))),
         revision: AtomicU64::new(0),
     });
-    let ticker = options.live.map(|live| tokio::spawn(tick(Arc::clone(&app), live.every)));
+    // The live sync timer runs in the server's own task, so it stops with the server.
+    let ticking = options.live.map(|live| (Arc::clone(&app), live.every));
     let router = Router::new().fallback(handle::<S>).with_state(app);
     let (shutdown, signal) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                let _ = signal.await;
-            })
-            .await
+        let serve = axum::serve(listener, router).with_graceful_shutdown(async {
+            let _ = signal.await;
+        });
+        match ticking {
+            None => serve.await,
+            Some((app, every)) => tokio::select! {
+                served = serve => served,
+                () = tick(app, every) => Ok(()),
+            },
+        }
     });
-    Ok(RunningServer {
-        url: format!("http://127.0.0.1:{port}/"),
-        port,
-        token,
-        shutdown,
-        task,
-        ticker,
-    })
+    Ok(RunningServer { url: format!("http://127.0.0.1:{port}/"), port, token, shutdown, task })
 }
 
 /// Pulls and pushes every `every` while the server runs, under the service lock like a request.
