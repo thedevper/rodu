@@ -783,7 +783,7 @@ impl TeamFolder {
             .collect();
         let refused_note = store.local_note(NOTE_AUTHORITY_REFUSED)?.unwrap_or_default();
         let mut refused: BTreeSet<String> = refused_note.lines().map(str::to_owned).collect();
-        let (before, refused_before) = (records.len(), refused.len());
+        let refused_before = refused.len();
         for (key, text) in store.authority()? {
             if records.get(&key).is_some_and(|r| r.text() == text) {
                 continue;
@@ -804,8 +804,8 @@ impl TeamFolder {
         }
         let Some((_, root)) = &self.signing else { return Ok(Vec::new()) };
         let kept = authority::worth_keeping(*root, records.into_values().collect());
-        if kept.len() != before {
-            let lines: Vec<&str> = kept.iter().map(Record::text).collect();
+        let lines: Vec<&str> = kept.iter().map(Record::text).collect();
+        if lines.join("\n") != noted {
             store.set_local_note(NOTE_AUTHORITY, &lines.join("\n"))?;
         }
         if refused.len() != refused_before {
