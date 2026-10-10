@@ -331,12 +331,13 @@ Where 3b differs from the text above, 3b is what holds.
   replica folder: `{"format": 1, "publicKey", "exchangeKey", "signature"}`, signed over
   `"rodu-exchange-1" 0x00 || workspace id length (u64 LE) || workspace id || peer id (u64 LE) ||
   exchange key`. It writes the file with its join request and again on any pull that finds it
-  missing or not its own. A key is wrapped for a machine only when the signer of its exchange
-  file is a key admitted for that very replica folder.
+  missing or not its own. A key is wrapped for a machine only when the signer of its exchange file
+  is a key admitted for that very replica folder, and never for a low-order point (which no wrap
+  can be made for); a machine whose key cannot take a wrap is skipped, never holding up the
+  others.
 - **Key generations and key records.** The invite code's key is generation 0. `rodu team rekey
-  --yes` (owner or admin) makes a random key of the next generation (one more than the highest a
-  key record that counts names, or than this machine holds; a record that does not count, such as
-  one a revoked admin signs afterwards, never uses up the generations) and names it in a signed
+  --yes` (owner or admin) makes a random key of the next generation, one more than the newest this
+  machine holds (two keys of one generation are settled by their checks) and names it in a signed
   authority record, `key.<generation>.<key check>.<signer key>.<signature>`, where the key check
   is the team file's `keyCheck` computed for the new key. The record goes in the `authority` map
   and the authority file like the others, counts while its signer is the owner or an admin, and is
@@ -357,16 +358,19 @@ Where 3b differs from the text above, 3b is what holds.
   hashes), so a wrap someone changed is made afresh. The file is plain because a machine needs no
   team key to read it. It shows the folder's provider the recipients' peer ids (already the
   replica folders' names) and how often the key changed.
-- **Taking a key.** A pull first unwraps what is wrapped for this machine. It tries at most 64
-  new entries per file, so a planted file cannot make it run X25519 without end. It keeps a key
-  only when the key matches the entry's check and a key record that counts names that generation
-  and check. Until then the key only opens the folder's small files (authority, seen and exchange
-  files, whose content counts by its own signatures). That way a record sealed with the new key
-  is read, and the key itself never seals anything. Kept keys go in `.rodu/team-keys` (one
-  `<generation>.<check>.<key>` per line, mode 0600, zeroized in memory, never in `config.json`);
-  `team.key` keeps the invite code's key. A machine seals with the newest key it holds (the
-  lowest check first when two records name one generation, so every machine picks the same) and
-  opens a file with whichever key it holds that opens it.
+- **Taking a key.** A pull first unwraps what is wrapped for this machine. It tries at most 64 new
+  entries per file, so a planted file cannot make it run X25519 without end. It keeps a key only
+  when the key matches the entry's check and a key record that counts names that generation and
+  check, and only as a chain: a key one generation past the newest this machine holds (or of the
+  same generation), taken oldest first. So no record, however high its generation, becomes the
+  newest key without the ones before it: an admin cannot use up the generations, or stay the key
+  everyone seals with after it is revoked and removed. Until then the key only opens the folder's
+  small files (authority, seen and exchange files, whose content counts by its own signatures).
+  That way a record sealed with the new key is read, and the key itself never seals anything. Kept
+  keys go in `.rodu/team-keys` (one `<generation>.<check>.<key>` per line, mode 0600, zeroized in
+  memory, never in `config.json`); `team.key` keeps the invite code's key. A machine seals with
+  the newest key it holds (the lowest check first when two records name one generation, so every
+  machine picks the same) and opens a file with whichever key it holds that opens it.
 - **A file no key opens yet waits.** A sealed file that does not open with any key this machine
   holds is said once ("does not open with any team key this machine holds") and read again once
   the machine holds another key. Before 3b it was refused for good. Now a file sealed with a key

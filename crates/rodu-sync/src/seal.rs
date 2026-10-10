@@ -100,6 +100,12 @@ pub fn exchange_public(secret: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
     MontgomeryPoint::mul_base_clamped(*secret).to_bytes()
 }
 
+/// Whether `public` is an X25519 key a wrap can be made for: not a low-order point, which X25519
+/// with any (clamped, so a multiple of 8) secret takes to all zero.
+pub fn usable_exchange(public: &[u8; KEY_LEN]) -> bool {
+    shared(&[1u8; KEY_LEN], public).is_some()
+}
+
 /// X25519 of `secret` and `public`; `None` when it is all zero (`public` is a low-order point,
 /// so the result would not depend on the secret).
 fn shared(secret: &[u8; KEY_LEN], public: &[u8; KEY_LEN]) -> Option<Zeroizing<[u8; KEY_LEN]>> {
@@ -316,6 +322,8 @@ mod tests {
         let mut one = [0u8; KEY_LEN];
         one[0] = 1;
         assert!(shared_is_refused(&alice, &one));
+        assert!(!usable_exchange(&[0u8; KEY_LEN]) && !usable_exchange(&one));
+        assert!(usable_exchange(&exchange_public(&bob)));
     }
 
     fn shared_is_refused(secret: &[u8; KEY_LEN], public: &[u8; KEY_LEN]) -> bool {
