@@ -820,7 +820,7 @@ fn symlinks_in_the_copy_are_never_followed() {
 fn members_lists_each_person_with_their_agents_and_machines() {
     let team = team();
     let bob = join(&team, "bob");
-    let (ann_id, bob_id) = (machine(&team.ann), machine(&bob));
+    let (ann_id, bob_id) = (&machine(&team.ann)[..8], &machine(&bob)[..8]);
     ok(&team.ann, &["sync"]);
     let list = ok(&team.ann, &["team", "members"]);
     let ann_at = list.find("ann\n").expect(&list);
@@ -845,7 +845,7 @@ fn a_replica_folder_nobody_claims_is_an_unknown_machine() {
     std::fs::create_dir_all(team.folder.join("sync/not-a-machine")).unwrap();
     let list = ok(&team.ann, &["team", "members"]);
     assert!(list.contains("Unknown machines"), "{list}");
-    assert!(list.contains("00000000000000ab"), "{list}");
+    assert!(list.contains("machine 00000000\n"), "shown by its folder's first 8 digits: {list}");
     assert!(!list.contains("not-a-machine"), "only replica folders are machines: {list}");
 }
 
@@ -862,8 +862,8 @@ fn join_as_adds_a_second_machine_for_someone_already_on_the_team() {
     let list = ok(&bob, &["team", "members"]);
     assert!(!list.contains("bob2"), "no second bob: {list}");
     let bob_section = &list[list.find("bob\n").expect(&list)..];
-    assert!(bob_section.contains(&machine(&bob)), "{list}");
-    assert!(bob_section.contains(&machine(&laptop)), "{list}");
+    assert!(bob_section.contains(&machine(&bob)[..8]), "{list}");
+    assert!(bob_section.contains(&machine(&laptop)[..8]), "{list}");
     // Cards made on the laptop are bob's.
     ok(&laptop, &["add", "From the laptop", "--assignee", "me"]);
     ok(&bob, &["sync"]);
@@ -895,4 +895,29 @@ fn join_as_someone_not_on_the_team_or_an_agent_is_refused_and_writes_nothing() {
     assert!(both.err.contains("not both"), "{}", both.err);
     assert!(!dir.join(".rodu").exists());
     assert_eq!(std::fs::read_dir(team.folder.join("sync")).unwrap().count(), before);
+}
+
+#[test]
+fn a_machine_whose_entry_is_missing_or_wrong_records_itself_on_its_next_command() {
+    use rodu_core::store::Store;
+    let team = team();
+    let bob = join(&team, "bob");
+    let bob_id = machine(&bob);
+    // As a team made before the document listed members, or a machine that overwrote the
+    // entry, would leave it: bob's machine is recorded as someone else's.
+    {
+        let store = rodu_sync::LoroStore::open(&bob.join(".rodu")).unwrap();
+        let ann = store.list_principals().unwrap().into_iter().find(|p| p.name == "ann").unwrap();
+        let peer = u64::from_str_radix(&bob_id, 16).unwrap();
+        store.set_member(peer, &ann.id).unwrap();
+        assert_eq!(store.members().unwrap().get(&peer), Some(&ann.id));
+    }
+    // Any command puts it right, and it reaches ann.
+    ok(&bob, &["ls"]);
+    ok(&team.ann, &["sync"]);
+    let list = ok(&team.ann, &["team", "members"]);
+    let bob_section = &list[list.find("bob\n").expect(&list)..];
+    assert!(bob_section.contains(&format!("machine {}", &bob_id[..8])), "{list}");
+    let ann_section = &list[..list.find("bob\n").unwrap()];
+    assert!(!ann_section.contains(&bob_id[..8]), "{list}");
 }

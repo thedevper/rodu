@@ -36,8 +36,9 @@ Three steps, each shippable alone.
   so they need no entry of their own.
 - `team join --as <name>` joins a second machine for a person already on the team: it adds this
   peer under that existing principal instead of creating `bob2`.
-- `rodu team members` lists each person with their agents and their machines (the full peer id,
-  as `rodu team` shows it; marks this machine and the numbering machine). A replica folder whose peer is in no entry is
+- `rodu team members` lists each person with their agents and their machines (short peer id:
+  the first 8 hex digits, which the replica folder's name starts with, or all 16 when two listed
+  machines share them; marks this machine and the numbering machine). A replica folder whose peer is in no entry is
   listed as "unknown machine". The readable copy and `rodu team` do not change.
 - This is a claim, not proof: anyone who can write to the folder can write an entry. The command
   says so until step 2 is in.

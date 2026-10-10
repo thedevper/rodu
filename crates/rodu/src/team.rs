@@ -507,6 +507,15 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     };
     let mut principals = ws.service.store.list_principals()?;
     principals.sort_by(|a, b| a.name.cmp(&b.name));
+    // Replica folders are named by peer id; anything else in sync/ is not a machine.
+    let folders: BTreeSet<u64> = std::fs::read_dir(Path::new(&team.folder).join(SYNC_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(rodu_sync::folder::parse_peer_dir))
+        .collect();
+    let all: BTreeSet<u64> = members.keys().chain(&folders).copied().collect();
+    let short = |peer: u64| short_peer(peer, &all);
     let mut claimed = BTreeSet::new();
     for person in principals.iter().filter(|p| p.kind == PrincipalKind::Human) {
         (io.out)(&person.name);
@@ -533,28 +542,19 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
             .flatten()
             .collect();
             (io.out)(&if marks.is_empty() {
-                format!("  machine {peer:016x}")
+                format!("  machine {}", short(peer))
             } else {
-                format!("  machine {peer:016x} ({})", marks.join(", "))
+                format!("  machine {} ({})", short(peer), marks.join(", "))
             });
         }
     }
-    // Replica folders are named by peer id; anything else in sync/ is not a machine.
-    let unknown: Vec<u64> = std::fs::read_dir(Path::new(&team.folder).join(SYNC_DIR))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| e.file_name().to_str().and_then(rodu_sync::folder::parse_peer_dir))
-        .filter(|peer| !claimed.contains(peer))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let unknown: Vec<u64> = folders.difference(&claimed).copied().collect();
     if !unknown.is_empty() {
         (io.out)(
             "Unknown machines (writing to the folder, but no person on the team claims them):",
         );
         for peer in unknown {
-            (io.out)(&format!("  machine {peer:016x}"));
+            (io.out)(&format!("  machine {}", short(peer)));
         }
     }
     (io.out)(
@@ -563,6 +563,14 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     );
     after(io, &ws);
     Ok(())
+}
+
+/// A machine as `rodu team members` shows it: the first 8 hex digits of its peer id, which its
+/// replica folder's name starts with, or all 16 when another machine listed shares those 8.
+fn short_peer(peer: u64, all: &BTreeSet<u64>) -> String {
+    let full = format!("{peer:016x}");
+    let shared = all.iter().any(|other| *other != peer && other >> 32 == peer >> 32);
+    if shared { full } else { full[..8].to_owned() }
 }
 
 fn folder_arg(io: &Io<'_>, args: &Args) -> Result<PathBuf> {
@@ -987,6 +995,14 @@ mod tests {
         };
         let store = AnyStore::Team(Box::new(LoroStore::open(dir).unwrap()));
         (config, RoduService::new(store).with_numbering(numbering))
+    }
+
+    #[test]
+    fn a_machine_is_shown_by_8_hex_digits_unless_another_shares_them() {
+        let all =
+            BTreeSet::from([0x3f9a_12bc_0000_0001, 0x3f9a_12bc_0000_0002, 0x0000_00ab_0000_0000]);
+        assert_eq!(short_peer(0x0000_00ab_0000_0000, &all), "000000ab");
+        assert_eq!(short_peer(0x3f9a_12bc_0000_0001, &all), "3f9a12bc00000001");
     }
 
     #[test]
