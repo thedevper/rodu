@@ -326,7 +326,27 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   - Two machines taking over at once, or an old-format team's creator naming itself while a
     take-over is still on its way, are settled by the document: one value wins on every replica,
     and the other machine stops numbering when it syncs.
-- **Left for later steps.** 4c: the readable copy. Live sync polls on a timer rather than watching the file system, and an open
+- **The readable copy (built 2026-10-10, step 4c).** A team can keep a plain Markdown copy of
+  its board in `<folder>/readable/`, for reading from Drive or a phone: one `<KEY>.md` per card
+  (fields, description, links, comments) and an `index.md` by collection and status. It is a
+  setting in the team document (`team`.`readable_copy`; only `true` is on), turned on with
+  `rodu team create --readable-copy` or `rodu team readable-copy on` by any member, and off with
+  `off`. Turning it on always warns that the copy is never encrypted, also for an encrypted team.
+  - Only the numbering machine writes it, so folder apps never see two writers. It renders after
+    each pull, write and live tick, but skips the work while the document version it last
+    rendered from is unchanged, and rewrites only files whose content changed (temp file, then
+    rename).
+  - File names come only from card keys filtered to ASCII letters, digits and `-`, so card text
+    never chooses where a file goes. The copy's folder is made only inside a team folder that is
+    there; an unmounted folder is never recreated.
+  - Rodu overwrites or deletes only what it wrote: `readable/.rodu-readable.json` records each
+    file and the SHA-256 of what was written, and names in it must be ones Rodu could have
+    written. A file that no longer matches (edited by a person) is left alone with a warning, and
+    other files in the folder are never touched. Turning the copy off removes Rodu's files and
+    the folder if it is then empty.
+  - Problems writing the copy are warnings; the pull never reads `readable/`. Changes made to the
+    copy are not read back.
+- **Left for later steps.** Live sync polls on a timer rather than watching the file system, and an open
   item panel shows a teammate's change only when it is opened again. A file waiting on operations that never arrive
   (its predecessor refused, or never written) is read and checked again on every command, with no
   limit yet; `rodu sync` lists such files. Held files count toward the import cap of each later
@@ -389,7 +409,7 @@ provider cannot read the board.
   accepts. It protects what the board says, not whether it syncs: whoever can write to the
   folder can still delete files, put back old ones (harmless, since operations already held
   are ignored) or stop the sync, and that is not detected.
-- **Left for later.** The readable copy (4c). Turning encryption on or off for an existing team,
+- **Left for later.** Turning encryption on or off for an existing team,
   and changing the key, which needs a new team today. On Windows, `team.key` relies on the
   user profile's permissions, since there is no 0600.
 
@@ -467,7 +487,7 @@ provider cannot read the board.
    (encryption) are done, described under "The team folder" and "Encrypted teams" above; 4c
    adds the readable copy, live watching in `web` and `mcp`, compaction and the numbering
    hand-over. Compaction is done, with the `stat` skip, and so are live sync in `web` and `mcp`
-   and the numbering hand-over, all under "The team folder". The readable copy is left.
+   the numbering hand-over and the readable copy, all under "The team folder". Step 4 is done.
 5. Later: `rodu relay` for live sync.
 6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.
