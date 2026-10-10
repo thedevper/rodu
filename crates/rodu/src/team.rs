@@ -151,20 +151,20 @@ pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
         warn(io, &format!("numbering new cards: {}", e.message));
     }
     if let Some(team) = &ws.config.team {
-        refresh_copy(team, &ws.service).iter().for_each(|line| warn(io, line));
+        refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
     }
 }
 
 /// Brings the team's readable copy up to date, or removes it once it is turned off. Only the
 /// numbering machine writes it, and only into a team folder that is there.
-fn refresh_copy(team: &TeamConfig, service: &RoduService<AnyStore>) -> Vec<String> {
+fn refresh_copy(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> Vec<String> {
     let Some(store) = service.store.team() else { return Vec::new() };
     let root = Path::new(&team.folder);
     if !service.numbering() || !root.join(SYNC_DIR).is_dir() {
         return Vec::new();
     }
     match store.readable_copy() {
-        Ok(on) => readable::refresh(root, service, on, &store.version()),
+        Ok(on) => readable::refresh(root, dir, service, on, &store.version()),
         Err(e) => vec![format!("readable copy: {}", e.message)],
     }
 }
@@ -239,7 +239,7 @@ pub(crate) fn after(io: &mut Io<'_>, ws: &Workspace) {
         Ok(pushed) => pushed.warnings.iter().for_each(|line| warn(io, line)),
         Err(e) => warn(io, &format!("{} (your changes stay here and go out next time)", e.message)),
     }
-    refresh_copy(team, &ws.service).iter().for_each(|line| warn(io, line));
+    refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
 }
 
 /// After `web` or `mcp` stop: their store is gone, so the workspace is opened again to push.
@@ -302,14 +302,14 @@ impl LiveSync<AnyStore> for FolderLive {
                 Err(e) => pulled.warnings.push(format!("numbering new cards: {}", e.message)),
             }
         }
-        pulled.warnings.extend(refresh_copy(&self.team, service));
+        pulled.warnings.extend(refresh_copy(&self.dir, &self.team, service));
         Ok(pulled)
     }
 
     fn push(&self, service: &RoduService<AnyStore>) -> Result<Vec<String>> {
         let Some(store) = service.store.team() else { return Ok(Vec::new()) };
         let mut warnings = team_folder(&self.dir, &self.team)?.push(store)?.warnings;
-        warnings.extend(refresh_copy(&self.team, service));
+        warnings.extend(refresh_copy(&self.dir, &self.team, service));
         Ok(warnings)
     }
 }
@@ -361,7 +361,7 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
             "could not send your changes"
         }
     };
-    refresh_copy(team, &ws.service).iter().for_each(|line| warn(io, line));
+    refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
     (io.out)(&format!(
         "Imported {} file(s), {} still arriving; numbered {numbered} card(s); {sent}",
         report.batch.imported.len(),
@@ -609,7 +609,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
         (io.out)(READABLE_WARNING);
         let ws = open(io, false)?;
         if let Some(team) = &ws.config.team {
-            refresh_copy(team, &ws.service).iter().for_each(|line| warn(io, line));
+            refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
         }
     }
     Ok(())
@@ -635,6 +635,7 @@ pub(crate) fn readable_copy(io: &mut Io<'_>, setting: Option<&String>) -> Result
     if store.readable_copy()? != on {
         store.set_readable_copy(on)?;
     }
+    // after() pushes and brings the copy up to date; its problems are warnings, said above.
     after(io, &ws);
     if on {
         (io.out)(READABLE_WARNING);
@@ -642,7 +643,10 @@ pub(crate) fn readable_copy(io: &mut Io<'_>, setting: Option<&String>) -> Result
     (io.out)(match (on, ws.service.numbering()) {
         (true, true) => "Readable copy: on, kept by this machine",
         (true, false) => "Readable copy: on; the numbering machine writes it when it next syncs",
-        (false, true) => "Readable copy: off; the files Rodu wrote were removed",
+        (false, true) => {
+            "Readable copy: off; this machine removed the files it wrote (any it kept are named \
+             in the warnings above)"
+        }
         (false, false) => "Readable copy: off; the numbering machine removes it when it next syncs",
     });
     Ok(())

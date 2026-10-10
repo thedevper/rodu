@@ -339,13 +339,19 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   - File names come only from card keys filtered to ASCII letters, digits and `-`, so card text
     never chooses where a file goes. The copy's folder is made only inside a team folder that is
     there; an unmounted folder is never recreated.
-  - Rodu overwrites or deletes only what it wrote. `readable/.rodu-readable.json` records each
-    file and the SHA-256 of what was written, but anyone who can write to the folder can write
-    that record too, so a file must also have a card key's shape (or be `index.md`), be a plain
-    file, and start with the heading Rodu writes under that name. A person's own file, an edited
-    copy or a symlink is left alone with a warning. The copy's folder must be a plain folder, not
-    a symlink, and files are written through a temp file created new, so a planted symlink is
-    never followed. Turning the copy off removes Rodu's files and the folder if it is then empty.
+  - Rodu removes only files this machine wrote. Its record of them, with the SHA-256 of what
+    was written, is kept in the workspace (`.rodu/readable-copy.json`), out of reach of anyone who
+    can only write to the folder. The folder holds a second record, `readable/.rodu-readable.json`,
+    so the next numbering machine after a hand-over can keep the copy up to date. Anyone with the
+    folder can forge that one, so it only allows overwriting a card file with fresh content, never
+    removing one: a forged entry can at worst get a file that already looks like Rodu's card
+    rewritten with the real card. Every file must also have a card key's shape (or be
+    `index.md`), be a plain file, and start with the heading Rodu writes under that name. A
+    person's own file, an edited copy or a symlink is left alone with a warning. The copy's folder
+    must be a plain folder, not a symlink, and files are written through a temp file created new,
+    so a planted symlink is never followed. Turning the copy off removes this machine's files and
+    the folder if it is then empty; files an earlier numbering machine wrote and this one never
+    rewrote stay, with a warning.
   - A card file shows the fields a card has. Cards have no reporter or labels, and a reporter
     cannot be derived on the numbering machine, since the event log is local to each machine.
     There is no archive, so every card is in the copy; a file is removed when its card's name

@@ -3,13 +3,16 @@
 //! encrypted. Only the numbering machine writes it, so folder apps never see two machines writing
 //! the same files.
 //!
-//! Rodu deletes or overwrites only files it wrote. Anyone who can write to the folder can also
-//! write the record of them, `readable/.rodu-readable.json`, so a file must pass every check:
-//! a name shaped like a card key (or `index.md`), a plain file (never a symlink), content still
-//! matching the SHA-256 recorded for it, and the heading Rodu writes on that very file. A person's
-//! own file, an edited copy, or a symlink is left alone, with a warning. The copy's folder itself
-//! must be a plain folder, not a symlink. File names come only from card keys, so text in a card
-//! can never choose where a file goes.
+//! Rodu removes only files this machine wrote. Its record of them, with the SHA-256 of what was
+//! written, is kept in the workspace (`.rodu/readable-copy.json`), out of reach of anyone who can
+//! only write to the shared folder. The folder also holds a record, `readable/.rodu-readable.json`,
+//! for the next numbering machine after a hand-over: that one may be forged, so it only lets a
+//! machine overwrite a card file with fresh content, never remove one. Either way a file must also
+//! have a card key's shape (or be `index.md`), be a plain file (never a symlink), still match the
+//! recorded hash, and start with the heading Rodu writes under that name. A person's own file, an
+//! edited copy, or a symlink is left alone, with a warning. The copy's folder must be a plain
+//! folder, not a symlink. File names come only from card keys, so text in a card can never choose
+//! where a file goes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -23,13 +26,18 @@ use sha2::{Digest, Sha256};
 /// The folder, inside the team folder, that holds the copy.
 pub(crate) const DIR: &str = "readable";
 const MANIFEST: &str = ".rodu-readable.json";
+/// This machine's record of what it wrote, in the workspace folder.
+const LOCAL: &str = "readable-copy.json";
 const INDEX: &str = "index.md";
 /// Cards read per search page while rendering.
 const PAGE: u32 = 500;
 
-/// What Rodu wrote, so it never deletes or overwrites anything else.
+/// What Rodu wrote, so it never deletes or overwrites anything else. In the workspace, `folder`
+/// says which team folder it is about.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Manifest {
+    #[serde(default)]
+    folder: String,
     /// The document version the copy was rendered from, so an unchanged board is not rendered
     /// again on every sync.
     #[serde(default)]
@@ -88,10 +96,12 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Keeps the copy in `root/readable` up to date with the board, if this machine numbers cards.
-/// With the copy off, removes what Rodu wrote there. Never fails: problems come back as warnings.
+/// Keeps the copy in `root/readable` up to date with the board; with the copy off, removes what
+/// this machine wrote there. `local` is the workspace folder, where this machine keeps its record.
+/// Never fails: problems come back as warnings.
 pub(crate) fn refresh(
     root: &Path,
+    local: &Path,
     service: &RoduService<crate::store::AnyStore>,
     on: bool,
     version: &[u8],
@@ -109,19 +119,21 @@ pub(crate) fn refresh(
         }
         _ => {}
     }
+    let folder = root.display().to_string();
+    let mine = load_local(local, &folder);
     if !on {
-        if dir.join(MANIFEST).is_file() {
-            remove(&dir, &mut warnings);
+        if !mine.files.is_empty() || dir.join(MANIFEST).is_file() {
+            remove(&dir, local, mine, &mut warnings);
         }
         return warnings;
     }
     let version = hex(version);
-    let manifest = load(&dir);
-    if manifest.version == version && dir.is_dir() {
+    let shared = load(&dir);
+    if shared.version == version && mine.version == version && dir.is_dir() {
         return warnings;
     }
     match render(service) {
-        Ok(files) => write(&dir, manifest, files, version, &mut warnings),
+        Ok(files) => write(&dir, local, (shared, mine), files, version, &mut warnings),
         Err(e) => warnings.push(format!("readable copy: {}", e.message)),
     }
     warnings
@@ -133,12 +145,29 @@ fn read_plain(path: &Path) -> Option<String> {
     meta.file_type().is_file().then(|| fs::read_to_string(path).ok()).flatten()
 }
 
-fn load(dir: &Path) -> Manifest {
-    let mut manifest: Manifest = read_plain(&dir.join(MANIFEST))
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
+fn parse(text: Option<String>) -> Manifest {
+    let mut manifest: Manifest =
+        text.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
     manifest.files.retain(|name, _| is_ours(name));
     manifest
+}
+
+/// The folder's record, written by whichever machine numbered last.
+fn load(dir: &Path) -> Manifest {
+    parse(read_plain(&dir.join(MANIFEST)))
+}
+
+/// This machine's record for the team folder `folder`; empty for any other folder.
+fn load_local(local: &Path, folder: &str) -> Manifest {
+    let manifest = parse(read_plain(&local.join(LOCAL)));
+    if manifest.folder == folder { manifest } else { Manifest::default() }
+}
+
+fn save(dir: &Path, name: &str, manifest: &Manifest, warnings: &mut Vec<String>) {
+    let text = serde_json::to_string_pretty(manifest).unwrap_or_default();
+    if let Err(e) = write_file(dir, name, &format!("{text}\n")) {
+        warnings.push(format!("readable copy: cannot write {name}: {e}"));
+    }
 }
 
 /// Whether `dir/name` is a plain file still holding exactly what Rodu wrote there: the content
@@ -161,9 +190,12 @@ fn write_file(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     })
 }
 
+const LEFT: &str = "was changed by someone else; left as is";
+
 fn write(
     dir: &Path,
-    old: Manifest,
+    local: &Path,
+    (shared, mine): (Manifest, Manifest),
     files: BTreeMap<String, String>,
     version: String,
     warnings: &mut Vec<String>,
@@ -178,24 +210,29 @@ fn write(
             return;
         }
     }
-    let mut kept = Manifest { version, files: BTreeMap::new() };
+    let folder = mine.folder.clone();
+    let mut wrote = BTreeMap::new();
     let mut failed = false;
     for (name, text) in &files {
         let path = dir.join(name);
         let hash = sha256(text);
-        let current = read_plain(&path);
-        if current.as_deref() == Some(text.as_str()) {
-            kept.files.insert(name.clone(), hash);
+        if read_plain(&path).as_deref() == Some(text.as_str()) {
+            wrote.insert(name.clone(), hash);
             continue;
         }
         let taken = fs::symlink_metadata(&path).is_ok();
-        if taken && !unchanged(dir, name, old.files.get(name)) {
-            warnings.push(format!("readable copy: {name} was changed by someone else; left as is"));
+        // Overwriting a card file with fresh content: allowed for what this machine wrote, and,
+        // after a hand-over, for what the folder's record says the last numbering machine wrote.
+        if taken
+            && !unchanged(dir, name, mine.files.get(name))
+            && !unchanged(dir, name, shared.files.get(name))
+        {
+            warnings.push(format!("readable copy: {name} {LEFT}"));
             continue;
         }
         match write_file(dir, name, text) {
             Ok(()) => {
-                kept.files.insert(name.clone(), hash);
+                wrote.insert(name.clone(), hash);
             }
             Err(e) => {
                 failed = true;
@@ -203,58 +240,77 @@ fn write(
             }
         }
     }
-    for (name, hash) in &old.files {
-        if files.contains_key(name) {
+    // Removing a file that left the copy: only what this machine wrote.
+    let mut gone = mine.files.keys().chain(shared.files.keys()).collect::<Vec<_>>();
+    gone.sort();
+    gone.dedup();
+    for name in gone {
+        if files.contains_key(name) || fs::symlink_metadata(dir.join(name)).is_err() {
             continue;
         }
-        let path = dir.join(name);
-        if fs::symlink_metadata(&path).is_err() {
-            continue;
-        }
-        if unchanged(dir, name, Some(hash)) {
-            if let Err(e) = fs::remove_file(&path) {
-                warnings.push(format!("readable copy: cannot remove {name}: {e}"));
-                kept.files.insert(name.clone(), hash.clone());
-            }
-        } else {
-            warnings.push(format!("readable copy: {name} was changed by someone else; left as is"));
+        if !unchanged(dir, name, mine.files.get(name)) {
+            warnings
+                .push(format!("readable copy: {name} was not written by this machine; left as is"));
+        } else if let Err(e) = fs::remove_file(dir.join(name)) {
+            warnings.push(format!("readable copy: cannot remove {name}: {e}"));
+            wrote.insert(name.clone(), mine.files[name].clone());
         }
     }
-    if failed {
-        // Rendered again next time, so the files that failed are tried again.
-        kept.version.clear();
-    }
-    let text = serde_json::to_string_pretty(&kept).unwrap_or_default();
-    if let Err(e) = write_file(dir, MANIFEST, &format!("{text}\n")) {
-        warnings.push(format!("readable copy: cannot write {MANIFEST}: {e}"));
-    }
+    // Rendered again next time if anything failed, so those files are tried again.
+    let version = if failed { String::new() } else { version };
+    let folder = if folder.is_empty() {
+        dir.parent().map(|p| p.display().to_string()).unwrap_or_default()
+    } else {
+        folder
+    };
+    save(
+        local,
+        LOCAL,
+        &Manifest { folder, version: version.clone(), files: wrote.clone() },
+        warnings,
+    );
+    save(dir, MANIFEST, &Manifest { folder: String::new(), version, files: wrote }, warnings);
 }
 
-/// Turning the copy off: removes the files Rodu wrote and still match, its record, and the
-/// folder if nothing else is left in it.
-fn remove(dir: &Path, warnings: &mut Vec<String>) {
-    let manifest = load(dir);
+/// Turning the copy off: removes the files this machine wrote that still match, the records,
+/// and the folder if nothing else is left in it.
+fn remove(dir: &Path, local: &Path, mine: Manifest, warnings: &mut Vec<String>) {
+    let shared = load(dir);
     let mut left = BTreeMap::new();
-    for (name, hash) in manifest.files {
+    let mut names = mine.files.keys().chain(shared.files.keys()).cloned().collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    for name in names {
         let path = dir.join(&name);
         if fs::symlink_metadata(&path).is_err() {
             continue;
         }
-        if !unchanged(dir, &name, Some(&hash)) {
-            warnings.push(format!("readable copy: {name} was changed by someone else; left as is"));
+        if !unchanged(dir, &name, mine.files.get(&name)) {
+            let why = if mine.files.contains_key(&name) {
+                LEFT
+            } else {
+                "was not written by this machine; left as is"
+            };
+            warnings.push(format!("readable copy: {name} {why}"));
+            if let Some(hash) = shared.files.get(&name) {
+                left.insert(name, hash.clone());
+            }
         } else if let Err(e) = fs::remove_file(&path) {
             warnings.push(format!("readable copy: cannot remove {name}: {e}"));
-            left.insert(name, hash);
+            left.insert(name.clone(), mine.files[&name].clone());
         }
     }
+    let _ = fs::remove_file(local.join(LOCAL));
     let result = if left.is_empty() {
         fs::remove_file(dir.join(MANIFEST))
     } else {
-        let text = serde_json::to_string_pretty(&Manifest { version: String::new(), files: left })
+        let text = serde_json::to_string_pretty(&Manifest { files: left, ..Manifest::default() })
             .unwrap_or_default();
         write_file(dir, MANIFEST, &format!("{text}\n"))
     };
-    if let Err(e) = result {
+    if let Err(e) = result
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
         warnings.push(format!("readable copy: cannot update {MANIFEST}: {e}"));
     }
     let _ = fs::remove_dir(dir);
