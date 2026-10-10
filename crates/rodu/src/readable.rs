@@ -31,9 +31,8 @@ const LOCAL: &str = "readable-copy.json";
 const INDEX: &str = "index.md";
 /// Cards read per search page while rendering.
 const PAGE: u32 = 500;
-/// The largest file of the copy, or record, read back. Anything bigger was not written by Rodu
-/// (a card file is far smaller), so a huge planted file is never loaded into memory.
-const MAX_READ: u64 = 4 * 1024 * 1024;
+/// The largest record read back. A card file is never loaded whole: it is hashed as it is read.
+const MAX_READ: u64 = 16 * 1024 * 1024;
 
 /// What Rodu wrote, so it never deletes or overwrites anything else. In the workspace, `folder`
 /// says which team folder it is about.
@@ -142,8 +141,8 @@ pub(crate) fn refresh(
     warnings
 }
 
-/// Reads a plain file of at most [`MAX_READ`] bytes; a symlink, anything else, or a bigger file
-/// reads as nothing.
+/// Reads a plain file of at most [`MAX_READ`] bytes (a record); a symlink, anything else, or a
+/// bigger file reads as nothing.
 fn read_plain(path: &Path) -> Option<String> {
     let meta = fs::symlink_metadata(path).ok()?;
     (meta.file_type().is_file() && meta.len() <= MAX_READ)
@@ -181,12 +180,38 @@ fn save(dir: &Path, name: &str, manifest: &Manifest, warnings: &mut Vec<String>)
     }
 }
 
+/// The SHA-256 of the plain file `dir/name`, and whether it starts with the heading Rodu writes
+/// under that name. Read in pieces, so a file of any size is never loaded whole; a symlink or
+/// anything but a plain file gives nothing.
+fn digest(dir: &Path, name: &str) -> Option<(String, bool)> {
+    use std::io::Read;
+    let path = dir.join(name);
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    let heading = heading(name);
+    let mut file = fs::File::open(&path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut start = Vec::with_capacity(heading.len());
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        let want = heading.len().saturating_sub(start.len()).min(read);
+        start.extend_from_slice(&buffer[..want]);
+        hasher.update(&buffer[..read]);
+    }
+    let hash = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Some((hash, start == heading.as_bytes()))
+}
+
 /// Whether `dir/name` is a plain file still holding exactly what Rodu wrote there: the content
 /// matches the recorded hash and starts with the heading Rodu writes under that name.
 fn unchanged(dir: &Path, name: &str, hash: Option<&String>) -> bool {
     let Some(hash) = hash else { return false };
-    read_plain(&dir.join(name))
-        .is_some_and(|text| &sha256(&text) == hash && text.starts_with(&heading(name)))
+    digest(dir, name).is_some_and(|(found, headed)| &found == hash && headed)
 }
 
 /// Writes through a fresh temp file and a rename. The temp file is created new, so a symlink
@@ -201,10 +226,17 @@ fn write_file(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
         .map_or(0, |d| d.subsec_nanos());
     let unique = format!("{}-{nanos}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
     let temp = dir.join(format!(".{name}.{unique}.tmp"));
-    fs::OpenOptions::new().write(true).create_new(true).open(&temp)?.write_all(text.as_bytes())?;
-    fs::rename(&temp, dir.join(name)).inspect_err(|_| {
-        let _ = fs::remove_file(&temp);
-    })
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    // The temp file is this call's own, so it is removed whatever fails after it was made.
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            fs::rename(&temp, dir.join(name))
+        })
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&temp);
+        })
 }
 
 const LEFT: &str = "was changed by someone else; left as is";
@@ -237,7 +269,7 @@ fn write(
     for (name, text) in &files {
         let path = dir.join(name);
         let hash = sha256(text);
-        if read_plain(&path).as_deref() == Some(text.as_str()) {
+        if digest(dir, name).is_some_and(|(found, _)| found == hash) {
             if mine.files.contains_key(name) {
                 own.insert(name.clone(), hash.clone());
             }
@@ -503,11 +535,16 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_or_linked_file_is_never_read() {
+    fn a_huge_or_linked_file_is_never_read_whole() {
         let dir = tempfile::tempdir().unwrap();
         let big = dir.path().join("DEMO-1.md");
         std::fs::write(&big, vec![b'#'; MAX_READ as usize + 1]).unwrap();
-        assert_eq!(read_plain(&big), None);
+        assert_eq!(read_plain(&big), None, "a record that big is not read");
+        // A card file of any size is still checked, by hashing it as it is read.
+        let card = format!("# DEMO-1: big\n{}", "x".repeat(5 * 1024 * 1024));
+        std::fs::write(&big, &card).unwrap();
+        assert!(unchanged(dir.path(), "DEMO-1.md", Some(&sha256(&card))));
+        assert!(!unchanged(dir.path(), "DEMO-1.md", Some(&sha256("other"))));
         let small = dir.path().join("DEMO-2.md");
         std::fs::write(&small, "# DEMO-2: x\n").unwrap();
         assert!(read_plain(&small).is_some());
