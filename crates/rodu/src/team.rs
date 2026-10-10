@@ -599,9 +599,21 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     let signed = match &team.signing {
         Some(_) => {
             let folder = team_folder(&ws.dir, team)?;
-            Some((folder.admissions(store)?, folder.requests()?))
+            Some((folder.admissions(store)?, folder.requests()?, folder.authority(store)?))
         }
         None => None,
+    };
+    // The role of a machine in a signed team, by the keys admitted for it.
+    let role = |peer: u64| -> Option<&'static str> {
+        let (admitted, _, authority) = signed.as_ref()?;
+        let keys = admitted.get(&peer)?;
+        if keys.contains(&authority.owner()) {
+            Some("team owner")
+        } else if keys.iter().any(|key| authority.is_admin(key)) {
+            Some("admin")
+        } else {
+            None
+        }
     };
     // Replica folders are named by peer id; anything else in sync/ is not a machine.
     let folders: BTreeSet<u64> = std::fs::read_dir(Path::new(&team.folder).join(SYNC_DIR))
@@ -631,10 +643,11 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
         for peer in machines {
             claimed.insert(peer);
             let waiting =
-                signed.as_ref().is_some_and(|(admitted, _)| !admitted.contains_key(&peer));
+                signed.as_ref().is_some_and(|(admitted, ..)| !admitted.contains_key(&peer));
             let marks: Vec<&str> = [
                 (peer == store.peer()).then_some("this machine"),
                 (Some(peer) == numbering).then_some("numbers cards"),
+                role(peer),
                 waiting.then_some("waiting to be admitted"),
             ]
             .into_iter()
@@ -649,7 +662,7 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     }
     // A machine asking to join is listed with its request below, not as unknown.
     let asking_peers: BTreeSet<u64> =
-        signed.iter().flat_map(|(_, requests)| requests.iter().map(|r| r.peer)).collect();
+        signed.iter().flat_map(|(_, requests, _)| requests.iter().map(|r| r.peer)).collect();
     let unknown: Vec<u64> =
         folders.difference(&claimed).filter(|p| !asking_peers.contains(p)).copied().collect();
     if !unknown.is_empty() {
@@ -658,7 +671,7 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
         );
         for peer in unknown {
             let waiting =
-                signed.as_ref().is_some_and(|(admitted, _)| !admitted.contains_key(&peer));
+                signed.as_ref().is_some_and(|(admitted, ..)| !admitted.contains_key(&peer));
             (io.out)(&if waiting {
                 format!("  machine {} (waiting to be admitted)", short(peer))
             } else {
@@ -667,11 +680,13 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
         }
     }
     match &signed {
-        Some((admitted, requests)) => {
+        Some((admitted, requests, _)) => {
             let asking: Vec<&JoinRequest> =
                 requests.iter().filter(|r| !is_admitted(admitted, r.peer, &r.key)).collect();
             if !asking.is_empty() {
-                (io.out)("Asking to join (the team's creator admits with rodu team admit):");
+                (io.out)(
+                    "Asking to join (the team owner or an admin admits with rodu team admit):",
+                );
                 for request in asking {
                     (io.out)(&format!(
                         "  {} (code {}, machine {})",
@@ -682,8 +697,9 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
                 }
             }
             (io.out)(
-                "The team takes in changes only from machines its creator admitted, proven by \
-                 their signatures. Which person a machine belongs to is what that machine says.",
+                "The team takes in changes only from machines its owner or an admin admitted, \
+                 proven by their signatures. Which person a machine belongs to is what that \
+                 machine says.",
             );
         }
         None => (io.out)(
@@ -703,7 +719,7 @@ fn short_peer(peer: u64, all: &BTreeSet<u64>) -> String {
     if shared { full } else { full[..8].to_owned() }
 }
 
-/// `rodu team admit [<name> <code>]`: on the machine that created a signed team, lists the
+/// `rodu team admit [<name> <code>]`: on the owner's or an admin's machine, lists the
 /// machines asking to join, or admits one. The code is the one the person's machine printed when
 /// it joined, read out by them, so a request someone planted in the folder under their name is
 /// never admitted by mistake.
@@ -791,25 +807,150 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
     Ok(())
 }
 
+/// The signed team this workspace belongs to, with its folder, synced first.
+fn signed_team<'a>(io: &mut Io<'_>, ws: &'a Workspace) -> Result<(&'a LoroStore, TeamFolder)> {
+    let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else {
+        return Err(RoduError::invalid("This is not a team workspace"));
+    };
+    if team.signing.is_none() {
+        return Err(RoduError::invalid(
+            "This team does not sign its files, so it has no owner or admins",
+        )
+        .with_hint("A team that admits each machine is made with: rodu team create --signed"));
+    }
+    before(io, ws);
+    Ok((store, team_folder(&ws.dir, team)?))
+}
+
+/// The admitted machine of the person called `name`: their only one, or the one `machine` (its
+/// peer id, or the start of it) names.
+fn person_machine(
+    ws: &Workspace,
+    store: &LoroStore,
+    folder: &TeamFolder,
+    name: &str,
+    machine: Option<&str>,
+) -> Result<(u64, PublicKey)> {
+    let person = ws
+        .service
+        .store
+        .list_principals()?
+        .into_iter()
+        .find(|p| p.kind == PrincipalKind::Human && p.name == name)
+        .ok_or_else(|| {
+            RoduError::not_found(format!("No one on the team is called {}", name.escape_debug()))
+                .with_hint("rodu team members lists the team")
+        })?;
+    let admitted = folder.admissions(store)?;
+    let machines: Vec<(u64, PublicKey)> = store
+        .members()?
+        .into_iter()
+        .filter(|(_, id)| *id == person.id)
+        .flat_map(|(peer, _)| {
+            admitted.get(&peer).into_iter().flatten().map(move |key| (peer, *key))
+        })
+        .filter(|(peer, _)| machine.is_none_or(|m| format!("{peer:016x}").starts_with(m)))
+        .collect();
+    match machines.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(RoduError::not_found(match machine {
+            Some(m) => {
+                format!("{} has no admitted machine {}", name.escape_debug(), m.escape_debug())
+            }
+            None => format!("{} has no admitted machine", name.escape_debug()),
+        })
+        .with_hint("rodu team members shows each person's machines")),
+        _ => Err(RoduError::conflict(format!(
+            "{} has more than one admitted machine",
+            name.escape_debug()
+        ))
+        .with_hint("Name one with --machine <id>, as rodu team members shows it")),
+    }
+}
+
+/// `rodu team admin <name> on|off [--machine <id>]`: on the owner's machine, lets a person's
+/// machine admit others, or stops it. Machines it admitted before stay in.
+pub(crate) fn admin(
+    io: &mut Io<'_>,
+    args: &Args,
+    name: Option<&String>,
+    state: Option<&String>,
+) -> Result<()> {
+    let on = match state.map(String::as_str) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => return Err(RoduError::invalid("Usage: rodu team admin <name> on|off")),
+    };
+    let name = name.ok_or_else(|| RoduError::invalid("Usage: rodu team admin <name> on|off"))?;
+    let ws = open(io, false)?;
+    let (store, folder) = signed_team(io, &ws)?;
+    let (peer, key) = person_machine(&ws, store, &folder, name, args.value("machine"))?;
+    let authority = folder.authority(store)?;
+    if authority.is_admin(&key) == on {
+        (io.out)(&format!(
+            "{}'s machine {peer:016x} {} an admin already",
+            name,
+            if on { "is" } else { "is not" }
+        ));
+        return Ok(());
+    }
+    folder.set_admin(store, &key, on)?;
+    after(io, &ws);
+    (io.out)(&if on {
+        format!("{name}'s machine {peer:016x} can admit machines once it next syncs")
+    } else {
+        format!("{name}'s machine {peer:016x} can no longer admit machines; those it admitted stay")
+    });
+    Ok(())
+}
+
+/// `rodu team transfer-owner <name> --yes [--machine <id>]`: on the owner's machine, hands the
+/// team to a person's machine. This machine stays an admin until the new owner says otherwise.
+pub(crate) fn transfer_owner(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Result<()> {
+    let name =
+        name.ok_or_else(|| RoduError::invalid("Usage: rodu team transfer-owner <name> --yes"))?;
+    let ws = open(io, false)?;
+    let (store, folder) = signed_team(io, &ws)?;
+    let (peer, key) = person_machine(&ws, store, &folder, name, args.value("machine"))?;
+    if !args.flag("yes") {
+        return Err(RoduError::invalid("Handing over the team needs --yes").with_hint(format!(
+            "The new owner alone then chooses admins and can hand it on; this cannot be taken \
+             back from here. Then run: rodu team transfer-owner {name} --yes"
+        )));
+    }
+    folder.transfer(store, &key)?;
+    after(io, &ws);
+    (io.out)(&format!(
+        "{name}'s machine {peer:016x} owns the team once it next syncs; this machine stays an admin"
+    ));
+    Ok(())
+}
+
 fn is_admitted(admitted: &Admitted, peer: u64, key: &PublicKey) -> bool {
     admitted.get(&peer).is_some_and(|keys| keys.contains(key))
 }
 
 /// Where this machine stands in a signed team.
 fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
-    let (Ok(Some(identity)), Some(root)) = (load_identity(dir), team.signing.as_deref()) else {
+    let Ok(Some(identity)) = load_identity(dir) else {
         return "this machine's key is missing".to_owned();
     };
-    let code = identity.public().code();
-    if identity.public().to_hex() == root {
-        return format!("this machine created the team and admits others (code {code})");
-    }
-    match team_folder(dir, team).and_then(|folder| folder.admissions(store)) {
-        Ok(admitted) if is_admitted(&admitted, store.peer(), &identity.public()) => {
+    let me = identity.public();
+    let code = me.code();
+    let state = team_folder(dir, team)
+        .and_then(|folder| Ok((folder.authority(store)?, folder.admissions(store)?)));
+    match state {
+        Ok((authority, _)) if authority.owner() == me => {
+            format!("this machine owns the team and admits others (code {code})")
+        }
+        Ok((authority, _)) if authority.is_admin(&me) => {
+            format!("this machine is an admin and admits others (code {code})")
+        }
+        Ok((_, admitted)) if is_admitted(&admitted, store.peer(), &me) => {
             format!("this machine is admitted (code {code})")
         }
         Ok(_) => format!(
-            "this machine waits to be admitted (code {code}); the team's creator runs: \
+            "this machine waits to be admitted (code {code}); the team owner or an admin runs: \
              rodu team admit <your name> {code}"
         ),
         Err(e) => format!("could not read the team folder ({}) (code {code})", e.message),
@@ -990,8 +1131,9 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     if signed {
         (io.out)(
             "Signing is on: each teammate's machine asks to join, and the team takes in its \
-             changes only once this machine admits it with: rodu team admit <name> <code>. Check \
-             the code with the teammate yourself, not through the folder.",
+             changes only once this machine (the team owner) or an admin admits it with: rodu \
+             team admit <name> <code>. Check the code with the teammate yourself, not through the \
+             folder. Choose admins with: rodu team admin <name> on",
         );
     }
     if readable_copy {
@@ -1302,8 +1444,8 @@ fn join_into(
     if let Some((_, code)) = signed {
         (io.out)(&format!("This machine's code: {code}"));
         (io.out)(&format!(
-            "The team does not take in your changes until the machine that created it admits this \
-             one. Tell its owner your code yourself (not through the team folder) and ask them to \
+            "The team does not take in your changes until its owner or an admin admits this \
+             machine. Tell them your code yourself (not through the team folder) and ask them to \
              run: rodu team admit {name} {code}"
         ));
     }

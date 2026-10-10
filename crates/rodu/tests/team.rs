@@ -963,7 +963,7 @@ fn join_signed(team: &Team, name: &str) -> (PathBuf, String) {
 #[test]
 fn a_signed_team_takes_in_a_teammate_once_the_creator_admits_them() {
     let team = signed_team(false);
-    assert!(ok(&team.ann, &["team"]).contains("Signing: on; this machine created the team"));
+    assert!(ok(&team.ann, &["team"]).contains("Signing: on; this machine owns the team"));
     let (bob, code) = join_signed(&team, "bob");
     assert!(ok(&bob, &["ls"]).contains("Made alone"), "the creator's cards reach bob at once");
     assert!(ok(&bob, &["team"]).contains("waits to be admitted"));
@@ -982,7 +982,7 @@ fn a_signed_team_takes_in_a_teammate_once_the_creator_admits_them() {
     assert!(wrong.err.contains("No machine asking to join as bob"), "{}", wrong.err);
     let not_root = rodu(&bob, &["team", "admit", "bob", &code]);
     assert_ne!(not_root.code, 0);
-    assert!(not_root.err.contains("Only the machine that created the team"), "{}", not_root.err);
+    assert!(not_root.err.contains("Only the team owner's machine"), "{}", not_root.err);
 
     let admitted = ok(&team.ann, &["team", "admit", "bob", &code]);
     assert!(admitted.contains("Admitted bob's machine"), "{admitted}");
@@ -994,6 +994,73 @@ fn a_signed_team_takes_in_a_teammate_once_the_creator_admits_them() {
     assert!(!list.contains("waiting to be admitted"), "{list}");
     assert!(!list.contains("Asking to join"), "{list}");
     assert!(list.contains("proven by their signatures"), "{list}");
+    assert!(list.contains("(this machine, numbers cards, team owner)"), "{list}");
+}
+
+// --- admins and ownership (ADR 0002, step 2b) -------------------------------------------------
+
+#[test]
+fn the_owner_chooses_admins_who_admit_and_hands_the_team_on() {
+    let team = signed_team(false);
+    let (bob, bob_code) = join_signed(&team, "bob");
+    ok(&team.ann, &["team", "admit", "bob", &bob_code]);
+    ok(&bob, &["sync"]);
+    let (cat, cat_code) = join_signed(&team, "cat");
+
+    // Only the owner chooses admins, and only for a person on the team.
+    let refused = rodu(&bob, &["team", "admin", "bob", "on"]);
+    assert!(refused.err.contains("Only the team owner's machine"), "{}", refused.err);
+    let nobody = rodu(&team.ann, &["team", "admin", "zed", "on"]);
+    assert!(nobody.err.contains("No one on the team is called zed"), "{}", nobody.err);
+    // cat, not admitted, is not on ann's board yet.
+    let waiting = rodu(&team.ann, &["team", "admin", "cat", "on"]);
+    assert!(waiting.err.contains("No one on the team is called cat"), "{}", waiting.err);
+    let other = rodu(&team.ann, &["team", "admin", "bob", "on", "--machine", "zz"]);
+    assert!(other.err.contains("bob has no admitted machine zz"), "{}", other.err);
+    let out = ok(&team.ann, &["team", "admin", "bob", "on"]);
+    assert!(out.contains("can admit machines"), "{out}");
+    assert!(ok(&team.ann, &["team", "admin", "bob", "on"]).contains("is an admin already"));
+    assert!(ok(&bob, &["team"]).contains("this machine is an admin"));
+    assert!(ok(&bob, &["team", "members"]).contains("(this machine, admin)"));
+    // bob, an admin, admits cat; ann takes in cat's work.
+    ok(&bob, &["team", "admit", "cat", &cat_code]);
+    ok(&cat, &["add", "From cat"]);
+    assert!(ok(&team.ann, &["ls"]).contains("From cat"));
+
+    // Handing the team over asks for --yes; then bob owns it and ann is an admin.
+    let unsure = rodu(&team.ann, &["team", "transfer-owner", "bob"]);
+    assert!(unsure.err.contains("needs --yes"), "{}", unsure.err);
+    let out = ok(&team.ann, &["team", "transfer-owner", "bob", "--yes"]);
+    assert!(out.contains("owns the team once it next syncs"), "{out}");
+    assert!(ok(&team.ann, &["team"]).contains("this machine is an admin"));
+    assert!(ok(&bob, &["team"]).contains("this machine owns the team"));
+    let refused = rodu(&team.ann, &["team", "admin", "cat", "on"]);
+    assert!(refused.err.contains("Only the team owner's machine"), "{}", refused.err);
+    // bob revokes ann: she can no longer admit, and cat (admitted by bob) stays.
+    ok(&bob, &["team", "admin", "ann", "off"]);
+    let list = ok(&team.ann, &["team", "members"]);
+    assert!(!list.contains("admin)"), "{list}");
+    assert!(list.contains("team owner"), "{list}");
+    let (_dan, dan_code) = join_signed(&team, "dan");
+    let refused = rodu(&team.ann, &["team", "admit", "dan", &dan_code]);
+    assert!(refused.err.contains("or an admin's"), "{}", refused.err);
+    ok(&cat, &["add", "Still in"]);
+    assert!(ok(&bob, &["ls"]).contains("Still in"));
+    assert!(ok(&team.ann, &["ls"]).contains("Still in"));
+}
+
+#[test]
+fn roles_need_a_signed_team() {
+    let root = tempfile::tempdir().unwrap();
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
+    let folder = root.path().join("Drive/Board");
+    ok(&ann, &["team", "create", "--folder", folder.to_str().unwrap(), "--no-encrypt"]);
+    let out = rodu(&ann, &["team", "admin", "ann", "on"]);
+    assert!(out.err.contains("has no owner or admins"), "{}", out.err);
+    let out = rodu(&ann, &["team", "admin", "ann", "maybe"]);
+    assert!(out.err.contains("Usage: rodu team admin"), "{}", out.err);
 }
 
 #[test]
