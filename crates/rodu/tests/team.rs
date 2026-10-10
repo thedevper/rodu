@@ -342,7 +342,7 @@ fn a_join_with_a_wrong_or_missing_key_writes_nothing() {
         assert!(!bob.join(".rodu").exists(), "nothing was written");
     }
     // A key on a plain team's code is refused too.
-    let plain = team();
+    let plain = crate::team();
     let keyed = format!("{}.{}", plain.code, "0f".repeat(32));
     let pf = plain.folder.to_str().unwrap();
     let run = rodu(&bob, &["team", "join", &keyed, "--folder", pf, "--name", "bob"]);
@@ -920,4 +920,124 @@ fn a_machine_whose_entry_is_missing_or_wrong_records_itself_on_its_next_command(
     assert!(bob_section.contains(&format!("machine {}", &bob_id[..8])), "{list}");
     let ann_section = &list[..list.find("bob\n").unwrap()];
     assert!(!ann_section.contains(&bob_id[..8]), "{list}");
+}
+
+// --- signed teams (ADR 0002, step 2a) ---------------------------------------------------------
+
+/// ann's workspace made a signed team; the invite code it printed.
+fn signed_team(encrypt: bool) -> Team {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("Drive/Signed board");
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
+    ok(&ann, &["add", "Made alone"]);
+    let choice = if encrypt { "--encrypt" } else { "--no-encrypt" };
+    let out =
+        ok(&ann, &["team", "create", "--folder", folder.to_str().unwrap(), choice, "--signed"]);
+    assert!(out.contains("Signing is on"), "{out}");
+    let code = out
+        .lines()
+        .find_map(|l| l.strip_prefix("Invite code: "))
+        .expect("an invite code")
+        .to_owned();
+    assert!(code.starts_with("rodu2-"), "{code}");
+    Team { _root: root, folder, ann, code }
+}
+
+/// bob joins the signed team; returns his workspace and the code his machine printed.
+fn join_signed(team: &Team, name: &str) -> (PathBuf, String) {
+    let dir = team.ann.parent().unwrap().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let folder = team.folder.to_str().unwrap();
+    let out = ok(&dir, &["team", "join", &team.code, "--folder", folder, "--name", name]);
+    let code = out
+        .lines()
+        .find_map(|l| l.strip_prefix("This machine's code: "))
+        .expect("a machine code")
+        .to_owned();
+    assert!(out.contains(&format!("rodu team admit {name} {code}")), "{out}");
+    (dir, code)
+}
+
+#[test]
+fn a_signed_team_takes_in_a_teammate_once_the_creator_admits_them() {
+    let team = signed_team(false);
+    assert!(ok(&team.ann, &["team"]).contains("Signing: on; this machine created the team"));
+    let (bob, code) = join_signed(&team, "bob");
+    assert!(ok(&bob, &["ls"]).contains("Made alone"), "the creator's cards reach bob at once");
+    assert!(ok(&bob, &["team"]).contains("waits to be admitted"));
+    ok(&bob, &["add", "From bob"]);
+
+    // Before admission, ann's board does not have bob's card, and members shows him asking.
+    assert!(!ok(&team.ann, &["ls"]).contains("From bob"));
+    let list = ok(&team.ann, &["team", "members"]);
+    assert!(list.contains(&format!("bob (code {code}")), "{list}");
+    assert!(ok(&team.ann, &["team", "admit"]).contains(&format!("bob  code {code}")));
+
+    // A wrong code, or admitting from bob's machine, is refused.
+    let wrong = rodu(&team.ann, &["team", "admit", "bob", "0000000000000000"]);
+    assert_ne!(wrong.code, 0);
+    assert!(wrong.err.contains("No machine asking to join as bob"), "{}", wrong.err);
+    let not_root = rodu(&bob, &["team", "admit", "bob", &code]);
+    assert_ne!(not_root.code, 0);
+    assert!(not_root.err.contains("Only the machine that created the team"), "{}", not_root.err);
+
+    let admitted = ok(&team.ann, &["team", "admit", "bob", &code]);
+    assert!(admitted.contains("Admitted bob's machine"), "{admitted}");
+    assert!(ok(&team.ann, &["ls"]).contains("From bob"), "bob's card lands once admitted");
+    assert!(ok(&bob, &["team"]).contains("this machine is admitted"));
+    ok(&team.ann, &["add", "From ann"]);
+    assert!(ok(&bob, &["ls"]).contains("From ann"));
+    let list = ok(&team.ann, &["team", "members"]);
+    assert!(!list.contains("waiting to be admitted"), "{list}");
+    assert!(!list.contains("Asking to join"), "{list}");
+    assert!(list.contains("proven by their signatures"), "{list}");
+}
+
+#[test]
+fn joining_a_signed_team_needs_its_root_key_and_writes_nothing_otherwise() {
+    let team = signed_team(false);
+    let dir = team.ann.parent().unwrap().join("eve");
+    std::fs::create_dir_all(&dir).unwrap();
+    let folder = team.folder.to_str().unwrap();
+    // The same team id without the root key, and with another root key.
+    let id = team.code.strip_prefix("rodu2-").unwrap().split('.').next().unwrap();
+    let unsigned = format!("rodu1-{id}");
+    let refused = rodu(&dir, &["team", "join", &unsigned, "--folder", folder, "--name", "eve"]);
+    assert!(refused.err.contains("needs its root key"), "{}", refused.err);
+    let other_root = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    let swapped = format!("rodu2-{id}.{other_root}");
+    let refused = rodu(&dir, &["team", "join", &swapped, "--folder", folder, "--name", "eve"]);
+    assert!(refused.err.contains("root key is not this team's"), "{}", refused.err);
+    assert!(!dir.join(".rodu").exists());
+    // A plain team does not take a signed code.
+    let plain = crate::team();
+    let plain_id = plain.code.strip_prefix("rodu1-").unwrap();
+    let wrong = format!("rodu2-{plain_id}.{other_root}");
+    let refused = rodu(
+        &dir,
+        &["team", "join", &wrong, "--folder", plain.folder.to_str().unwrap(), "--name", "eve"],
+    );
+    assert!(refused.err.contains("root key is not this team's"), "{}", refused.err);
+    assert!(!dir.join(".rodu").exists());
+}
+
+#[test]
+fn an_encrypted_signed_team_admits_and_keeps_names_out_of_the_folder() {
+    let team = signed_team(true);
+    let (bob, code) = join_signed(&team, "bob");
+    assert!(!contains(&all_bytes(&team.folder), "bob"), "the request is sealed");
+    ok(&bob, &["add", "Sealed and signed"]);
+    ok(&team.ann, &["team", "admit", "bob", &code]);
+    assert!(ok(&team.ann, &["ls"]).contains("Sealed and signed"));
+}
+
+#[test]
+fn a_signed_workspace_whose_machine_key_is_gone_stops_syncing() {
+    let team = signed_team(false);
+    std::fs::remove_file(team.ann.join(".rodu/identity.key")).unwrap();
+    let run = rodu(&team.ann, &["ls"]);
+    assert_eq!(run.code, 0, "the command still runs on this machine's board");
+    assert!(run.err.contains("machine key is missing"), "{}", run.err);
 }
