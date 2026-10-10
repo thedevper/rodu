@@ -31,6 +31,9 @@ const LOCAL: &str = "readable-copy.json";
 const INDEX: &str = "index.md";
 /// Cards read per search page while rendering.
 const PAGE: u32 = 500;
+/// The largest file of the copy, or record, read back. Anything bigger was not written by Rodu
+/// (a card file is far smaller), so a huge planted file is never loaded into memory.
+const MAX_READ: u64 = 4 * 1024 * 1024;
 
 /// What Rodu wrote, so it never deletes or overwrites anything else. In the workspace, `folder`
 /// says which team folder it is about.
@@ -129,20 +132,28 @@ pub(crate) fn refresh(
     }
     let version = hex(version);
     let shared = load(&dir);
-    if shared.version == version && mine.version == version && dir.is_dir() {
+    if shared.version == version && mine.version == version && plain_dir(&dir) {
         return warnings;
     }
     match render(service) {
-        Ok(files) => write(&dir, local, (shared, mine), files, version, &mut warnings),
+        Ok(files) => write(&dir, local, &folder, (shared, mine), files, version, &mut warnings),
         Err(e) => warnings.push(format!("readable copy: {}", e.message)),
     }
     warnings
 }
 
-/// Reads a plain file; a symlink or anything else reads as nothing.
+/// Reads a plain file of at most [`MAX_READ`] bytes; a symlink, anything else, or a bigger file
+/// reads as nothing.
 fn read_plain(path: &Path) -> Option<String> {
     let meta = fs::symlink_metadata(path).ok()?;
-    meta.file_type().is_file().then(|| fs::read_to_string(path).ok()).flatten()
+    (meta.file_type().is_file() && meta.len() <= MAX_READ)
+        .then(|| fs::read_to_string(path).ok())
+        .flatten()
+}
+
+/// Whether `dir` is a folder itself, not a symlink to one.
+fn plain_dir(dir: &Path) -> bool {
+    fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_dir())
 }
 
 fn parse(text: Option<String>) -> Manifest {
@@ -182,8 +193,14 @@ fn unchanged(dir: &Path, name: &str, hash: Option<&String>) -> bool {
 /// planted under its name is never followed, and the rename replaces a name, never a target.
 fn write_file(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let temp = dir.join(format!(".{name}.tmp"));
-    let _ = fs::remove_file(&temp);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // A name no one else uses, so nothing already there is ever removed or followed.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let unique = format!("{}-{nanos}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let temp = dir.join(format!(".{name}.{unique}.tmp"));
     fs::OpenOptions::new().write(true).create_new(true).open(&temp)?.write_all(text.as_bytes())?;
     fs::rename(&temp, dir.join(name)).inspect_err(|_| {
         let _ = fs::remove_file(&temp);
@@ -195,6 +212,7 @@ const LEFT: &str = "was changed by someone else; left as is";
 fn write(
     dir: &Path,
     local: &Path,
+    folder: &str,
     (shared, mine): (Manifest, Manifest),
     files: BTreeMap<String, String>,
     version: String,
@@ -204,19 +222,25 @@ fn write(
     // written where it should be.
     match fs::create_dir(dir) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && plain_dir(dir) => {}
         Err(e) => {
             warnings.push(format!("readable copy: cannot make {}: {e}", dir.display()));
             return;
         }
     }
-    let folder = mine.folder.clone();
+    // Every file of the copy now in place, for the folder's record (and the next numbering
+    // machine), and the ones this machine wrote itself, for its own record: only those can ever
+    // be removed. A file someone else put there, even one identical to the card, is not.
     let mut wrote = BTreeMap::new();
+    let mut own = BTreeMap::new();
     let mut failed = false;
     for (name, text) in &files {
         let path = dir.join(name);
         let hash = sha256(text);
         if read_plain(&path).as_deref() == Some(text.as_str()) {
+            if mine.files.contains_key(name) {
+                own.insert(name.clone(), hash.clone());
+            }
             wrote.insert(name.clone(), hash);
             continue;
         }
@@ -232,6 +256,7 @@ fn write(
         }
         match write_file(dir, name, text) {
             Ok(()) => {
+                own.insert(name.clone(), hash.clone());
                 wrote.insert(name.clone(), hash);
             }
             Err(e) => {
@@ -253,27 +278,20 @@ fn write(
                 .push(format!("readable copy: {name} was not written by this machine; left as is"));
         } else if let Err(e) = fs::remove_file(dir.join(name)) {
             warnings.push(format!("readable copy: cannot remove {name}: {e}"));
+            own.insert(name.clone(), mine.files[name].clone());
             wrote.insert(name.clone(), mine.files[name].clone());
         }
     }
     // Rendered again next time if anything failed, so those files are tried again.
     let version = if failed { String::new() } else { version };
-    let folder = if folder.is_empty() {
-        dir.parent().map(|p| p.display().to_string()).unwrap_or_default()
-    } else {
-        folder
-    };
-    save(
-        local,
-        LOCAL,
-        &Manifest { folder, version: version.clone(), files: wrote.clone() },
-        warnings,
-    );
+    let mine = Manifest { folder: folder.to_owned(), version: version.clone(), files: own };
+    save(local, LOCAL, &mine, warnings);
     save(dir, MANIFEST, &Manifest { folder: String::new(), version, files: wrote }, warnings);
 }
 
 /// Turning the copy off: removes the files this machine wrote that still match, the records,
-/// and the folder if nothing else is left in it.
+/// and the folder if nothing else is left in it. A file it wrote but could not remove stays in
+/// both records, so the next sync tries again; any other file is named once and forgotten.
 fn remove(dir: &Path, local: &Path, mine: Manifest, warnings: &mut Vec<String>) {
     let shared = load(dir);
     let mut left = BTreeMap::new();
@@ -292,19 +310,18 @@ fn remove(dir: &Path, local: &Path, mine: Manifest, warnings: &mut Vec<String>) 
                 "was not written by this machine; left as is"
             };
             warnings.push(format!("readable copy: {name} {why}"));
-            if let Some(hash) = shared.files.get(&name) {
-                left.insert(name, hash.clone());
-            }
         } else if let Err(e) = fs::remove_file(&path) {
             warnings.push(format!("readable copy: cannot remove {name}: {e}"));
             left.insert(name.clone(), mine.files[&name].clone());
         }
     }
-    let _ = fs::remove_file(local.join(LOCAL));
     let result = if left.is_empty() {
+        let _ = fs::remove_file(local.join(LOCAL));
         fs::remove_file(dir.join(MANIFEST))
     } else {
-        let text = serde_json::to_string_pretty(&Manifest { files: left, ..Manifest::default() })
+        let kept = Manifest { folder: mine.folder.clone(), version: String::new(), files: left };
+        save(local, LOCAL, &kept, warnings);
+        let text = serde_json::to_string_pretty(&Manifest { folder: String::new(), ..kept })
             .unwrap_or_default();
         write_file(dir, MANIFEST, &format!("{text}\n"))
     };
@@ -387,7 +404,7 @@ fn plain(text: &str) -> String {
 }
 
 fn index_section(collection: &Collection, cards: &[&Item]) -> String {
-    let mut out = format!("\n## {} ({})\n", plain(&collection.name), collection.key);
+    let mut out = format!("\n## {} ({})\n", plain(&collection.name), plain(&collection.key));
     for state in &collection.workflow.states {
         let here: Vec<&&Item> = cards.iter().filter(|i| i.status == state.name).collect();
         if here.is_empty() {
@@ -457,7 +474,7 @@ pub(crate) fn render_card(item: &Item, card: &Card<'_>) -> String {
             out.push_str(&format!(
                 "\n### {}, {}\n\n{}\n",
                 plain(&author),
-                comment.created_at,
+                plain(&comment.created_at),
                 comment.body.trim_end()
             ));
         }
@@ -482,6 +499,26 @@ mod tests {
         assert!(is_ours("DEMO-1.md") && is_ours("index.md"));
         for bad in ["../DEMO-1.md", "notes.md", "notes.txt", ".rodu-readable.json", "DEMO-1.txt"] {
             assert!(!is_ours(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_huge_or_linked_file_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("DEMO-1.md");
+        std::fs::write(&big, vec![b'#'; MAX_READ as usize + 1]).unwrap();
+        assert_eq!(read_plain(&big), None);
+        let small = dir.path().join("DEMO-2.md");
+        std::fs::write(&small, "# DEMO-2: x\n").unwrap();
+        assert!(read_plain(&small).is_some());
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("DEMO-3.md");
+            std::os::unix::fs::symlink(&small, &link).unwrap();
+            assert_eq!(read_plain(&link), None);
+            std::os::unix::fs::symlink(dir.path(), dir.path().join("linked")).unwrap();
+            assert!(!plain_dir(&dir.path().join("linked")));
+            assert!(plain_dir(dir.path()));
         }
     }
 

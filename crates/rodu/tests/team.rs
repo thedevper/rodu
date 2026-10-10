@@ -749,6 +749,7 @@ fn after_a_hand_over_the_new_numbering_machine_keeps_the_copy_up_to_date() {
     ok(&team.ann, &["team", "readable-copy", "on"]);
     let copy = readable(&team);
     assert!(copy.join("DEMO-1.md").is_file());
+    ok(&team.ann, &["add", "Left alone"]);
     ok(&bob, &["team", "take-numbering", "--yes"]);
     ok(&bob, &["mv", "DEMO-1", "Todo"]);
     // bob overwrites ann's file, as the folder's record allows, with no warning.
@@ -757,9 +758,30 @@ fn after_a_hand_over_the_new_numbering_machine_keeps_the_copy_up_to_date() {
     let before = modified(&copy.join("DEMO-1.md"));
     ok(&bob, &["sync"]);
     assert_eq!(modified(&copy.join("DEMO-1.md")), before);
-    // Off, bob removes the files he wrote.
-    ok(&bob, &["team", "readable-copy", "off"]);
+    // Off, bob removes the files he wrote. DEMO-2 he never rewrote: ann wrote it, and a file
+    // only looking like his own render gives him no right to remove it.
+    let off = rodu(&bob, &["team", "readable-copy", "off"]);
+    assert!(off.err.contains("DEMO-2.md was not written by this machine"), "{}", off.err);
     assert!(!copy.join("DEMO-1.md").exists());
+    assert!(copy.join("DEMO-2.md").is_file());
+    // Named once, then forgotten: the next sync says nothing.
+    ok(&bob, &["sync"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_could_not_be_removed_is_removed_by_a_later_sync() {
+    use std::os::unix::fs::PermissionsExt;
+    let team = team();
+    ok(&team.ann, &["team", "readable-copy", "on"]);
+    let copy = readable(&team);
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let off = rodu(&team.ann, &["team", "readable-copy", "off"]);
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(off.err.contains("cannot remove DEMO-1.md"), "{}", off.err);
+    assert!(copy.join("DEMO-1.md").is_file());
+    ok(&team.ann, &["sync"]);
+    assert!(!copy.join("DEMO-1.md").exists(), "this machine still knew it wrote it");
 }
 
 #[cfg(unix)]

@@ -349,9 +349,19 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
     `index.md`), be a plain file, and start with the heading Rodu writes under that name. A
     person's own file, an edited copy or a symlink is left alone with a warning. The copy's folder
     must be a plain folder, not a symlink, and files are written through a temp file created new,
-    so a planted symlink is never followed. Turning the copy off removes this machine's files and
-    the folder if it is then empty; files an earlier numbering machine wrote and this one never
-    rewrote stay, with a warning.
+    so a planted symlink is never followed. A file found already identical to the card does not
+    become this machine's to remove unless its own record had it. Turning the copy off removes
+    this machine's files and the folder if it is then empty; a file it could not remove stays in
+    its record for the next sync. Files are read back only up to 4 MiB, so a huge planted file is
+    never loaded.
+  - Residuals: files an earlier numbering machine wrote and the new one never rewrote stay after a
+    hand-over, named once in a warning; giving the new machine the right to remove them would
+    mean trusting the forgeable folder record. A file a forged folder entry let it overwrite is
+    its own from then on (its content was already replaced). The plain-folder check on `readable/`
+    is not atomic with the writes that follow, so someone with local access to the folder who
+    swaps in a symlink at that moment could redirect a write; folder apps do not sync symlinks as
+    symlinks. Any member can turn the copy on, and the numbering machine then writes it without
+    asking its user, even for an encrypted team; the warning is shown where it was turned on.
   - A card file shows the fields a card has. Cards have no reporter or labels, and a reporter
     cannot be derived on the numbering machine, since the event log is local to each machine.
     There is no archive, so every card is in the copy; a file is removed when its card's name
