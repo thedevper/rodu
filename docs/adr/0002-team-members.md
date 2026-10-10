@@ -109,31 +109,45 @@ Where 2a differs from the text above, 2a is what holds:
 - **Who a file is accepted from.** A file signed by the root key is accepted from any replica
   folder: only the creator holds that key. Any other file is accepted only when the team document
   holds an admission for that folder's peer whose key is the signer's and whose signature verifies
-  against the root key. A file from a peer with no valid admission waits, unread as done, and is
-  read again on every pull. A file whose signature does not verify, or that is not a signed
-  payload at all, is reported once as damaged. A pull that brings in a new admission reads the
-  folder once more, so the admitted machine's files land in the same command.
-- **Admission record.** The document's root map `admissions`, from peer id (16 hex) to
-  `<member public key, 64 hex>.<signature, 128 hex>`. The signature is the root key's over
-  `"rodu-admit-1" 0x00 || workspace id length (u64 LE) || workspace id || peer id (u64 LE) ||
-  member public key`. Any member can write into the map, so a record counts only by its
-  signature, never by who wrote it.
+  against the root key. A validly signed file whose signer is not admitted for its folder waits.
+  It is not remembered as done, but its name, size and time are noted with its signer, so it is
+  not read again until that signer is admitted for that folder. A file whose signature does not
+  verify, or that is not a signed payload at all, is reported once as damaged. A pull that brings
+  in a new admission reads the folder once more, so the admitted machine's files land in the same
+  command.
+- **Admission record.** The document's root map `admissions`, keyed `<peer id, 16 hex>.<member
+  public key, 64 hex>`, each holding `<member public key>.<signature, 128 hex>`. The signature is
+  the root key's over `"rodu-admit-1" 0x00 || workspace id length (u64 LE) || workspace id || peer
+  id (u64 LE) || member public key`. Any member can write into the map, so a record counts only by
+  its signature, never by who wrote it. Each record has its own entry, so admitting a machine
+  never replaces another's record.
+- **Admissions are kept once checked.** Any member can also overwrite or delete an entry. So each
+  replica keeps, in its own index (never synced), every admission it has checked, and a later
+  change to the document never shuts out that machine there. What remains: a member who deletes
+  a record before some replica has read it keeps that replica, such as one joining later, from
+  admitting the machine. That is a denial of service by a member, not a way in. Removing such a
+  member is step 3.
 - **Asking to join.** `team join` on a signed team writes `sync/<peer>/request.json`
   (`{"format": 1, "name", "publicKey", "signature"}`; sealed with the team key as
   `request.sealed` for an encrypted team, so the provider does not learn the name). The machine
   signs its own request over `"rodu-request-1" 0x00 || workspace id length (u64 LE) || workspace
   id || peer id (u64 LE) || name length (u64 LE) || name`, so nobody can file a request under
   another machine's key. Requests that are links, over 4 KiB, unsigned or under a name a person
-  cannot have are skipped. Join prints the machine's code: the
-  first 16 hex digits of the SHA-256 of its public key. The joiner tells the owner the code by
-  some other channel. The owner runs `rodu team admit <name> <code>`, which refuses unless a request
-  under that name has that code. That way a request someone planted in the folder under a
+  cannot have are skipped. Join prints the machine's code: the first 96 bits of the SHA-256 of
+  its public key, as 24 hex digits in groups of four, so nobody can search out a key with the
+  same code. The joiner tells the owner the code by some other channel. The owner runs
+  `rodu team admit <name> <code>`, which refuses unless a request under that name has that code.
+  That way a request someone planted in the folder under a
   teammate's name cannot be admitted by mistake. `rodu team admit` with no arguments lists
   requests waiting.
 - **The root's own machine** is admitted by the root at create, so every machine of a signed
   team is listed the same way.
-- **Seeing it.** `rodu team` syncs first, like other commands, then says whether this machine is
-  the root, admitted, or waiting.
+- **Seeing it.** On a signed team, `rodu team` syncs first, then says whether this machine is the
+  root, admitted, or waiting. An unsigned team's `rodu team` is unchanged.
+- **Left for later.** A join that fails after it wrote its request can leave that request in the
+  folder, where it is listed until removed by hand. A request and a sync file are sealed under
+  the same associated data; a request planted as a sync file opens but fails its signature, and
+  is reported as damaged.
   `rodu team members` marks machines waiting for admission and lists requests. On a signed team,
   it stops calling the list unproven for admitted machines, but the name each machine gives
   stays a claim.
