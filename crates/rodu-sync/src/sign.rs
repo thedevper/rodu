@@ -106,9 +106,13 @@ impl PublicKey {
         hex::encode(self.0)
     }
 
-    /// The code a person reads out to the owner: the first 16 hex digits of the key's SHA-256.
+    /// The code a person reads out to the owner: the first 96 bits of the key's SHA-256, as 24
+    /// hex digits in groups of four. 96 bits keeps anyone from searching out a key with the same
+    /// code.
     pub fn code(&self) -> String {
-        hex::encode(&Sha256::digest(self.0)[..8])
+        let digits = hex::encode(&Sha256::digest(self.0)[..12]);
+        let groups: Vec<&str> = (0..6).map(|i| &digits[i * 4..i * 4 + 4]).collect();
+        groups.join("-")
     }
 
     fn verifying(&self) -> Option<VerifyingKey> {
@@ -299,7 +303,8 @@ mod tests {
         let again = MachineKey::from_hex(&key.to_hex()).unwrap();
         assert_eq!(again.public(), key.public());
         assert_eq!(PublicKey::from_hex(&key.public().to_hex()), Some(key.public()));
-        assert_eq!(key.public().code().len(), 16);
+        let code = key.public().code();
+        assert_eq!((code.len(), code.matches('-').count()), (29, 5), "{code}");
         for bad in ["", "00", &"g".repeat(64), &"A".repeat(64)] {
             assert!(MachineKey::from_hex(bad).is_none(), "{bad:?}");
             assert!(PublicKey::from_hex(bad).is_none(), "{bad:?}");

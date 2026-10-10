@@ -1139,7 +1139,7 @@ fn update_of(path: &std::path::Path, peer: u64) -> Vec<u8> {
 }
 
 #[test]
-fn files_signed_by_the_wrong_key_moved_or_unsigned_are_refused_once() {
+fn files_changed_moved_or_unsigned_are_refused_once_and_a_strangers_wait() {
     let root = tempfile::tempdir().unwrap();
     let ann_folder = signed_at(root.path(), ROOT_KEY);
     let a = first(&ann_folder);
@@ -1173,15 +1173,23 @@ fn files_signed_by_the_wrong_key_moved_or_unsigned_are_refused_once() {
     std::fs::write(b_dir.join("0000000053.update"), frame(&update)).unwrap();
 
     let report = a.sync(&ann_folder);
-    assert_eq!(report.damaged.len(), 4, "{report:?}");
-    assert_eq!(
-        report.damaged.iter().filter(|d| d.contains("another key")).count(),
-        1,
-        "{report:?}"
-    );
+    assert_eq!(report.damaged.len(), 3, "{report:?}");
+    // The stranger's file is validly signed, by a key nobody admitted for bob's folder: it waits.
+    assert_eq!(report.awaiting, vec![(b.store().peer(), 1)], "{report:?}");
     assert!(a.titles().contains(&"Kept".to_owned()), "the good file still lands");
     let again = a.sync(&ann_folder);
     assert!(again.damaged.is_empty(), "reported once: {again:?}");
+    assert_eq!(again.awaiting, vec![(b.store().peer(), 1)], "still waiting: {again:?}");
+    // A waiting file is not read again: the same name, size and time with other bytes (which
+    // would be refused as damaged if read) still counts as waiting.
+    let waiting = b_dir.join("0000000050.update");
+    let time = std::fs::metadata(&waiting).unwrap().modified().unwrap();
+    let len = std::fs::metadata(&waiting).unwrap().len() as usize;
+    std::fs::write(&waiting, vec![b'x'; len]).unwrap();
+    std::fs::File::options().write(true).open(&waiting).unwrap().set_modified(time).unwrap();
+    let third = a.sync(&ann_folder);
+    assert!(third.damaged.is_empty(), "not read again: {third:?}");
+    assert_eq!(third.awaiting, vec![(b.store().peer(), 1)], "{third:?}");
 }
 
 #[test]
@@ -1262,4 +1270,53 @@ fn an_encrypted_signed_team_hides_requests_and_still_admits() {
     a.sync(&ann_folder);
     assert_eq!(names(&a), ["ann", "bob"]);
     drop(b);
+}
+
+#[test]
+fn an_admission_once_checked_survives_a_member_overwriting_it() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    let (bob_key, cat_key) = (key_hex(), key_hex());
+    let bob_folder = signed_at(root.path(), &bob_key);
+    let b = join_signed(&bob_folder, "bob");
+    let cat_folder = signed_at(root.path(), &cat_key);
+    let c = join_signed(&cat_folder, "cat");
+    for request in ann_folder.requests().unwrap() {
+        ann_folder.admit(a.store(), &request).unwrap();
+    }
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // bob, admitted, overwrites cat's admission in the document.
+    let cat = MachineKey::from_hex(&cat_key).unwrap().public();
+    b.store()
+        .set_admission(c.store().peer(), &format!("{}.{}", cat.to_hex(), "00".repeat(64)))
+        .unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    assert!(
+        ann_folder.admissions(a.store()).unwrap()[&c.store().peer()].contains(&cat),
+        "ann checked cat's admission before: it stays"
+    );
+    // cat's later work still reaches ann.
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "From cat" })], None).unwrap();
+    c.sync(&cat_folder);
+    let report = a.sync(&ann_folder);
+    assert!(report.awaiting.is_empty(), "{report:?}");
+    assert!(a.titles().contains(&"From cat".to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_request_behind_a_linked_replica_folder_is_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let _a = first(&ann_folder);
+    let bob_key = key_hex();
+    let b = join_signed(&signed_at(root.path(), &bob_key), "bob");
+    let real = ann_folder.root().join("sync").join(format!("{:016x}", b.store().peer()));
+    let outside = root.path().join("elsewhere");
+    std::fs::rename(&real, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &real).unwrap();
+    assert!(ann_folder.requests().unwrap().is_empty());
 }

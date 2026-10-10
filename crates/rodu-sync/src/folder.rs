@@ -21,7 +21,7 @@
 //! untrusted: names are parsed, never joined into paths, links and dotfiles are skipped, and the
 //! payloads go through [`LoroStore::import_batch`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -195,9 +195,19 @@ fn is_person_name(name: &str) -> bool {
 /// What a signed team does with a file.
 enum Verdict<'a> {
     Accept(&'a [u8]),
-    /// From a machine not admitted yet.
-    Await,
+    /// Signed by a machine not admitted for its replica folder (yet).
+    Await(PublicKey),
     Damaged(&'static str),
+}
+
+/// The machines a signed team admits: for each peer, the keys admitted for it.
+pub type Admitted = BTreeMap<u64, BTreeSet<PublicKey>>;
+
+/// The local note listing the admissions this replica checked, one `<peer>.<key>` per line.
+const NOTE_ADMITTED: &str = "admitted";
+/// The local note on a file that waits for its signer to be admitted: the signer's key.
+fn await_note(stat: &str) -> String {
+    format!("await/{stat}")
 }
 
 impl PullReport {
@@ -220,6 +230,16 @@ impl PullReport {
         index.links.splice(0..0, first.links);
         index.problems.splice(0..0, first.problems);
         index.conflicts.splice(0..0, first.conflicts);
+        for list in [
+            &mut index.items,
+            &mut index.comments,
+            &mut index.links,
+            &mut index.problems,
+            &mut index.conflicts,
+        ] {
+            let mut seen = BTreeSet::new();
+            list.retain(|entry| seen.insert(entry.clone()));
+        }
         let mut damaged = self.damaged;
         damaged.extend(second.damaged);
         PullReport { damaged, batch, ..second }
@@ -581,6 +601,10 @@ impl TeamFolder {
         for entry in fs::read_dir(&sync).map_err(|e| folder_error(&sync, e))? {
             let entry = entry.map_err(|e| folder_error(&sync, e))?;
             let Some(peer) = entry.file_name().to_str().and_then(parse_peer_dir) else { continue };
+            // A link in place of a replica folder is never followed.
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
             let path = entry.path().join(file);
             let plain_file = fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
             let Some(bytes) =
@@ -614,8 +638,8 @@ impl TeamFolder {
         Ok(found)
     }
 
-    /// Signed team: the machines the team document admits, by peer.
-    pub fn admissions(&self, store: &LoroStore) -> Result<BTreeMap<u64, PublicKey>> {
+    /// Signed team: the machines admitted, by peer.
+    pub fn admissions(&self, store: &LoroStore) -> Result<Admitted> {
         let info = self.checked_info()?;
         self.admitted(store, &info)
     }
@@ -646,25 +670,46 @@ impl TeamFolder {
             return Ok(first);
         }
         let now = self.admitted(store, &info)?;
-        if !first.awaiting.iter().any(|(peer, _)| now.contains_key(peer)) {
+        if now == admitted {
             return Ok(first);
         }
         let second = self.pull_once(store, checker, &info, &now)?;
         Ok(first.then(second))
     }
 
-    /// The machines the team document admits, by peer: only records the root key signed for this
-    /// team. Empty for a team that does not sign.
-    fn admitted(&self, store: &LoroStore, info: &TeamInfo) -> Result<BTreeMap<u64, PublicKey>> {
-        let Some((_, root)) = &self.signing else { return Ok(BTreeMap::new()) };
+    /// The machines admitted, by peer: every record in the team document the root key signed for
+    /// this team, and every one this replica checked before. Any member can change the document,
+    /// so a record once checked is kept here: overwriting or deleting it later never shuts out
+    /// that machine on this replica. Empty for a team that does not sign.
+    fn admitted(&self, store: &LoroStore, info: &TeamInfo) -> Result<Admitted> {
+        let Some((_, root)) = &self.signing else { return Ok(Admitted::new()) };
         let team = self.team_id(info);
-        Ok(store
-            .admissions()?
-            .into_iter()
-            .filter_map(|(peer, record)| {
-                sign::check_admission(root, team, peer, &record).map(|key| (peer, key))
-            })
-            .collect())
+        let mut admitted = Admitted::new();
+        let noted = store.local_note(NOTE_ADMITTED)?.unwrap_or_default();
+        for line in noted.lines() {
+            let parsed = line
+                .split_once('.')
+                .and_then(|(peer, key)| Some((parse_peer_dir(peer)?, PublicKey::from_hex(key)?)));
+            if let Some((peer, key)) = parsed {
+                admitted.entry(peer).or_default().insert(key);
+            }
+        }
+        let before = admitted.clone();
+        for (peer, record) in store.admissions()? {
+            if let Some(key) = sign::check_admission(root, team, peer, &record) {
+                admitted.entry(peer).or_default().insert(key);
+            }
+        }
+        if admitted != before {
+            let lines: Vec<String> = admitted
+                .iter()
+                .flat_map(|(peer, keys)| {
+                    keys.iter().map(move |key| format!("{}.{}", peer_dir_name(*peer), key.to_hex()))
+                })
+                .collect();
+            store.set_local_note(NOTE_ADMITTED, &lines.join("\n"))?;
+        }
+        Ok(admitted)
     }
 
     /// What a signed team does with a file's payload once it is unframed and opened: its Loro
@@ -672,7 +717,7 @@ impl TeamFolder {
     fn verify<'a>(
         &self,
         info: &TeamInfo,
-        admitted: &BTreeMap<u64, PublicKey>,
+        admitted: &Admitted,
         peer: u64,
         payload: &'a [u8],
     ) -> Verdict<'a> {
@@ -680,11 +725,10 @@ impl TeamFolder {
         let Some((signer, update)) = sign::open_file(self.team_id(info), peer, payload) else {
             return Verdict::Damaged("is not signed, or its signature does not verify");
         };
-        match admitted.get(&peer) {
-            _ if signer == *root => Verdict::Accept(update),
-            Some(key) if *key == signer => Verdict::Accept(update),
-            Some(_) => Verdict::Damaged("is signed by another key than the one admitted for it"),
-            None => Verdict::Await,
+        if signer == *root || admitted.get(&peer).is_some_and(|keys| keys.contains(&signer)) {
+            Verdict::Accept(update)
+        } else {
+            Verdict::Await(signer)
         }
     }
 
@@ -693,7 +737,7 @@ impl TeamFolder {
         store: &LoroStore,
         checker: &Checker,
         info: &TeamInfo,
-        admitted: &BTreeMap<u64, PublicKey>,
+        admitted: &Admitted,
     ) -> Result<PullReport> {
         let info = info.clone();
         let mut awaiting: BTreeMap<u64, usize> = BTreeMap::new();
@@ -744,6 +788,16 @@ impl TeamFolder {
                 {
                     continue;
                 }
+                // A file already found waiting for its signer is not read again until that
+                // signer is admitted for this folder.
+                if let Some(stat) = &stat
+                    && let Some(signer) = store.local_note(&await_note(stat))?
+                    && let Some(signer) = PublicKey::from_hex(&signer)
+                    && !admitted.get(&peer).is_some_and(|keys| keys.contains(&signer))
+                {
+                    *awaiting.entry(peer).or_default() += 1;
+                    continue;
+                }
                 let limit = (MAX_IMPORT_BYTES + HEADER + SEAL_OVERHEAD) as u64;
                 if size > limit {
                     report_too_large(store, &mut report, &shown, size)?;
@@ -760,7 +814,7 @@ impl TeamFolder {
                     Err(e) => return Err(folder_error(&path, e)),
                 };
                 let key = format!("{shown}/{}", hex::encode(Sha256::digest(&bytes)));
-                read.push((key.clone(), stat, peer, own_seq(&name)));
+                read.push((key.clone(), stat.clone(), peer, own_seq(&name)));
                 // A sealed payload is opened, and so authenticated, here, and a signed one has its
                 // signature checked; the Loro update then goes through the import check like a
                 // plain one.
@@ -790,8 +844,13 @@ impl TeamFolder {
                     Verdict::Accept(update) => {
                         incoming.push(Incoming { peer, key, bytes: update.to_vec() })
                     }
-                    // Not remembered as done: read again until the machine is admitted.
-                    Verdict::Await => *awaiting.entry(peer).or_default() += 1,
+                    // Not remembered as done: read again once its signer is admitted.
+                    Verdict::Await(signer) => {
+                        *awaiting.entry(peer).or_default() += 1;
+                        if let Some(stat) = &stat {
+                            store.set_local_note(&await_note(stat), &signer.to_hex())?;
+                        }
+                    }
                     // Reported once; the same name with other bytes is a new file.
                     Verdict::Damaged(why) => {
                         if !store.sync_seen(&key)? {

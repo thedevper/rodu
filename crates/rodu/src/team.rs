@@ -9,7 +9,7 @@ use std::time::Duration;
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService};
-use rodu_sync::folder::{JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
+use rodu_sync::folder::{Admitted, JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::seal::TeamKey;
 use rodu_sync::sign::{MachineKey, PublicKey};
 use rodu_sync::{Checker, LoroStore};
@@ -524,10 +524,12 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
     let ws = open(io, false)?;
     match (&ws.config.team, ws.service.store.team()) {
         (Some(team), Some(store)) => {
-            // Like every command, it shows the team as of a sync: whether this machine was
-            // admitted, or numbering moved, is only known after one.
-            before(io, &ws);
-            after(io, &ws);
+            // A signed team's status shows whether this machine was admitted, which only a sync
+            // can tell.
+            if team.signing.is_some() {
+                before(io, &ws);
+                after(io, &ws);
+            }
             (io.out)(&format!("Team folder: {}", team.folder));
             if !team.encrypted {
                 (io.out)("Encryption: off");
@@ -645,19 +647,29 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
             });
         }
     }
-    let unknown: Vec<u64> = folders.difference(&claimed).copied().collect();
+    // A machine asking to join is listed with its request below, not as unknown.
+    let asking_peers: BTreeSet<u64> =
+        signed.iter().flat_map(|(_, requests)| requests.iter().map(|r| r.peer)).collect();
+    let unknown: Vec<u64> =
+        folders.difference(&claimed).filter(|p| !asking_peers.contains(p)).copied().collect();
     if !unknown.is_empty() {
         (io.out)(
             "Unknown machines (writing to the folder, but no person on the team claims them):",
         );
         for peer in unknown {
-            (io.out)(&format!("  machine {}", short(peer)));
+            let waiting =
+                signed.as_ref().is_some_and(|(admitted, _)| !admitted.contains_key(&peer));
+            (io.out)(&if waiting {
+                format!("  machine {} (waiting to be admitted)", short(peer))
+            } else {
+                format!("  machine {}", short(peer))
+            });
         }
     }
     match &signed {
         Some((admitted, requests)) => {
             let asking: Vec<&JoinRequest> =
-                requests.iter().filter(|r| admitted.get(&r.peer) != Some(&r.key)).collect();
+                requests.iter().filter(|r| !is_admitted(admitted, r.peer, &r.key)).collect();
             if !asking.is_empty() {
                 (io.out)("Asking to join (the team's creator admits with rodu team admit):");
                 for request in asking {
@@ -709,8 +721,11 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
     before(io, &ws);
     let folder = team_folder(&ws.dir, team)?;
     let admitted = folder.admissions(store)?;
-    let waiting: Vec<JoinRequest> =
-        folder.requests()?.into_iter().filter(|r| admitted.get(&r.peer) != Some(&r.key)).collect();
+    let waiting: Vec<JoinRequest> = folder
+        .requests()?
+        .into_iter()
+        .filter(|r| !is_admitted(&admitted, r.peer, &r.key))
+        .collect();
     let (Some(name), Some(code)) = (name, code) else {
         if name.is_some() {
             return Err(RoduError::invalid(
@@ -736,9 +751,17 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
         }
         return Ok(());
     };
-    let code = code.trim().to_ascii_lowercase();
-    let matching: Vec<&JoinRequest> =
-        waiting.iter().filter(|r| r.name == *name && r.key.code() == code).collect();
+    // Read out with or without its dashes.
+    let digits = |code: &str| -> String {
+        code.chars().filter(char::is_ascii_hexdigit).map(|c| c.to_ascii_lowercase()).collect()
+    };
+    let code = code.trim();
+    let matching: Vec<&JoinRequest> = waiting
+        .iter()
+        .filter(|r| {
+            r.name == *name && digits(&r.key.code()) == digits(code) && !digits(code).is_empty()
+        })
+        .collect();
     let request = match matching.as_slice() {
         [request] => *request,
         [] => {
@@ -768,6 +791,10 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
     Ok(())
 }
 
+fn is_admitted(admitted: &Admitted, peer: u64, key: &PublicKey) -> bool {
+    admitted.get(&peer).is_some_and(|keys| keys.contains(key))
+}
+
 /// Where this machine stands in a signed team.
 fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
     let (Ok(Some(identity)), Some(root)) = (load_identity(dir), team.signing.as_deref()) else {
@@ -778,7 +805,7 @@ fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
         return format!("this machine created the team and admits others (code {code})");
     }
     match team_folder(dir, team).and_then(|folder| folder.admissions(store)) {
-        Ok(admitted) if admitted.get(&store.peer()) == Some(&identity.public()) => {
+        Ok(admitted) if is_admitted(&admitted, store.peer(), &identity.public()) => {
             format!("this machine is admitted (code {code})")
         }
         Ok(_) => format!(

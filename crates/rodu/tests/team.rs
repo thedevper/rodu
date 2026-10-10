@@ -973,6 +973,7 @@ fn a_signed_team_takes_in_a_teammate_once_the_creator_admits_them() {
     assert!(!ok(&team.ann, &["ls"]).contains("From bob"));
     let list = ok(&team.ann, &["team", "members"]);
     assert!(list.contains(&format!("bob (code {code}")), "{list}");
+    assert!(!list.contains("Unknown machines"), "bob is asking, not unknown: {list}");
     assert!(ok(&team.ann, &["team", "admit"]).contains(&format!("bob  code {code}")));
 
     // A wrong code, or admitting from bob's machine, is refused.
