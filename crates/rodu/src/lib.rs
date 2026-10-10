@@ -44,6 +44,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   team admit [<name> <code>]  signed team: list machines asking to join, or admit one
   team admin <name> on <code> | off [--machine <id>]   signed team, owner: let a person's machine admit others, or stop it
   team transfer-owner <name> <code> --yes   signed team, owner: hand the team to the person's machine with that code
+  team remove <name> [--machine <id>] --yes   signed team, owner or admin: refuse what the person's machines write from now on
   team take-numbering --yes   number the team's cards here, when the machine that did is gone for good
   team readable-copy on|off   keep a plain Markdown copy of the board in the team folder (never encrypted)
   sync                       sync with the team folder now (every command also does)
@@ -368,12 +369,13 @@ async fn command_result(
             Some("transfer-owner") => {
                 team::transfer_owner(io, args, rest.get(1), rest.get(2)).map(|()| 0)
             }
+            Some("remove") => team::remove(io, args, rest.get(1)).map(|()| 0),
             Some("take-numbering") => team::take_numbering(io, args).map(|()| 0),
             Some("readable-copy") => team::readable_copy(io, rest.get(1)).map(|()| 0),
             Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
                 .with_hint(
                     "rodu team, rodu team create, rodu team join, rodu team members, \
-                     rodu team admit, rodu team admin, rodu team transfer-owner, \
+                     rodu team admit, rodu team admin, rodu team transfer-owner, rodu team remove, \
                      rodu team take-numbering, rodu team readable-copy",
                 )),
         },

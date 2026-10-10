@@ -17,7 +17,7 @@ fn main() {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{e}");
-                2
+                e.exit_code()
             }
         };
         std::process::exit(code);

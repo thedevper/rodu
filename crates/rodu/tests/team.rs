@@ -1066,6 +1066,46 @@ fn the_owner_chooses_admins_who_admit_and_hands_the_team_on() {
 }
 
 #[test]
+fn the_owner_or_an_admin_removes_a_member_whose_later_work_stays_out() {
+    let team = signed_team(true);
+    let (bob, bob_code) = join_signed(&team, "bob");
+    ok(&team.ann, &["team", "admit", "bob", &bob_code]);
+    ok(&bob, &["sync"]);
+    let (cat, cat_code) = join_signed(&team, "cat");
+    ok(&team.ann, &["team", "admit", "cat", &cat_code]);
+    ok(&cat, &["add", "Before"]);
+    assert!(ok(&bob, &["ls"]).contains("Before"));
+
+    // A member removes nobody; the owner's machine is not removed; a name must be on the team.
+    let refused = rodu(&bob, &["team", "remove", "cat", "--yes"]);
+    assert!(refused.err.contains("or an admin's, can remove"), "{}", refused.err);
+    let owner = rodu(&team.ann, &["team", "remove", "ann", "--yes"]);
+    assert!(owner.err.contains("is the team owner's or an admin's"), "{}", owner.err);
+    let nobody = rodu(&team.ann, &["team", "remove", "zed", "--yes"]);
+    assert!(nobody.err.contains("No one on the team is called zed"), "{}", nobody.err);
+    let usage = rodu(&team.ann, &["team", "remove"]);
+    assert!(usage.err.contains("Usage: rodu team remove"), "{}", usage.err);
+    // It asks for --yes, and says an encrypted team's key stays with them.
+    let unsure = rodu(&team.ann, &["team", "remove", "cat"]);
+    assert!(unsure.err.contains("needs --yes"), "{}", unsure.err);
+    assert!(unsure.err.contains("still read the board"), "{}", unsure.err);
+    let out = ok(&team.ann, &["team", "remove", "cat", "--yes"]);
+    assert!(out.contains("Removed cat's machine"), "{out}");
+    assert!(ok(&team.ann, &["team", "members"]).contains("(removed)"));
+    let again = rodu(&team.ann, &["team", "remove", "cat", "--yes"]);
+    assert!(again.err.contains("cat has no machine on the team"), "{}", again.err);
+
+    // cat's machine hears it at once: what it writes stays there.
+    let after = rodu(&cat, &["add", "After"]);
+    assert!(after.err.contains("removed from the team"), "{}", after.err);
+    assert!(rodu(&cat, &["team"]).out.contains("this machine was removed"));
+    for machine in [&team.ann, &bob] {
+        let list = ok(machine, &["ls"]);
+        assert!(list.contains("Before") && !list.contains("After"), "{list}");
+    }
+}
+
+#[test]
 fn roles_need_a_signed_team() {
     let root = tempfile::tempdir().unwrap();
     let ann = root.path().join("ann");

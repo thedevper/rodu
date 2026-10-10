@@ -10,7 +10,9 @@
 //! `"keyCheck"`; its files are framed as `RODU-SEALED1` and their payload is sealed (see
 //! [`crate::seal`]). A signed team's team file is format 3: `"signing": "ed25519"` and `"root"`,
 //! the root public key, plus the encryption fields when it is also encrypted; each payload is
-//! signed before it is sealed (see [`crate::sign`]). Which kind a workspace syncs is its own
+//! signed before it is sealed (see [`crate::sign`]). A signed team's replica folders also hold a
+//! machine's request to join, the authority records and admissions it signed, and what it holds
+//! of removed machines (`request.json`, `authority.json`, `seen.json`; `.sealed` when encrypted). Which kind a workspace syncs is its own
 //! setting, never the folder's: a folder that does not match it is refused, so a changed team file
 //! cannot make it write plain or unsigned files, or trust another root key.
 //!
@@ -48,6 +50,21 @@ const REQUEST_PLAIN: &str = "request.json";
 const REQUEST_SEALED: &str = "request.sealed";
 /// The largest request read.
 const MAX_REQUEST: u64 = 4096;
+/// A signed team: what a machine holds of removed machines, in its replica folder; sealed for an
+/// encrypted team. Outside the document, so it never waits on the operations it lets in.
+const SEEN_PLAIN: &str = "seen.json";
+const SEEN_SEALED: &str = "seen.sealed";
+/// The largest seen file read.
+const MAX_SEEN: u64 = 64 * 1024;
+/// A signed team: the authority records and admissions a machine signed, in its replica folder
+/// as well as in the document; sealed for an encrypted team. Each verifies by its own signature,
+/// so where it travels does not matter, and a file is read before any update: a replica knows
+/// who was admitted and removed before it takes in a single operation, rather than once the
+/// operations those records depend on have landed.
+const AUTHORITY_PLAIN: &str = "authority.json";
+const AUTHORITY_SEALED: &str = "authority.sealed";
+/// The largest authority file read.
+const MAX_AUTHORITY_FILE: u64 = 1024 * 1024;
 /// A replica compacts its own files once it wrote this many since it last did.
 const COMPACT_AT: usize = 32;
 
@@ -161,6 +178,9 @@ pub struct PullReport {
     /// Signed team: replica folders holding files from a machine not admitted yet, with how many
     /// files wait. They are read again on every pull.
     pub awaiting: Vec<(u64, usize)>,
+    /// Signed team: files from a removed machine that go on past where the team cut it off. Said
+    /// once; each is read again only if the cut moves.
+    pub cut: Vec<String>,
     /// Replicas whose files this machine dealt with are gone, with no newer file in their place
     /// yet: a compacted file still arriving. Said on every pull until it arrives.
     pub missing: Vec<String>,
@@ -175,6 +195,55 @@ struct RequestFile {
     name: String,
     public_key: String,
     signature: String,
+}
+
+/// What a seen file holds: `seen` is `<removed peer, 16 hex>:<end>` entries, comma-separated.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeenFile {
+    format: u32,
+    public_key: String,
+    seen: String,
+    signature: String,
+}
+
+/// What an authority file holds: record texts, and admissions as `<peer, 16 hex>.<record>`.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityFile {
+    format: u32,
+    records: Vec<String>,
+    admissions: Vec<String>,
+}
+
+/// What the folder's authority files hold together, unchecked.
+struct Mirrored {
+    records: Vec<String>,
+    admissions: Vec<(u64, String)>,
+}
+
+/// The claims in a seen file's text; `None` unless every entry is well formed.
+fn parse_seen(text: &str) -> Option<Vec<(u64, u64)>> {
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    text.split(',')
+        .map(|entry| {
+            let (peer, end) = entry.split_once(':')?;
+            let end =
+                (end.len() <= 10 && !end.is_empty() && end.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| end.parse::<u64>().ok())
+                    .flatten()
+                    .filter(|end| *end <= i32::MAX as u64)?;
+            Some((parse_peer_dir(peer)?, end))
+        })
+        .collect()
+}
+
+fn seen_text(claims: &BTreeMap<u64, u64>) -> String {
+    let entries: Vec<String> =
+        claims.iter().map(|(peer, end)| format!("{}:{end}", peer_dir_name(*peer))).collect();
+    entries.join(",")
 }
 
 /// A machine asking to join a signed team, as its own key signed it.
@@ -202,14 +271,16 @@ enum Verdict<'a> {
 }
 
 /// The machines a signed team admits: for each peer, the keys admitted for it.
-pub type Admitted = BTreeMap<u64, BTreeSet<PublicKey>>;
+pub use crate::authority::Admitted;
 
 /// Whose files a signed team takes in: the machines admitted, and the root key for any replica
-/// folder while it still owns the team or is an admin.
+/// folder while it still owns the team or is an admin; and up to which operation, for each peer
+/// the team removed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Trusted {
     admitted: Admitted,
     root: Option<PublicKey>,
+    cut: BTreeMap<u64, u64>,
 }
 
 impl Trusted {
@@ -226,6 +297,9 @@ const NOTE_ADMITTED: &str = "admitted";
 const NOTE_AUTHORITY: &str = "authority";
 /// The local note listing the authority entries that failed their check, one hash per line.
 const NOTE_AUTHORITY_REFUSED: &str = "authority-refused";
+/// The local note listing the seen claims this replica took into account, one
+/// `<by>.<signer>.<removed>.<end>` per line.
+const NOTE_SEEN: &str = "seen";
 /// The most refused authority entries noted.
 const MAX_REFUSED: usize = 4096;
 /// The local note listing the hashes of the transfers this replica follows, epoch 1 first.
@@ -233,6 +307,10 @@ const NOTE_OWNERS: &str = "owners";
 /// The local note on a file that waits for its signer to be admitted: the signer's key.
 fn await_note(stat: &str) -> String {
     format!("await/{stat}")
+}
+/// The local note on a file that goes past its removed peer's cut: the cut it was read under.
+fn cut_note(stat: &str) -> String {
+    format!("cut/{stat}")
 }
 
 impl PullReport {
@@ -265,9 +343,12 @@ impl PullReport {
             let mut seen = BTreeSet::new();
             list.retain(|entry| seen.insert(entry.clone()));
         }
+        batch.cut.splice(0..0, self.batch.cut);
         let mut damaged = self.damaged;
         damaged.extend(second.damaged);
-        PullReport { damaged, batch, ..second }
+        let mut cut = self.cut;
+        cut.extend(second.cut);
+        PullReport { damaged, cut, batch, ..second }
     }
 }
 
@@ -512,6 +593,13 @@ impl TeamFolder {
     /// error: the file went out.
     pub fn push(&self, store: &LoroStore) -> Result<Pushed> {
         let info = self.checked_info()?;
+        // Nothing it writes now would be taken in, and a compaction would put operations every
+        // replica takes in into a file none takes in.
+        if self.signing.is_some() && self.trusted(store, &info)?.cut.contains_key(&store.peer()) {
+            return Err(RoduError::invalid(
+                "This machine was removed from the team: nothing it writes is taken in any more",
+            ));
+        }
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         let mut written = None;
         store.export_own(|payload| {
@@ -674,11 +762,16 @@ impl TeamFolder {
     pub fn admit(&self, store: &LoroStore, request: &JoinRequest) -> Result<()> {
         let info = self.checked_info()?;
         let authority = self.authority_of(store, &info)?;
+        if self.trusted(store, &info)?.cut.contains_key(&request.peer) {
+            return Err(RoduError::invalid("That machine was removed from the team")
+                .with_hint("It can join again as a new machine, from a new workspace"));
+        }
         match &self.signing {
-            Some((key, _)) if authority.may_admit(&key.public()) => store.set_admission(
-                request.peer,
-                &key.admit(self.team_id(&info), request.peer, &request.key),
-            ),
+            Some((key, _)) if authority.may_admit(&key.public()) => {
+                let record = key.admit(self.team_id(&info), request.peer, &request.key);
+                store.set_admission(request.peer, &record)?;
+                self.mirror(store, &info, None)
+            }
             _ => Err(RoduError::invalid(
                 "Only the team owner's machine, or an admin's, can admit machines",
             )),
@@ -692,15 +785,66 @@ impl TeamFolder {
         let info = self.checked_info()?;
         let trusted = self.trusted(store, &info)?;
         let first = self.pull_once(store, checker, &info, &trusted)?;
-        if first.awaiting.is_empty() {
-            return Ok(first);
-        }
         let now = self.trusted(store, &info)?;
-        if now == trusted {
-            return Ok(first);
+        let mut report = if now == trusted {
+            first
+        } else {
+            first.then(self.pull_once(store, checker, &info, &now)?)
+        };
+        // What came in stays in; only the word on what this machine holds waits for next time.
+        if let Err(e) = self.note_seen(store, &info) {
+            report.batch.notes.push(format!(
+                "saying what this machine holds of removed machines: {}; tried again next time",
+                e.message
+            ));
         }
-        let second = self.pull_once(store, checker, &info, &now)?;
-        Ok(first.then(second))
+        Ok(report)
+    }
+
+    /// Signed team, on a member's machine: says in its seen file how much it holds of each
+    /// removed peer, where that is more than the removals of it name, so every replica takes in
+    /// what this one may have built on ([`Authority::cuts`]). Rewritten only when that changed.
+    fn note_seen(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
+        let records = self.authority_records(store, info)?;
+        let authority = self.resolve(store, &records)?;
+        let admitted = self.admitted_under(store, info, &authority)?;
+        // The cuts the removals alone make: a claim at or below them says nothing new.
+        let removals = authority.cuts(&records, &admitted, &[]);
+        let me = key.public();
+        let member = authority.may_admit(&me)
+            || (admitted.get(&store.peer()).is_some_and(|keys| keys.contains(&me))
+                && !removals.contains_key(&store.peer()));
+        if !member {
+            return Ok(());
+        }
+        let claims: BTreeMap<u64, u64> = removals
+            .iter()
+            .map(|(peer, cut)| (*peer, *cut, store.seen_end(*peer)))
+            .filter(|(_, cut, held)| held > cut)
+            .map(|(peer, _, held)| (peer, held))
+            .collect();
+        let text = seen_text(&claims);
+        let now = self.seen_of(info, store.peer())?;
+        if now.as_ref().map(|(_, t)| t.as_str()) == Some(text.as_str())
+            || (now.is_none() && claims.is_empty())
+        {
+            return Ok(());
+        }
+        let seen = SeenFile {
+            format: 1,
+            public_key: me.to_hex(),
+            signature: key.sign_seen(self.team_id(info), store.peer(), &text),
+            seen: text,
+        };
+        let json = serde_json::to_vec(&seen).expect("a seen file serializes");
+        let (file, bytes) = match &self.key {
+            Some(team) => (SEEN_SEALED, seal::seal(team, self.team_id(info), store.peer(), &json)?),
+            None => (SEEN_PLAIN, json),
+        };
+        let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
+        fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
+        write_replacing(&dir, &dir.join(file), &bytes)
     }
 
     /// The machines admitted, by peer: every admission in the team document or checked before
@@ -711,14 +855,210 @@ impl TeamFolder {
     /// The root key is trusted for every replica folder while it owns the team or is an admin.
     fn trusted(&self, store: &LoroStore, info: &TeamInfo) -> Result<Trusted> {
         let Some((_, root)) = &self.signing else { return Ok(Trusted::default()) };
-        let authority = self.authority_of(store, info)?;
+        let records = self.authority_records(store, info)?;
+        let authority = self.resolve(store, &records)?;
+        let admitted = self.admitted_under(store, info, &authority)?;
+        let seen = self.checked_seen(store, info, &authority, &admitted)?;
+        let cut = authority.cuts(&records, &admitted, &seen);
+        Ok(Trusted { admitted, root: authority.may_admit(root).then_some(*root), cut })
+    }
+
+    /// Every seen claim this replica took into account: the local note's, and those in the
+    /// folder's seen files whose signer may admit or is admitted for the folder it was read from
+    /// (whether that machine is removed is [`Authority::cuts`]'s to judge). Only the highest claim
+    /// of each machine about each removed peer is kept, so the note stays as small as the team.
+    /// Saves the note when it changed.
+    fn checked_seen(
+        &self,
+        store: &LoroStore,
+        info: &TeamInfo,
+        authority: &Authority,
+        admitted: &Admitted,
+    ) -> Result<Vec<authority::Seen>> {
+        let noted = store.local_note(NOTE_SEEN)?.unwrap_or_default();
+        let mut highest: BTreeMap<(u64, PublicKey, u64), u64> = BTreeMap::new();
+        let mut raise = |claim: authority::Seen| {
+            let end = highest.entry((claim.by, claim.signer, claim.removed)).or_insert(claim.end);
+            *end = (*end).max(claim.end);
+        };
+        for line in noted.lines() {
+            let parts: Vec<&str> = line.split('.').collect();
+            let [by, signer, removed, end] = parts.as_slice() else { continue };
+            let parsed = (|| {
+                Some(authority::Seen {
+                    by: parse_peer_dir(by)?,
+                    signer: PublicKey::from_hex(signer)?,
+                    removed: parse_peer_dir(removed)?,
+                    end: end.parse().ok()?,
+                })
+            })();
+            parsed.into_iter().for_each(&mut raise);
+        }
+        for claim in self.read_seen(info)? {
+            let counts = authority.may_admit(&claim.signer)
+                || admitted.get(&claim.by).is_some_and(|keys| keys.contains(&claim.signer));
+            if counts {
+                raise(claim);
+            }
+        }
+        let claims: Vec<authority::Seen> = highest
+            .into_iter()
+            .map(|((by, signer, removed), end)| authority::Seen { by, signer, removed, end })
+            .collect();
+        let lines: Vec<String> = claims
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}.{}.{}.{}",
+                    peer_dir_name(c.by),
+                    c.signer.to_hex(),
+                    peer_dir_name(c.removed),
+                    c.end
+                )
+            })
+            .collect();
+        if lines.join("\n") != noted {
+            store.set_local_note(NOTE_SEEN, &lines.join("\n"))?;
+        }
+        Ok(claims)
+    }
+
+    /// Writes this machine's authority file afresh: every authority record and admission this
+    /// replica checked that this machine's key signed (from its local notes, so a file that was
+    /// damaged, grew too large or was changed loses nothing), with `also`, and whatever the file
+    /// held that still reads.
+    fn mirror(&self, store: &LoroStore, info: &TeamInfo, also: Option<&Record>) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
+        let me = key.public();
+        let mut file = self
+            .authority_file(info, store.peer())?
+            .unwrap_or(AuthorityFile { format: 1, ..Default::default() });
+        let records = self.authority_records(store, info)?;
+        let signed = records.iter().chain(also).filter(|r| r.signer() == me);
+        for text in signed.map(|r| r.text().to_owned()) {
+            if !file.records.contains(&text) {
+                file.records.push(text);
+            }
+        }
+        for (peer, member, signer) in self.checked_admissions(store, info)? {
+            if signer == me {
+                // Ed25519 signs deterministically: the same record as the one first written.
+                let entry = format!(
+                    "{}.{}",
+                    peer_dir_name(peer),
+                    key.admit(self.team_id(info), peer, &member)
+                );
+                if !file.admissions.contains(&entry) {
+                    file.admissions.push(entry);
+                }
+            }
+        }
+        let json = serde_json::to_vec(&file).expect("an authority file serializes");
+        let (name, bytes) = match &self.key {
+            Some(team) => {
+                (AUTHORITY_SEALED, seal::seal(team, self.team_id(info), store.peer(), &json)?)
+            }
+            None => (AUTHORITY_PLAIN, json),
+        };
+        let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
+        fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
+        write_replacing(&dir, &dir.join(name), &bytes)
+    }
+
+    /// `peer`'s authority file, if it is there and reads.
+    fn authority_file(&self, info: &TeamInfo, peer: u64) -> Result<Option<AuthorityFile>> {
+        let name = if self.key.is_some() { AUTHORITY_SEALED } else { AUTHORITY_PLAIN };
+        let Some(json) = self.small_file(info, peer, name, MAX_AUTHORITY_FILE) else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_slice::<AuthorityFile>(&json).ok().filter(|file| file.format == 1))
+    }
+
+    /// Every record text and admission in the folder's authority files, unchecked: each is checked
+    /// by its signature like those in the document.
+    fn mirrored(&self, info: &TeamInfo) -> Result<Mirrored> {
+        let (mut records, mut admissions) = (Vec::new(), Vec::new());
+        for peer in self.replica_folders()? {
+            let Some(file) = self.authority_file(info, peer)? else { continue };
+            records.extend(file.records);
+            for entry in file.admissions {
+                if let Some((peer, record)) = entry.split_once('.')
+                    && let Some(peer) = parse_peer_dir(peer)
+                {
+                    admissions.push((peer, record.to_owned()));
+                }
+            }
+        }
+        Ok(Mirrored { records, admissions })
+    }
+
+    /// The peers of the replica folders (never a link in place of one).
+    fn replica_folders(&self) -> Result<Vec<u64>> {
+        let sync = self.root.join(SYNC_DIR);
+        let mut peers = Vec::new();
+        for entry in fs::read_dir(&sync).map_err(|e| folder_error(&sync, e))? {
+            let entry = entry.map_err(|e| folder_error(&sync, e))?;
+            let Some(peer) = entry.file_name().to_str().and_then(parse_peer_dir) else { continue };
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                peers.push(peer);
+            }
+        }
+        peers.sort();
+        Ok(peers)
+    }
+
+    /// A small file `name` in `peer`'s replica folder, opened with the team key for an encrypted
+    /// team; `None` if it is missing, a link, larger than `max`, or does not open.
+    fn small_file(&self, info: &TeamInfo, peer: u64, name: &str, max: u64) -> Option<Vec<u8>> {
+        let path = self.root.join(SYNC_DIR).join(peer_dir_name(peer)).join(name);
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            return None;
+        }
+        let bytes = read_at_most(&path, max).ok().flatten()?;
+        match &self.key {
+            Some(team) => seal::open(team, self.team_id(info), peer, &bytes),
+            None => Some(bytes),
+        }
+    }
+
+    /// The claims in the folder's seen files whose signature verifies, each with the folder it
+    /// was read from. Anything else (a link, an oversize, damaged or unsigned file) is skipped.
+    fn read_seen(&self, info: &TeamInfo) -> Result<Vec<authority::Seen>> {
+        let mut found = Vec::new();
+        for by in self.replica_folders()? {
+            let Some((signer, text)) = self.seen_of(info, by)? else { continue };
+            for (removed, end) in parse_seen(&text).unwrap_or_default() {
+                found.push(authority::Seen { by, signer, removed, end });
+            }
+        }
+        Ok(found)
+    }
+
+    /// The signer and the text of `peer`'s seen file, if it is there and its signature verifies.
+    fn seen_of(&self, info: &TeamInfo, peer: u64) -> Result<Option<(PublicKey, String)>> {
+        let name = if self.key.is_some() { SEEN_SEALED } else { SEEN_PLAIN };
+        let Some(json) = self.small_file(info, peer, name, MAX_SEEN) else { return Ok(None) };
+        let Ok(seen) = serde_json::from_slice::<SeenFile>(&json) else { return Ok(None) };
+        let Some(key) = PublicKey::from_hex(&seen.public_key) else { return Ok(None) };
+        let valid = seen.format == 1
+            && sign::check_seen(&key, self.team_id(info), peer, &seen.seen, &seen.signature);
+        Ok(valid.then_some((key, seen.seen)))
+    }
+
+    /// The admissions that count under `authority`, by peer.
+    fn admitted_under(
+        &self,
+        store: &LoroStore,
+        info: &TeamInfo,
+        authority: &Authority,
+    ) -> Result<Admitted> {
         let mut admitted = Admitted::new();
         for (peer, member, signer) in self.checked_admissions(store, info)? {
             if authority.counts(&signer, peer, &member) {
                 admitted.entry(peer).or_default().insert(member);
             }
         }
-        Ok(Trusted { admitted, root: authority.may_admit(root).then_some(*root) })
+        Ok(admitted)
     }
 
     /// Every admission this replica checked, as (peer, member, signer): the local note's, and the
@@ -751,8 +1091,14 @@ impl TeamFolder {
             checked.extend(parsed);
         }
         let before = checked.len();
-        for (peer, record) in store.admissions()? {
-            if let Some((member, signer)) = sign::check_admission(root, team, peer, &record) {
+        // An admission signed by a key that could never admit is not noted: anyone who can write
+        // to the folder could otherwise grow the note without end.
+        let admitters = authority::admitters(*root, &self.authority_records(store, info)?);
+        let mirrored = self.mirrored(info)?.admissions;
+        for (peer, record) in store.admissions()?.into_iter().chain(mirrored) {
+            if let Some((member, signer)) = sign::check_admission(root, team, peer, &record)
+                && admitters.contains(&signer)
+            {
                 checked.insert((peer, member, signer));
             }
         }
@@ -784,7 +1130,9 @@ impl TeamFolder {
         let refused_note = store.local_note(NOTE_AUTHORITY_REFUSED)?.unwrap_or_default();
         let mut refused: BTreeSet<String> = refused_note.lines().map(str::to_owned).collect();
         let refused_before = refused.len();
-        for (key, text) in store.authority()? {
+        let mirrored =
+            self.mirrored(info)?.records.into_iter().map(|text| (authority::key_of(&text), text));
+        for (key, text) in store.authority()?.into_iter().chain(mirrored) {
             if records.get(&key).is_some_and(|r| r.text() == text) {
                 continue;
             }
@@ -821,17 +1169,22 @@ impl TeamFolder {
         let Some((_, root)) = &self.signing else {
             return Err(RoduError::internal("only a signed team has owners"));
         };
-        let noted = store.local_note(NOTE_OWNERS)?.unwrap_or_default();
-        let settled: Vec<authority::Hash> = noted
-            .lines()
-            .map_while(|line| hex::decode(line).ok().and_then(|bytes| bytes.try_into().ok()))
-            .collect();
+        let settled = self.settled(store)?;
         let authority = Authority::resolve(*root, records, &settled);
         if authority.settled() != settled {
             let lines: Vec<String> = authority.settled().iter().map(hex::encode).collect();
             store.set_local_note(NOTE_OWNERS, &lines.join("\n"))?;
         }
         Ok(authority)
+    }
+
+    /// The hashes of the transfers this replica followed, epoch 1 first (local note `owners`).
+    fn settled(&self, store: &LoroStore) -> Result<Vec<authority::Hash>> {
+        let noted = store.local_note(NOTE_OWNERS)?.unwrap_or_default();
+        Ok(noted
+            .lines()
+            .map_while(|line| hex::decode(line).ok().and_then(|bytes| bytes.try_into().ok()))
+            .collect())
     }
 
     fn authority_of(&self, store: &LoroStore, info: &TeamInfo) -> Result<Authority> {
@@ -843,6 +1196,44 @@ impl TeamFolder {
     pub fn authority(&self, store: &LoroStore) -> Result<Authority> {
         let info = self.checked_info()?;
         self.authority_of(store, &info)
+    }
+
+    /// Signed team: the peers it removed, each with the count of its operations taken in.
+    pub fn removed(&self, store: &LoroStore) -> Result<BTreeMap<u64, u64>> {
+        let info = self.checked_info()?;
+        Ok(self.trusted(store, &info)?.cut)
+    }
+
+    /// Signed team, on the owner's or an admin's machine: removes the machine writing as `peer`.
+    /// Its operations past those this replica holds are refused on every replica, apart from
+    /// those a member took in before it heard of the removal ([`Authority::cuts`]). The owner's
+    /// and admins' machines are not removed. Returns false when `peer` was removed already. The
+    /// next push sends the record.
+    pub fn remove(&self, store: &LoroStore, peer: u64) -> Result<bool> {
+        let info = self.checked_info()?;
+        let records = self.authority_records(store, &info)?;
+        let authority = self.resolve(store, &records)?;
+        let key = match &self.signing {
+            Some((key, _)) if authority.may_admit(&key.public()) => key,
+            _ => {
+                return Err(RoduError::invalid(
+                    "Only the team owner's machine, or an admin's, can remove machines",
+                ));
+            }
+        };
+        let admitted = self.admitted_under(store, &info, &authority)?;
+        if admitted.get(&peer).is_some_and(|keys| keys.iter().any(|k| authority.may_admit(k))) {
+            return Err(RoduError::invalid(
+                "The team owner's machine and admins' machines are not removed",
+            )
+            .with_hint("The owner first stops it being an admin: rodu team admin <name> off"));
+        }
+        if authority.cuts(&records, &admitted, &[]).contains_key(&peer) {
+            return Ok(false);
+        }
+        let record = Record::removal(self.team_id(&info), key, peer, store.seen_end(peer));
+        self.write_authority(store, &info, &record)?;
+        Ok(true)
     }
 
     /// This machine's key, when it owns the team; otherwise the error saying who may `what`.
@@ -865,6 +1256,17 @@ impl TeamFolder {
         if *target == authority.owner() {
             return Err(RoduError::invalid("The team owner is not made an admin"));
         }
+        // An admin's machine is never cut, so making a removed machine's key an admin would
+        // undo its removal.
+        let trusted = self.trusted(store, &info)?;
+        let removed = trusted
+            .admitted
+            .iter()
+            .any(|(peer, keys)| trusted.cut.contains_key(peer) && keys.contains(target));
+        if on && removed {
+            return Err(RoduError::invalid("That machine was removed from the team")
+                .with_hint("It can join again as a new machine, from a new workspace"));
+        }
         let (epoch, n) = (authority.epoch(), authority.next_n(&records, target));
         let record = if on {
             Record::grant(team, key, epoch, n, target)
@@ -877,6 +1279,12 @@ impl TeamFolder {
                 })
                 .map(|(peer, member, _)| (peer, member))
                 .collect();
+            // The machines `target` removed stay out: their removals count only while their
+            // signer may admit, so the owner signs them again.
+            let admitted = self.admitted_under(store, &info, &authority)?;
+            for (peer, end) in authority.removals_by(&records, &admitted, target) {
+                self.write_authority(store, &info, &Record::removal(team, key, peer, end))?;
+            }
             Record::revoke(team, key, epoch, n, target, &kept)
         };
         self.write_authority(store, &info, &record)
@@ -911,7 +1319,7 @@ impl TeamFolder {
         }
         let records = self.authority_records(store, info)?;
         self.resolve(store, &records)?;
-        Ok(())
+        self.mirror(store, info, Some(record))
     }
 
     /// What a signed team does with a file's payload once it is unframed and opened: its Loro
@@ -998,6 +1406,13 @@ impl TeamFolder {
                     *awaiting.entry(peer).or_default() += 1;
                     continue;
                 }
+                // A file found to go past its peer's cut is not read again until the cut moves.
+                if let Some(stat) = &stat
+                    && let Some(cut) = trusted.cut.get(&peer)
+                    && store.local_note(&cut_note(stat))? == Some(cut.to_string())
+                {
+                    continue;
+                }
                 let limit = (MAX_IMPORT_BYTES + HEADER + SEAL_OVERHEAD) as u64;
                 if size > limit {
                     report_too_large(store, &mut report, &shown, size)?;
@@ -1041,9 +1456,12 @@ impl TeamFolder {
                     Err(why) => Verdict::Damaged(why),
                 };
                 match verdict {
-                    Verdict::Accept(update) => {
-                        incoming.push(Incoming { peer, key, bytes: update.to_vec() })
-                    }
+                    Verdict::Accept(update) => incoming.push(Incoming {
+                        peer,
+                        key,
+                        bytes: update.to_vec(),
+                        limit: trusted.cut.get(&peer).copied(),
+                    }),
                     // Not remembered as done: read again once its signer is admitted.
                     Verdict::Await(signer) => {
                         *awaiting.entry(peer).or_default() += 1;
@@ -1066,6 +1484,14 @@ impl TeamFolder {
         // Landed, refused or reported: never read again while its name, size and time hold.
         // A file still waiting for other operations is not, so it is read again next time.
         for (key, stat, peer, seq) in read {
+            if report.batch.cut.contains(&key) {
+                let shown = key.rsplit_once('/').map_or(key.as_str(), |(shown, _)| shown);
+                report.cut.push(shown.to_owned());
+                if let (Some(stat), Some(cut)) = (&stat, trusted.cut.get(&peer)) {
+                    store.set_local_note(&cut_note(stat), &cut.to_string())?;
+                }
+                continue;
+            }
             if store.sync_seen(&key)? {
                 if let Some(stat) = stat {
                     store.mark_sync_seen(&stat)?;
@@ -1134,6 +1560,24 @@ fn read_at_most(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
     fs::File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
+
+/// Writes a whole file under a temporary hidden name, then renames it over `path`, so readers
+/// never see it half written.
+fn write_replacing(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map_err(|e| folder_error(path, e))
 }
 
 /// Writes a whole file under a temporary hidden name, then renames it to `path`, so readers never

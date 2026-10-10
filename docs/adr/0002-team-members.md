@@ -231,7 +231,7 @@ Where 2b differs from Roles below, 2b is what holds.
   files can land before the revocation counts. Work already taken in is never taken out again;
   later work from that machine waits. Step 3's removal covers what such a machine wrote.
 
-### Step 3: removing someone
+### Step 3: removing someone (3a built 2026-10-10; re-keying is 3b)
 
 - `rodu team remove <name>` (owner or admin, within the limits under Roles) signs a removal
   record. For each of that person's peers, it names the last file sequence this replica had
@@ -244,6 +244,81 @@ Where 2b differs from Roles below, 2b is what holds.
   needs an X25519 key per machine besides the signing key, and it is the largest part of this
   step. Until it is built, `team remove` on an encrypted team says that what the person already
   had and anything written afterwards stays readable to them, and recommends a new team.
+
+#### Step 3a as built (removal on a signed team; re-keying is 3b)
+
+Where 3a differs from the text above, 3a is what holds.
+
+- **The cut is counted in operations, not files.** File names are not signed (2a), and a
+  compaction rewrites a replica's work into one new file, so a file sequence proves nothing. A
+  removal names the peer and how many of its Loro operations the remover's machine holds (the
+  peer's entry in its version vector). Operations of that peer past the count are refused: the
+  import check, which already decodes each update in the child process, also checks that the
+  update ends by the cut, and reports it as cut rather than damaged. A file going past the cut is
+  not taken in and not remembered as done. It is said once ("not taken in ... written after it
+  was removed") and read again only if the cut moves.
+- **Removal record.** `remove.<peer, 16 hex>.<end>.<signer key>.<signature>` in the `authority`
+  map, signed like the other authority records. It counts while its signer is the owner or an
+  admin, and no key admitted for that peer is the owner or an admin: the owner's and admins'
+  machines are never removed (the owner first revokes an admin). Where more than one counts, the
+  highest end is the cut, so a remover who saw more of the peer's work keeps it. An admin can
+  already admit anyone, so letting an admin raise a cut gives no new power. When the owner
+  revokes an admin, it signs again each removal that admin made, so those machines stay out, as a
+  revocation keeps that admin's admissions. `rodu team remove <name> [--machine <id>] --yes`
+  removes the person's machines (their `members` entries), and refuses before writing anything if
+  one of them is the owner's or an admin's. A removed machine cannot be admitted again, nor its
+  key made an admin (an admin's machine is never cut, so that would undo the removal): it joins
+  again as a new machine, from a new workspace.
+- **Work a member built on is never cut.** In Loro every change depends on everything its
+  machine held. If a member took in some of the removed machine's later work before it heard of
+  the removal, all of that member's later work depends on it, and a replica refusing it could
+  never take in anything from that member again: the team would split for good. So each machine
+  that holds more of a removed peer than the removals name says so in a file of its own replica
+  folder, `seen.json` (`seen.sealed`, sealed with the team key, for an encrypted team):
+  `{"format": 1, "publicKey", "seen": "<peer>:<end>,...", "signature"}`, signed over
+  `"rodu-seen-1" 0x00 || workspace id length (u64 LE) || workspace id || writer peer id (u64 LE)
+  || text length (u64 LE) || text`. A claim counts when its signer is the owner or an admin, or is
+  admitted for the replica folder it sits in and that machine is not removed. The cut moves up to
+  the highest claim that counts. The claim cannot travel in the document: there it would depend on
+  the very operations it lets in, and wait for them for ever. Each replica keeps the highest claim
+  of each machine it counted (local note `seen`), so a claim deleted later still counts there.
+- **Authority travels outside the document too.** Each authority record and admission is also
+  written to the signing machine's `authority.json` (`authority.sealed`): `{"format": 1,
+  "records": [...], "admissions": ["<peer>.<record>", ...]}`, read up to 1 MiB. Each entry
+  verifies by its own signature, exactly as in the document, so the file adds no trust. What it
+  adds is timing: a replica knows who was admitted and removed before it takes in a single
+  operation. Without it, a replica catching up learns of a removal only once the operations the
+  record depends on have landed, and by then it has read the removed machine's later files with
+  no cut in place. It also narrows the 2b residuals: a revocation or an admission in a file is
+  seen before any update is read, and deleting it from the document no longer hides it. Since a
+  stranger's file can hold any number of self-signed admissions, an admission is noted only when
+  its signer could ever admit (the root, a key a transfer hands the team to, or a key such a key
+  granted admin). A machine writes its file afresh each time, from its notes, so a damaged file
+  loses nothing.
+- **A removed machine stops.** Once it hears of its removal (from a file, before it reads any
+  update), its push is refused with "This machine was removed from the team", so it neither
+  writes nor compacts work nobody takes in. `rodu team` says so, and `rodu team members` marks the
+  machine "removed".
+- **Left for later.**
+  - Re-keying an encrypted team (3b). Until then a removed person keeps the team key, and `team
+    remove` on an encrypted team says so before `--yes`.
+  - Anyone who can write to the folder can delete files there (ADR 0001), including a removed
+    person whose access to the shared folder was not taken away. That includes their own files
+    from before the cut, which a replica joining later then never gets, and anything built on
+    them waits on such a replica. `team remove` asks for the person's folder access to be taken
+    away too.
+  - A removed machine that never heard of its removal and compacted puts work from before the
+    cut and after it into one file, which is refused whole. A replica that already had the
+    earlier files loses nothing. One that did not (one joining later, after that compaction
+    removed the earlier files) misses that work.
+  - A dishonest member can claim to hold more of a removed peer than it does, and so let that
+    peer's later work in, as it could write that work itself. Removing that member too ends it;
+    what came in before stays.
+  - An owner who signs a grant of admin to a removed machine's key by hand, rather than through
+    `rodu team admin`, undoes that removal: an owner's choice, not a way in for anyone else.
+  - Records and admissions in a stranger's authority file are checked again on every read, as
+    those in the document are. A file of 1 MiB of validly signed records costs every read their
+    signature checks.
 
 ### Roles
 

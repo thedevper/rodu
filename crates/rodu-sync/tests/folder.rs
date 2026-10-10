@@ -29,13 +29,14 @@ fn check_child() {
     }
     let mut input = Vec::new();
     std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut input).unwrap();
-    // The peers of the updates this check replays: after the snapshot, [peer, length, bytes]...
+    // The peers of the updates this check replays: after the snapshot, [peer, cut, length,
+    // bytes]...
     let word = |at: usize| u64::from_le_bytes(input[at..at + 8].try_into().unwrap());
     let mut peers = Vec::new();
     let mut at = 8 + word(0) as usize;
     while at < input.len() {
         peers.push(word(at));
-        at += 16 + word(at + 8) as usize;
+        at += 24 + word(at + 16) as usize;
     }
     if let Some(log) = std::env::var_os(LOG_ENV) {
         let mut file = std::fs::OpenOptions::new().append(true).create(true).open(log).unwrap();
@@ -56,7 +57,7 @@ fn check_child() {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{e}");
-            2
+            e.exit_code()
         }
     };
     std::process::exit(code);
@@ -1126,8 +1127,9 @@ fn a_pull_that_brings_an_admission_takes_in_the_admitted_machines_files_at_once(
         ann_folder.admit(a.store(), &request).unwrap();
     }
     a.sync(&ann_folder);
-    // cat had not seen bob's admission: one pull brings it, then bob's file.
-    let report = c.sync(&signed_at(root.path(), &cat_key));
+    // cat had not seen bob's admission: one pull brings it, then bob's file. (Without ann's
+    // authority file, as for records written before there were any, it comes in the document.)
+    let report = unheard(root.path(), || c.sync(&signed_at(root.path(), &cat_key)));
     assert!(report.awaiting.is_empty(), "{report:?}");
     assert_eq!(names(&c), ["ann", "bob", "cat"]);
     drop(b);
@@ -1385,7 +1387,7 @@ fn an_admin_admits_and_a_revocation_keeps_only_the_machines_let_in_before() {
     let d = join_signed(&signed_at(root.path(), &dan_key), "dan");
     ann_folder.set_admin(a.store(), &bob, false).unwrap();
     a.sync(&ann_folder);
-    bob_folder.admit(b.store(), &request_of(&bob_folder, "dan")).unwrap();
+    unheard(root.path(), || bob_folder.admit(b.store(), &request_of(&bob_folder, "dan")).unwrap());
     b.sync(&bob_folder);
     let report = a.sync(&ann_folder);
     assert_eq!(report.awaiting, vec![(d.store().peer(), 1)], "{report:?}");
@@ -1589,4 +1591,270 @@ fn authority_entries_that_fail_their_check_are_noted_and_ignored() {
     assert_eq!(note.lines().count(), 1, "{note}");
     assert!(!note.contains(outsider.text()));
     assert!(bob_folder.authority(b.store()).unwrap().is_admin(&public(&bob_key)));
+}
+
+/// Runs `f` as a machine would before the authority files written so far reach it.
+fn unheard<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("Shared/Team/sync"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join("authority.json"))
+        .filter(|path| path.exists())
+        .collect();
+    for path in &files {
+        std::fs::rename(path, path.with_extension("hidden")).unwrap();
+    }
+    let out = f();
+    for path in &files {
+        std::fs::rename(path.with_extension("hidden"), path).unwrap();
+    }
+    out
+}
+
+/// ann (the owner), bob and cat, each with the folder as their machine sees it.
+struct Three {
+    ann_folder: TeamFolder,
+    a: Machine,
+    bob_key: String,
+    bob_folder: TeamFolder,
+    b: Machine,
+    cat_folder: TeamFolder,
+    c: Machine,
+}
+
+/// ann (the owner) and bob, with cat admitted by ann and cat's "Before" taken in everywhere.
+fn with_cat(root: &std::path::Path) -> Three {
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root);
+    let cat_folder = signed_at(root, &key_hex());
+    let c = join_signed(&cat_folder, "cat");
+    ann_folder.admit(a.store(), &request_of(&ann_folder, "cat")).unwrap();
+    a.sync(&ann_folder);
+    c.sync(&cat_folder);
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "Before" })], None).unwrap();
+    c.sync(&cat_folder);
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    assert!(b.titles().contains(&"Before".to_owned()));
+    Three { ann_folder, a, bob_key, bob_folder, b, cat_folder, c }
+}
+
+#[test]
+fn a_removed_machine_keeps_what_it_wrote_before_and_nothing_after() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = with_cat(root.path());
+    let cat = c.store().peer();
+    // Only the owner or an admin removes, and never the owner's machine.
+    assert!(bob_folder.remove(b.store(), cat).is_err());
+    assert!(ann_folder.remove(a.store(), a.store().peer()).is_err());
+    assert!(ann_folder.remove(a.store(), cat).unwrap());
+    assert!(!ann_folder.remove(a.store(), cat).unwrap(), "removed already");
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.removed(b.store()).unwrap().keys().collect::<Vec<_>>(), [&cat]);
+    // cat, not having heard, writes on: nobody takes it in, and each says so once.
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "After" })], None).unwrap();
+    unheard(root.path(), || cat_folder.push(c.store()).unwrap());
+    for (folder, m) in [(&bob_folder, &b), (&ann_folder, &a)] {
+        let report = m.sync(folder);
+        assert_eq!(report.cut.len(), 1, "{report:?}");
+        assert!(report.batch.refused.is_empty(), "{report:?}");
+        assert!(m.titles().contains(&"Before".to_owned()));
+        assert!(!m.titles().contains(&"After".to_owned()));
+        assert!(m.sync(folder).cut.is_empty(), "said once");
+    }
+    // Nor does making its key an admin bring it back.
+    let cat_key = request_of(&ann_folder, "cat").key;
+    assert!(ann_folder.set_admin(a.store(), &cat_key, true).is_err());
+    // Once cat hears, its machine writes nothing more, and cannot be admitted again.
+    cat_folder.pull(c.store(), &checker()).unwrap();
+    let refused = cat_folder.push(c.store()).unwrap_err();
+    assert!(refused.message.contains("removed"), "{}", refused.message);
+    assert!(ann_folder.admit(a.store(), &request_of(&ann_folder, "cat")).is_err());
+    // A machine joining later takes in what cat wrote before, and nothing after.
+    let dan_folder = signed_at(root.path(), &key_hex());
+    let d = join_signed(&dan_folder, "dan");
+    ann_folder.admit(a.store(), &request_of(&ann_folder, "dan")).unwrap();
+    a.sync(&ann_folder);
+    d.sync(&dan_folder);
+    assert!(d.titles().contains(&"Before".to_owned()));
+    assert!(!d.titles().contains(&"After".to_owned()));
+}
+
+#[test]
+fn work_a_member_took_in_before_hearing_of_a_removal_reaches_every_replica() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = with_cat(root.path());
+    let cat = c.store().peer();
+    ann_folder.remove(a.store(), cat).unwrap();
+    a.sync(&ann_folder);
+    // cat writes on, and bob takes it in, in the same pull that brings him the removal in ann's
+    // update before her authority file has arrived.
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "Late" })], None).unwrap();
+    unheard(root.path(), || cat_folder.push(c.store()).unwrap());
+    unheard(root.path(), || bob_folder.pull(b.store(), &checker()).unwrap());
+    assert!(bob_folder.removed(b.store()).unwrap().contains_key(&cat));
+    assert!(b.titles().contains(&"Late".to_owned()));
+    // bob builds on it. Everything bob writes now depends on cat's late work.
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "From bob" })], None).unwrap();
+    bob_folder.push(b.store()).unwrap();
+    // Without bob's word on what he holds, ann cannot take in bob's work.
+    let seen = root.path().join(format!("Shared/Team/sync/{:016x}/seen.json", b.store().peer()));
+    let said = std::fs::read(&seen).unwrap();
+    std::fs::remove_file(&seen).unwrap();
+    a.sync(&ann_folder);
+    assert!(!a.titles().contains(&"From bob".to_owned()));
+    // With it, the cut moves up to what bob holds, and both land, on ann's machine and on one
+    // joining later; what cat writes after that is still refused.
+    std::fs::write(&seen, said).unwrap();
+    a.sync(&ann_folder);
+    assert!(a.titles().contains(&"Late".to_owned()));
+    assert!(a.titles().contains(&"From bob".to_owned()));
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "Later" })], None).unwrap();
+    unheard(root.path(), || cat_folder.push(c.store()).unwrap());
+    let dan_folder = signed_at(root.path(), &key_hex());
+    let d = join_signed(&dan_folder, "dan");
+    ann_folder.admit(a.store(), &request_of(&ann_folder, "dan")).unwrap();
+    a.sync(&ann_folder);
+    d.sync(&dan_folder);
+    for (folder, m) in [(&ann_folder, &a), (&bob_folder, &b), (&dan_folder, &d)] {
+        m.sync(folder);
+        let titles = m.titles();
+        assert!(titles.contains(&"Late".to_owned()) && titles.contains(&"From bob".to_owned()));
+        assert!(!titles.contains(&"Later".to_owned()), "{titles:?}");
+    }
+    // The cut is where bob's claim put it.
+    assert_eq!(ann_folder.removed(a.store()).unwrap()[&cat], b.store().seen_end(cat));
+}
+
+#[test]
+fn the_machines_a_revoked_admin_removed_stay_out() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = with_cat(root.path());
+    let cat = c.store().peer();
+    let bob_key = request_of(&ann_folder, "bob").key;
+    ann_folder.set_admin(a.store(), &bob_key, true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // An admin removes members, but not the owner's machine.
+    assert!(bob_folder.remove(b.store(), a.store().peer()).is_err());
+    bob_folder.remove(b.store(), cat).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    ann_folder.set_admin(a.store(), &bob_key, false).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "After" })], None).unwrap();
+    unheard(root.path(), || cat_folder.push(c.store()).unwrap());
+    for (folder, m) in [(&ann_folder, &a), (&bob_folder, &b)] {
+        assert!(folder.removed(m.store()).unwrap().contains_key(&cat));
+        m.sync(folder);
+        assert!(!m.titles().contains(&"After".to_owned()));
+    }
+}
+
+#[test]
+fn authority_and_seen_files_count_only_for_what_their_signatures_prove() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key, b, c, .. } = with_cat(root.path());
+    let (bob, cat) = (b.store().peer(), c.store().peer());
+    // eve, never admitted, writes into a replica folder of her own: a removal of bob, an admission
+    // of herself, a damaged record, and a claim about cat; her own key signs them all.
+    let eve = MachineKey::generate().unwrap();
+    let eve_peer = 0x0e0e_0e0e_0e0e_0e0e_u64;
+    let dir = root.path().join(format!("Shared/Team/sync/{eve_peer:016x}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let removal = Record::removal(TEAM_ID, &eve, bob, 0);
+    let admission = format!("{eve_peer:016x}.{}", eve.admit(TEAM_ID, eve_peer, &eve.public()));
+    let file = json!({
+        "format": 1,
+        "records": [removal.text(), "remove.0000000000000001.0.x.y"],
+        "admissions": [admission],
+    });
+    std::fs::write(dir.join("authority.json"), file.to_string()).unwrap();
+    let text = format!("{cat:016x}:99");
+    let seen = json!({
+        "format": 1,
+        "publicKey": eve.public().to_hex(),
+        "seen": text,
+        "signature": eve.sign_seen(TEAM_ID, eve_peer, &text),
+    });
+    std::fs::write(dir.join("seen.json"), seen.to_string()).unwrap();
+    ann_folder.remove(a.store(), cat).unwrap();
+    a.sync(&ann_folder);
+    let cut = ann_folder.removed(a.store()).unwrap();
+    assert_eq!(cut.keys().collect::<Vec<_>>(), [&cat], "bob is not removed");
+    assert!(cut[&cat] < 99, "eve's claim does not move cat's cut");
+    assert!(!ann_folder.admissions(a.store()).unwrap().contains_key(&eve_peer));
+    // Nor is her claim or her admission kept in ann's notes.
+    for note in ["seen", "admitted"] {
+        let noted = a.store().local_note(note).unwrap().unwrap_or_default();
+        assert!(!noted.contains(&eve.public().to_hex()), "{note}: {noted}");
+    }
+    // A claim bob signs counts only where bob's key is admitted: in his own folder, not eve's.
+    let text = format!("{cat:016x}:98");
+    let bob_key = MachineKey::from_hex(&bob_key).unwrap();
+    let claim = |peer: u64| {
+        json!({
+            "format": 1,
+            "publicKey": bob_key.public().to_hex(),
+            "seen": text,
+            "signature": bob_key.sign_seen(TEAM_ID, peer, &text),
+        })
+        .to_string()
+    };
+    std::fs::write(dir.join("seen.json"), claim(eve_peer)).unwrap();
+    assert!(ann_folder.removed(a.store()).unwrap()[&cat] < 98);
+    // A link in place of an authority file is never followed.
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(dir.join("seen.json")).unwrap();
+        let elsewhere = root.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, claim(eve_peer)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join("seen.json")).unwrap();
+        assert!(ann_folder.removed(a.store()).unwrap()[&cat] < 98);
+    }
+}
+
+#[test]
+fn a_machine_catching_up_knows_every_admission_before_it_reads_an_update() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, _, bob_folder, b) = ann_and_bob(root.path());
+    // ann admits each machine after taking in the work of the one before, so in the document
+    // each admission waits on that work.
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "From bob" })], None).unwrap();
+    b.sync(&bob_folder);
+    for name in ["cat", "dan"] {
+        let folder = signed_at(root.path(), &key_hex());
+        let m = join_signed(&folder, name);
+        a.sync(&ann_folder);
+        ann_folder.admit(a.store(), &request_of(&ann_folder, name)).unwrap();
+        a.sync(&ann_folder);
+        m.sync(&folder);
+        m.svc
+            .create_items(&m.me, "DEMO", &[json!({ "title": format!("From {name}") })], None)
+            .unwrap();
+        m.sync(&folder);
+    }
+    a.sync(&ann_folder);
+    // eve's first pull takes in everybody's work: every admission is in an authority file.
+    let e = join(&signed_at(root.path(), &key_hex()), "eve");
+    for title in ["From bob", "From cat", "From dan"] {
+        assert!(e.titles().contains(&title.to_owned()), "{title}: {:?}", e.titles());
+    }
+}
+
+#[test]
+fn a_damaged_authority_file_is_written_again_whole_from_what_this_machine_checked() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, c, .. } = with_cat(root.path());
+    let file =
+        root.path().join(format!("Shared/Team/sync/{:016x}/authority.json", a.store().peer()));
+    let before = std::fs::read_to_string(&file).unwrap();
+    let cat = format!("{:016x}.", c.store().peer());
+    assert!(before.contains(&cat), "{before}");
+    std::fs::write(&file, "not json").unwrap();
+    ann_folder.remove(a.store(), c.store().peer()).unwrap();
+    let after = std::fs::read_to_string(&file).unwrap();
+    // cat's admission is still there, besides the removal.
+    assert!(after.contains(&cat), "{after}");
+    assert!(after.contains(&format!("remove.{:016x}.", c.store().peer())), "{after}");
 }

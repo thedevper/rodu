@@ -93,6 +93,9 @@ pub struct Incoming {
     /// imported twice and a file rewritten under the same name is checked again.
     pub key: String,
     pub bytes: Vec<u8>,
+    /// Signed team: the counter `peer`'s operations must end by, once the team cut it off
+    /// (ADR 0002, step 3). A file going past it is neither imported nor remembered as done.
+    pub limit: Option<u64>,
 }
 
 /// Marks a held file whose check crashed or timed out once (see [`LoroStore::import_batch`]).
@@ -101,9 +104,11 @@ fn strike_key(key: &str) -> String {
     format!("strike:{key}")
 }
 
-/// The files still pending, then `files`, as the child should replay them.
+/// The files still pending, then `files`, as the child should replay them. A held file was
+/// imported already, so no cut applies to it.
 fn with_held<'a>(held: &[&'a Incoming], files: &[&'a Incoming]) -> Vec<Untrusted<'a>> {
-    held.iter().chain(files).map(|f| untrusted(f)).collect()
+    let held = held.iter().map(|f| Untrusted { limit: None, ..untrusted(f) });
+    held.chain(files.iter().map(|f| untrusted(f))).collect()
 }
 
 fn highest_key(peer: u64) -> String {
@@ -111,7 +116,7 @@ fn highest_key(peer: u64) -> String {
 }
 
 fn untrusted(file: &Incoming) -> Untrusted<'_> {
-    Untrusted { bytes: &file.bytes, peer: Some(file.peer) }
+    Untrusted { bytes: &file.bytes, peer: Some(file.peer), limit: file.limit }
 }
 
 /// What [`LoroStore::import_batch`] did.
@@ -126,6 +131,9 @@ pub struct BatchReport {
     pub waiting: Vec<String>,
     /// Why files wait that were not refused: a check that crashed or could not run.
     pub notes: Vec<String>,
+    /// Keys of files holding operations past their peer's cut ([`Incoming::limit`]): not
+    /// imported, and not remembered as done, so they are read again if the cut moves.
+    pub cut: Vec<String>,
     pub index: IndexReport,
 }
 
@@ -507,6 +515,11 @@ impl LoroStore {
         self.doc.borrow().oplog_vv().encode()
     }
 
+    /// How many of `peer`'s operations this replica holds: the counter its next one would take.
+    pub fn seen_end(&self, peer: u64) -> u64 {
+        self.doc.borrow().oplog_vv().get(&peer).map_or(0, |end| (*end).max(0) as u64)
+    }
+
     /// Everything this replica has that `version` has not seen.
     pub fn updates_since(&self, version: &[u8]) -> Result<Vec<u8>> {
         let seen = VersionVector::decode(version)
@@ -520,7 +533,7 @@ impl LoroStore {
         self.transaction(TxMode::Write, || {
             let touched = {
                 let doc = self.doc.borrow();
-                check_import(&doc, &[Untrusted { bytes, peer: None }], checker)
+                check_import(&doc, &[Untrusted { bytes, peer: None, limit: None }], checker)
                     .map_err(from_sync)?;
                 let before = doc.oplog_frontiers();
                 self.dirty.set(true);
@@ -624,6 +637,8 @@ impl LoroStore {
                                     check_import(&doc, &with_held(&[], &files), checker)
                                 };
                                 match alone {
+                                    // Past its peer's cut: read again if the cut moves.
+                                    Err(SyncError::Cut(_)) => report.cut.push(file.key.clone()),
                                     Err(e) => {
                                         if matches!(e, SyncError::InvalidData(_)) {
                                             self.sql.mark_sync_seen(&file.key)?;
