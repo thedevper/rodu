@@ -1,7 +1,7 @@
 //! Team workspaces (ADR 0001): `rodu team create`, `rodu team join`, `rodu sync`, and the sync
 //! every command does around its work in a team workspace.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -355,8 +355,14 @@ fn warn_report(io: &mut Io<'_>, report: &PullReport) {
 fn report_lines(report: &PullReport) -> Vec<String> {
     let skipped =
         report.damaged.iter().chain(&report.batch.refused).map(|l| format!("skipped {l}"));
+    let cut = report.cut.iter().map(|l| {
+        format!("not taken in {l}: it holds changes its machine wrote after it was removed")
+    });
     let index = report.batch.index.problems.iter().chain(&report.batch.index.conflicts);
-    skipped.chain(report.missing.iter().chain(&report.batch.notes).chain(index).cloned()).collect()
+    skipped
+        .chain(cut)
+        .chain(report.missing.iter().chain(&report.batch.notes).chain(index).cloned())
+        .collect()
 }
 
 /// Live sync with the team folder while `rodu web` or `rodu mcp` runs: the same pull, numbering
@@ -603,8 +609,15 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
         }
         None => None,
     };
+    let removed = match &team.signing {
+        Some(_) => team_folder(&ws.dir, team)?.removed(store)?,
+        None => BTreeMap::new(),
+    };
     // The role of a machine in a signed team, by the keys admitted for it.
     let role = |peer: u64| -> Option<&'static str> {
+        if removed.contains_key(&peer) {
+            return Some("removed");
+        }
         let (admitted, _, authority) = signed.as_ref()?;
         let keys = admitted.get(&peer)?;
         if keys.contains(&authority.owner()) {
@@ -642,8 +655,9 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
         }
         for peer in machines {
             claimed.insert(peer);
-            let waiting =
-                signed.as_ref().is_some_and(|(admitted, ..)| !admitted.contains_key(&peer));
+            let waiting = signed.as_ref().is_some_and(|(admitted, ..)| {
+                !admitted.contains_key(&peer) && !removed.contains_key(&peer)
+            });
             let marks: Vec<&str> = [
                 (peer == store.peer()).then_some("this machine"),
                 (Some(peer) == numbering).then_some("numbers cards"),
@@ -672,7 +686,9 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
         for peer in unknown {
             let waiting =
                 signed.as_ref().is_some_and(|(admitted, ..)| !admitted.contains_key(&peer));
-            (io.out)(&if waiting {
+            (io.out)(&if removed.contains_key(&peer) {
+                format!("  machine {} (removed)", short(peer))
+            } else if waiting {
                 format!("  machine {} (waiting to be admitted)", short(peer))
             } else {
                 format!("  machine {}", short(peer))
@@ -966,6 +982,85 @@ pub(crate) fn transfer_owner(
     Ok(())
 }
 
+/// `rodu team remove <name> [--machine <id>] --yes`: on the owner's or an admin's machine,
+/// removes the person's machines (or the one named), so nothing they write from now on is taken
+/// in. What they wrote before stays. An admin removes members only; the owner first stops an
+/// admin being one.
+pub(crate) fn remove(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Result<()> {
+    let name = name.ok_or_else(|| {
+        RoduError::invalid("Usage: rodu team remove <name> [--machine <id>] --yes")
+    })?;
+    let ws = open(io, false)?;
+    let (store, folder) = signed_team(io, &ws)?;
+    let person = ws
+        .service
+        .store
+        .list_principals()?
+        .into_iter()
+        .find(|p| p.kind == PrincipalKind::Human && p.name == *name)
+        .ok_or_else(|| {
+            RoduError::not_found(format!("No one on the team is called {}", name.escape_debug()))
+                .with_hint("rodu team members lists the team")
+        })?;
+    let machine = args.value("machine");
+    let removed = folder.removed(store)?;
+    let machines: Vec<u64> = store
+        .members()?
+        .into_iter()
+        .filter(|(peer, id)| *id == person.id && !removed.contains_key(peer))
+        .map(|(peer, _)| peer)
+        .filter(|peer| machine.is_none_or(|m| format!("{peer:016x}").starts_with(m)))
+        .collect();
+    if machines.is_empty() {
+        return Err(RoduError::not_found(match machine {
+            Some(m) => format!("{} has no machine {} on the team", name, m.escape_debug()),
+            None => format!("{name} has no machine on the team"),
+        })
+        .with_hint("rodu team members shows each person's machines"));
+    }
+    // Checked for all of them before any is removed.
+    let (admitted, authority) = (folder.admissions(store)?, folder.authority(store)?);
+    if let Some(peer) = machines.iter().find(|peer| {
+        admitted.get(peer).is_some_and(|keys| keys.iter().any(|key| authority.may_admit(key)))
+    }) {
+        return Err(RoduError::invalid(format!(
+            "{name}'s machine {peer:016x} is the team owner's or an admin's, and is not removed"
+        ))
+        .with_hint(
+            "The owner first stops it being an admin (rodu team admin <name> off), or hands the \
+             team on; or name another machine with --machine <id>",
+        ));
+    }
+    if !args.flag("yes") {
+        let encrypted = ws.config.team.as_ref().is_some_and(|t| t.encrypted);
+        return Err(RoduError::invalid("Removing someone needs --yes").with_hint(format!(
+            "Nothing {name}'s {} write from then on is taken in, and a removed machine cannot \
+             be admitted again. {}Also take away their access to the shared folder. Then run: \
+             rodu team remove {name}{} --yes",
+            if machines.len() == 1 { "machine" } else { "machines" },
+            if encrypted {
+                "They keep the team key, so they can still read the board as it is in the folder; \
+                 a new team with a new key keeps them out. "
+            } else {
+                ""
+            },
+            machine.map(|m| format!(" --machine {m}")).unwrap_or_default()
+        )));
+    }
+    for peer in &machines {
+        folder.remove(store, *peer)?;
+    }
+    after(io, &ws);
+    let shown: Vec<String> = machines.iter().map(|peer| format!("{peer:016x}")).collect();
+    (io.out)(&format!(
+        "Removed {name}'s {} {}; every machine refuses what {} writes from now on once it next syncs",
+        if machines.len() == 1 { "machine" } else { "machines" },
+        shown.join(", "),
+        if machines.len() == 1 { "it" } else { "they" }
+    ));
+    Ok(())
+}
+
 fn is_admitted(admitted: &Admitted, peer: u64, key: &PublicKey) -> bool {
     admitted.get(&peer).is_some_and(|keys| keys.contains(key))
 }
@@ -988,21 +1083,27 @@ fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
     };
     let me = identity.public();
     let code = me.code();
-    let state = team_folder(dir, team)
-        .and_then(|folder| Ok((folder.authority(store)?, folder.admissions(store)?)));
+    let state = team_folder(dir, team).and_then(|folder| {
+        let removed = folder.removed(store)?.contains_key(&store.peer());
+        Ok((folder.authority(store)?, folder.admissions(store)?, removed))
+    });
     match state {
-        Ok((authority, _)) if authority.disputed() => format!(
+        Ok((_, _, true)) => format!(
+            "this machine was removed from the team (code {code}): nothing it writes is taken in \
+             any more"
+        ),
+        Ok((authority, _, _)) if authority.disputed() => format!(
             "{}; warning: a former owner signed a second hand-over of the team. This machine keeps \
              following the first it saw, but a machine that never saw it may follow the other",
             role_text(&authority, &me, code.as_str())
         ),
-        Ok((authority, _)) if authority.owner() == me => {
+        Ok((authority, _, _)) if authority.owner() == me => {
             format!("this machine owns the team and admits others (code {code})")
         }
-        Ok((authority, _)) if authority.is_admin(&me) => {
+        Ok((authority, _, _)) if authority.is_admin(&me) => {
             format!("this machine is an admin and admits others (code {code})")
         }
-        Ok((_, admitted)) if is_admitted(&admitted, store.peer(), &me) => {
+        Ok((_, admitted, _)) if is_admitted(&admitted, store.peer(), &me) => {
             format!("this machine is admitted (code {code})")
         }
         Ok(_) => format!(
