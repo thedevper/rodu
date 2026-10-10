@@ -34,13 +34,16 @@ pub const NUMBERING_PEER: &str = "numbering_peer";
 /// In [`TEAM`]: whether the numbering peer keeps a plain Markdown copy of the board in the
 /// folder. Only `true` turns it on.
 pub const READABLE_COPY: &str = "readable_copy";
+/// Which person each machine writes for: a map from peer id (as [`peer_text`] writes it) to the
+/// id of a human principal (ADR 0002, step 1). Nothing proves an entry yet.
+pub const MEMBERS: &str = "members";
 
-/// The numbering peer as written to the document.
+/// A peer id as written to the document.
 pub fn peer_text(peer: u64) -> String {
     format!("{peer:016x}")
 }
 
-/// Reads a numbering peer back; anything but 16 lowercase hex digits is no peer.
+/// Reads a peer id back; anything but 16 lowercase hex digits is no peer.
 pub fn parse_peer(text: &str) -> Option<u64> {
     let hex =
         text.len() == 16 && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
