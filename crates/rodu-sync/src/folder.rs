@@ -1593,11 +1593,31 @@ impl TeamFolder {
             .and_then(|records| Ok(self.resolve(store, &records)?.team_keys(&records)));
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let counting = counting?;
-        let kept: Vec<Held> = found
-            .into_iter()
-            .filter(|h| counting.contains(&(h.generation, h.check.clone())))
-            .collect();
+        // Taken as a chain: a key is kept only when this machine holds the one before it, so no
+        // single record, however high its generation, becomes the newest key without the ones
+        // before it (an admin cannot use up the generations, nor stay the writing key for good).
+        found.sort_by(|a, b| a.generation.cmp(&b.generation).then_with(|| a.check.cmp(&b.check)));
+        let mut top = held.first().map_or(0, |h| h.generation);
+        let mut kept: Vec<Held> = Vec::new();
+        for candidate in found {
+            if candidate.generation <= top + 1
+                && counting.contains(&(candidate.generation, candidate.check.clone()))
+            {
+                top = top.max(candidate.generation);
+                kept.push(candidate);
+            }
+        }
         if kept.is_empty() { Ok(()) } else { self.keep_keys(&kept) }
+    }
+
+    /// The newest generation reachable from `held` through generations that `named` holds one
+    /// after another: the newest a machine holding `held` can take.
+    fn chain(held: u64, named: &BTreeSet<(u64, String)>) -> u64 {
+        let mut top = held;
+        while named.iter().any(|(g, _)| *g == top + 1) {
+            top += 1;
+        }
+        top
     }
 
     /// `peer`'s keys file, if it is there and reads.
@@ -1646,11 +1666,11 @@ impl TeamFolder {
                 });
                 file.keys.push(match kept {
                     Some(entry) => entry.clone(),
-                    None => {
-                        let wrapped =
-                            seal::wrap(&held.key, &exchange, team, *peer, held.generation)?;
-                        format!("{prefix}{}", hex::encode(wrapped))
-                    }
+                    // One machine whose key cannot take a wrap never holds up the others.
+                    None => match seal::wrap(&held.key, &exchange, team, *peer, held.generation) {
+                        Ok(wrapped) => format!("{prefix}{}", hex::encode(wrapped)),
+                        Err(_) => continue,
+                    },
                 });
             }
         }
@@ -1677,6 +1697,8 @@ impl TeamFolder {
             && file.exchange_key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
         (hex_ok && file.format == 1).then_some(())?;
         hex::decode_to_slice(&file.exchange_key, &mut exchange).ok()?;
+        // A low-order point would make every wrap for it fail.
+        seal::usable_exchange(&exchange).then_some(())?;
         sign::check_exchange(&signer, self.team_id(info), peer, &exchange, &file.signature)
             .then_some((signer, exchange))
     }
@@ -1725,11 +1747,10 @@ impl TeamFolder {
                 ));
             }
         };
-        // Only records that count: one a revoked admin signs afterwards, however high, must never
-        // use up the generations.
-        let newest_held = self.held(false)?.first().map_or(0, |h| h.generation);
-        let newest_named = authority.team_keys(&records).iter().map(|(g, _)| *g).max();
-        let generation = newest_named.unwrap_or(0).max(newest_held) + 1;
+        // The one after the newest this machine holds, which every machine takes once it holds
+        // that one (a second key of the same generation is settled by its check). A record that
+        // jumps ahead, however high, never uses up the generations.
+        let generation = self.held(false)?.first().map_or(0, |h| h.generation) + 1;
         if authority::generation(&generation.to_string()).is_none() {
             return Err(RoduError::invalid("This team changed its key as often as it can"));
         }
@@ -1753,7 +1774,7 @@ impl TeamFolder {
         let held = self.held(false)?.first().map_or(0, |h| h.generation);
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
-        let newest = authority.team_keys(&records).iter().map(|(g, _)| *g).max().unwrap_or(0);
+        let newest = Self::chain(held, &authority.team_keys(&records));
         Ok(Some(KeyState { held, newest }))
     }
 
