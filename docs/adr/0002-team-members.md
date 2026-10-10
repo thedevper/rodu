@@ -28,7 +28,7 @@ non-members instead of forwarding whatever arrives.
 
 Three steps, each shippable alone.
 
-### Step 1: a members list (no cryptography)
+### Step 1: a members list (no cryptography; built 2026-10-10)
 
 - The team document gains a root map `members`, from peer id (16 lowercase hex, as `sync/` names
   it) to the human principal id that replica writes for. `team create` adds the creator's peer;
@@ -36,11 +36,17 @@ Three steps, each shippable alone.
   so they need no entry of their own.
 - `team join --as <name>` joins a second machine for a person already on the team: it adds this
   peer under that existing principal instead of creating `bob2`.
-- `rodu team members` lists each person with their agents and their machines (short peer id;
-  marks this machine and the numbering machine). A replica folder whose peer is in no entry is
+- `rodu team members` lists each person with their agents and their machines (the full peer id,
+  as `rodu team` shows it; marks this machine and the numbering machine). A replica folder whose peer is in no entry is
   listed as "unknown machine". The readable copy and `rodu team` do not change.
 - This is a claim, not proof: anyone who can write to the folder can write an entry. The command
   says so until step 2 is in.
+- As built: an entry whose key is not 16 lowercase hex digits, or whose value is not the id of a
+  principal in the document, is ignored. A replica whose own entry is missing (a team made
+  before this) or names someone else records itself after its next pull, once its person is in
+  the document. `--as` refuses an unknown name or an agent's name, and the failed join leaves
+  nothing behind. It uses that person's agent, or makes `<name>-agent` if they have none. A
+  machine claimed for an agent is listed as unknown.
 
 ### Step 2: each machine signs what it writes
 
