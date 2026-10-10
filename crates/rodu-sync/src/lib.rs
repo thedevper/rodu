@@ -44,10 +44,22 @@ pub enum SyncError {
     Crashed(String),
     #[error("Sync file refused: checking it took over {0:?}")]
     TimedOut(Duration),
+    /// Holds operations of its peer past the point the team cut that peer off (ADR 0002, step
+    /// 3). Not a fault of the file: it is read again if the cut moves.
+    #[error("Sync file holds operations written after its machine was removed: {0}")]
+    Cut(String),
+}
+
+impl SyncError {
+    /// The exit code of the check child for this error: 3 for [`SyncError::Cut`], 2 otherwise.
+    pub fn exit_code(&self) -> i32 {
+        if matches!(self, SyncError::Cut(_)) { 3 } else { 2 }
+    }
 }
 
 /// How to start the child process that checks an untrusted import: a command that runs
-/// [`run_check`] on its stdin and exits 0 when the import is valid and 2 when it is not.
+/// [`run_check`] on its stdin and exits 0 when the import is valid, and otherwise with
+/// [`SyncError::exit_code`].
 pub struct Checker {
     command: Box<dyn Fn() -> Command + Send + Sync>,
     timeout: Duration,
@@ -100,6 +112,7 @@ impl Checker {
         match status.code() {
             Some(0) => Ok(()),
             Some(2) => Err(SyncError::InvalidData(message.trim().to_owned())),
+            Some(3) => Err(SyncError::Cut(message.trim().to_owned())),
             _ => Err(SyncError::Crashed(status.to_string())),
         }
     }
@@ -107,7 +120,8 @@ impl Checker {
 
 /// The child side of [`Replica::import_untrusted`]: reads the framed input from `input` (a
 /// snapshot, then updates each with the peer that must have written all of its operations, or 0
-/// for any), does the imports on a scratch replica and reads everything back, so a panic in Loro's
+/// for any, and the counter that peer's operations must end by, or `u64::MAX` for none), does the
+/// imports on a scratch replica and reads everything back, so a panic in Loro's
 /// decoder, including one deferred until data is read, happens here and not in the caller.
 pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     let mut bytes = Vec::new();
@@ -123,7 +137,10 @@ pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
     while !rest.is_empty() {
         let (peer, after_peer) = rest.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
         let peer = u64::from_le_bytes(peer.try_into().expect("8 bytes"));
-        let (update, after) = split_framed(after_peer)?;
+        let (limit, after_limit) =
+            after_peer.split_at_checked(8).ok_or_else(|| invalid("short input"))?;
+        let limit = u64::from_le_bytes(limit.try_into().expect("8 bytes"));
+        let (update, after) = split_framed(after_limit)?;
         rest = after;
         if peer != 0 {
             let meta = LoroDoc::decode_import_blob_meta(update, true).map_err(invalid)?;
@@ -134,6 +151,12 @@ pub fn run_check(input: &mut dyn Read) -> Result<(), SyncError> {
                 .any(|(p, _)| *p != peer);
             if others {
                 return Err(invalid(format!("holds operations of a peer other than {peer:016x}")));
+            }
+            let end = meta.partial_end_vv.get(&peer).map_or(0, |end| *end as i64);
+            if end > limit.min(i64::MAX as u64) as i64 {
+                return Err(SyncError::Cut(format!(
+                    "{peer:016x} was cut off at operation {limit}, and this file goes on to {end}"
+                )));
             }
         }
         doc.import(update).map_err(invalid)?;
@@ -169,11 +192,13 @@ fn split_framed(input: &[u8]) -> Result<(&[u8], &[u8]), SyncError> {
     rest.split_at_checked(len).ok_or_else(|| invalid("short input"))
 }
 
-/// One untrusted update for [`check_import`]: its bytes, and the peer that must have written all
-/// of its operations (a sync file's folder names its writer), or None for any.
+/// One untrusted update for [`check_import`]: its bytes, the peer that must have written all of
+/// its operations (a sync file's folder names its writer), or None for any, and the counter that
+/// peer's operations must end by, if the team cut it off.
 pub(crate) struct Untrusted<'a> {
     pub bytes: &'a [u8],
     pub peer: Option<u64>,
+    pub limit: Option<u64>,
 }
 
 /// Replays importing `updates`, in order, into a copy of `doc` in `checker`'s child process; Ok
@@ -188,11 +213,12 @@ fn check_import(
         return Err(SyncError::TooLarge { size, max: MAX_IMPORT_BYTES });
     }
     let snapshot = doc.export(ExportMode::Snapshot).map_err(invalid)?;
-    let mut input = Vec::with_capacity(8 + snapshot.len() + 16 * updates.len() + size);
+    let mut input = Vec::with_capacity(8 + snapshot.len() + 24 * updates.len() + size);
     input.extend((snapshot.len() as u64).to_le_bytes());
     input.extend(snapshot);
     for update in updates {
         input.extend(update.peer.unwrap_or(0).to_le_bytes());
+        input.extend(update.limit.unwrap_or(u64::MAX).to_le_bytes());
         input.extend((update.bytes.len() as u64).to_le_bytes());
         input.extend(update.bytes);
     }
@@ -260,7 +286,7 @@ impl Replica {
     /// Merges updates or a snapshot from another machine, once `checker` has replayed the same
     /// import on a copy of this replica in a child process and the child survived.
     pub fn import_untrusted(&mut self, bytes: &[u8], checker: &Checker) -> Result<(), SyncError> {
-        check_import(&self.doc, &[Untrusted { bytes, peer: None }], checker)?;
+        check_import(&self.doc, &[Untrusted { bytes, peer: None, limit: None }], checker)?;
         if self.doc.import(bytes).map_err(invalid)?.pending.is_some() {
             // Operations waiting on others would be applied, unchecked, by a later import:
             // dropped instead, by starting again from a snapshot, which leaves them out.
@@ -423,7 +449,7 @@ mod tests {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("{e}");
-                2
+                e.exit_code()
             }
         };
         std::process::exit(code);
@@ -436,6 +462,31 @@ mod tests {
             a.set_field(&format!("c{i}"), "status", ["Backlog", "Done"][i % 2]).unwrap();
         }
         a
+    }
+
+    #[test]
+    fn the_check_refuses_operations_past_their_peers_cut_as_a_cut() {
+        let a = sample();
+        let update = a.updates_since(&Replica::new(9).unwrap().version()).unwrap();
+        let end = *a.doc.oplog_vv().get(&1).unwrap() as u64;
+        let input = |peer: u64, limit: u64| {
+            let mut input = Vec::new();
+            input.extend(0u64.to_le_bytes());
+            input.extend(peer.to_le_bytes());
+            input.extend(limit.to_le_bytes());
+            input.extend((update.len() as u64).to_le_bytes());
+            input.extend(&update);
+            input
+        };
+        assert_eq!(run_check(&mut input(1, end).as_slice()), Ok(()));
+        assert_eq!(run_check(&mut input(1, u64::MAX).as_slice()), Ok(()));
+        let cut = run_check(&mut input(1, end - 1).as_slice()).unwrap_err();
+        assert!(matches!(cut, SyncError::Cut(_)), "{cut:?}");
+        assert_eq!(cut.exit_code(), 3);
+        // Another peer's operations are invalid whatever the cut.
+        let other = run_check(&mut input(2, end - 1).as_slice()).unwrap_err();
+        assert!(matches!(other, SyncError::InvalidData(_)), "{other:?}");
+        assert_eq!(other.exit_code(), 2);
     }
 
     #[test]

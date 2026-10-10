@@ -1,4 +1,5 @@
-//! Who may admit machines to a signed team, and who owns it (ADR 0002, step 2b).
+//! Who may admit machines to a signed team, who owns it (ADR 0002, step 2b), and which machines
+//! it removed (step 3).
 //!
 //! Authority records sit in the team document's `authority` map, keyed by the hex SHA-256 of
 //! their text, and each is signed by the key it names:
@@ -7,6 +8,7 @@
 //! owner.<epoch>.<new owner key>.<carried records>.<signer key>.<signature>
 //! admin.<epoch>.<n>.<target key>.on.<signer key>.<signature>
 //! admin.<epoch>.<n>.<target key>.off.<kept admissions>.<signer key>.<signature>
+//! remove.<peer, 16 hex>.<end>.<signer key>.<signature>
 //! ```
 //!
 //! `kept admissions` is `-` or a comma-separated list of `<peer, 16 hex>:<admitted key>`;
@@ -20,6 +22,12 @@
 //! - An admin record of the current epoch counts when the current owner signed it. One of an
 //!   earlier epoch `e` counts only when the transfer that ended `e` carries its hash: an owner's
 //!   say ends when it hands the team on, so nothing it signs afterwards counts.
+//! - A removal cuts a peer off at `end`, the count of its operations the remover held: later
+//!   ones are refused. It counts while its signer may admit and no key admitted for that peer may.
+//!   A machine that took in more of that peer's operations before it heard of the removal says
+//!   so ([`Seen`]), and the cut moves up to the most any member saw: whatever a member built on
+//!   reaches every replica, so the team never splits over it. That claim travels outside the
+//!   document, because there it would depend on the very operations it lets in.
 //!
 //! Everything here is pure: no document, no files.
 
@@ -43,7 +51,22 @@ pub type Hash = [u8; 32];
 enum Kind {
     Owner { epoch: u64, new: PublicKey, carried: BTreeSet<Hash> },
     Admin { epoch: u64, n: u64, target: PublicKey, on: bool, kept: BTreeSet<Admission> },
+    Remove { peer: u64, end: u64 },
 }
+
+/// What a machine says it holds of a removed peer, signed by its key in its own replica folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Seen {
+    /// The replica folder the claim was read from: the machine making it.
+    pub by: u64,
+    pub signer: PublicKey,
+    pub removed: u64,
+    /// How many of `removed`'s operations it holds.
+    pub end: u64,
+}
+
+/// The machines admitted to a team, by peer.
+pub type Admitted = BTreeMap<u64, BTreeSet<PublicKey>>;
 
 /// An authority record whose signature verifies against the key it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +87,14 @@ fn number(text: &str) -> Option<u64> {
         .then(|| text.parse().ok())
         .flatten()
         .filter(|n| *n <= MAX_EPOCH * 1024)
+}
+
+/// An operation count: at most what a Loro counter holds.
+fn end(text: &str) -> Option<u64> {
+    (!text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+        .filter(|end| *end <= i32::MAX as u64)
 }
 
 fn peer(text: &str) -> Option<u64> {
@@ -145,6 +176,7 @@ impl Record {
                 on: false,
                 kept: parse_kept(kept)?,
             },
+            ["remove", p, e] => Kind::Remove { peer: peer(p).filter(|p| *p != 0)?, end: end(e)? },
             _ => return None,
         };
         sign::check_authority(&signer, workspace_id, signed, signature).then(|| Record {
@@ -205,11 +237,17 @@ impl Record {
         let body = format!("admin.{epoch}.{n}.{}.off.{}", target.to_hex(), kept_text(kept));
         Self::sign(workspace_id, key, body)
     }
+
+    /// The removal of `peer`, cut off after its first `end` operations, signed by `key`.
+    pub fn removal(workspace_id: &str, key: &MachineKey, peer: u64, end: u64) -> Record {
+        Self::sign(workspace_id, key, format!("remove.{peer:016x}.{end}"))
+    }
 }
 
 /// The records worth keeping: those signed by `root`, or by a key some kept transfer hands the
-/// team to. A record signed by any other key can never count, and keeping it would let anyone who
-/// can write to the folder make a replica's notes grow without end.
+/// team to; removals also when a kept grant names their signer. A record signed by any other key
+/// can never count, and keeping it would let anyone who can write to the folder make a replica's
+/// notes grow without end.
 pub fn worth_keeping(root: PublicKey, records: Vec<Record>) -> Vec<Record> {
     let mut keys = BTreeSet::from([root]);
     loop {
@@ -227,7 +265,21 @@ pub fn worth_keeping(root: PublicKey, records: Vec<Record>) -> Vec<Record> {
         }
         keys.extend(more);
     }
-    records.into_iter().filter(|r| keys.contains(&r.signer)).collect()
+    let granted: BTreeSet<PublicKey> = records
+        .iter()
+        .filter(|r| keys.contains(&r.signer))
+        .filter_map(|r| match r.kind {
+            Kind::Admin { target, on: true, .. } => Some(target),
+            _ => None,
+        })
+        .collect();
+    records
+        .into_iter()
+        .filter(|r| {
+            keys.contains(&r.signer)
+                || (matches!(r.kind, Kind::Remove { .. }) && granted.contains(&r.signer))
+        })
+        .collect()
 }
 
 /// What a key's latest admin record says.
@@ -362,6 +414,71 @@ impl Authority {
                 .admins
                 .get(signer)
                 .is_some_and(|state| !state.on && state.kept.contains(&(peer, *member)))
+    }
+
+    /// The removals that count, as (signer, peer, end): signed by a key that may admit now, of a
+    /// peer no key admitted for which may admit (the owner and admins are never removed).
+    fn removals<'a>(
+        &'a self,
+        records: &'a [Record],
+        admitted: &'a Admitted,
+    ) -> impl Iterator<Item = (PublicKey, u64, u64)> + 'a {
+        records.iter().filter_map(move |r| match r.kind {
+            Kind::Remove { peer, end }
+                if self.may_admit(&r.signer)
+                    && !admitted
+                        .get(&peer)
+                        .is_some_and(|keys| keys.iter().any(|key| self.may_admit(key))) =>
+            {
+                Some((r.signer, peer, end))
+            }
+            _ => None,
+        })
+    }
+
+    /// The peers the team removed, each with the count of its operations taken in: the highest
+    /// `end` among the removals of it that count, raised to the highest a claim in `seen` makes
+    /// whose signer may admit, or is admitted for the replica folder it was read from when that
+    /// machine is not removed itself.
+    pub fn cuts(
+        &self,
+        records: &[Record],
+        admitted: &Admitted,
+        seen: &[Seen],
+    ) -> BTreeMap<u64, u64> {
+        let mut cuts: BTreeMap<u64, u64> = BTreeMap::new();
+        for (_, peer, end) in self.removals(records, admitted) {
+            let cut = cuts.entry(peer).or_insert(end);
+            *cut = (*cut).max(end);
+        }
+        let counts = |claim: &Seen| {
+            self.may_admit(&claim.signer)
+                || (!cuts.contains_key(&claim.by)
+                    && admitted.get(&claim.by).is_some_and(|keys| keys.contains(&claim.signer)))
+        };
+        let raised: Vec<&Seen> = seen
+            .iter()
+            .filter(|claim| cuts.contains_key(&claim.removed) && counts(claim))
+            .collect();
+        for claim in raised {
+            let cut = cuts.get_mut(&claim.removed).expect("only removed peers");
+            *cut = (*cut).max(claim.end);
+        }
+        cuts
+    }
+
+    /// The removals `signer` signed that count now, as (peer, end): what the owner signs again
+    /// when it revokes `signer`, so those machines stay out.
+    pub fn removals_by(
+        &self,
+        records: &[Record],
+        admitted: &Admitted,
+        signer: &PublicKey,
+    ) -> Vec<(u64, u64)> {
+        self.removals(records, admitted)
+            .filter(|(by, _, _)| by == signer)
+            .map(|(_, peer, end)| (peer, end))
+            .collect()
     }
 
     /// The `n` the next admin record for `target` takes in the current epoch: one more than the
@@ -502,7 +619,91 @@ mod tests {
         let eve_to_cat = transfer(&eve, 1, &cat.public());
         let by_cat = Record::grant(TEAM, &cat, 0, 1, &cat.public());
         let all = vec![by_bob.clone(), by_eve, eve_to_cat, by_cat, to_bob.clone()];
-        assert_eq!(worth_keeping(root.public(), all), vec![by_bob, to_bob]);
+        assert_eq!(worth_keeping(root.public(), all), vec![by_bob.clone(), to_bob.clone()]);
+        // A removal is kept also when a kept grant names its signer: an admin removes members.
+        let cat_removes = Record::removal(TEAM, &cat, 7, 3);
+        let eve_removes = Record::removal(TEAM, &eve, 7, 3);
+        let cat_grants = Record::grant(TEAM, &cat, 1, 1, &eve.public());
+        let all =
+            vec![by_bob.clone(), to_bob.clone(), cat_removes.clone(), eve_removes, cat_grants];
+        assert_eq!(worth_keeping(root.public(), all), vec![by_bob, to_bob, cat_removes]);
+    }
+
+    fn seen(by: u64, signer: &MachineKey, removed: u64, end: u64) -> Seen {
+        Seen { by, signer: signer.public(), removed, end }
+    }
+
+    #[test]
+    fn a_removal_counts_when_its_signer_may_admit_and_never_cuts_the_owner_or_an_admin() {
+        let (root, bob, cat, dan) = (key(), key(), key(), key());
+        // Machines 1 (root's), 2 (bob's), 3 (cat's), 4 (dan's).
+        let admitted: Admitted = [(1, root.public()), (2, bob.public()), (3, cat.public())]
+            .into_iter()
+            .chain([(4, dan.public())])
+            .map(|(peer, key)| (peer, BTreeSet::from([key])))
+            .collect();
+        let grant = Record::grant(TEAM, &root, 0, 1, &bob.public());
+        let by_root = Record::removal(TEAM, &root, 3, 10);
+        let by_bob = Record::removal(TEAM, &bob, 3, 12);
+        let by_cat = Record::removal(TEAM, &cat, 4, 5);
+        let records = [grant.clone(), by_root.clone(), by_bob.clone(), by_cat];
+        let auth = resolve(root.public(), &records);
+        // The highest end among the removals that count; cat is no admin.
+        assert_eq!(auth.cuts(&records, &admitted, &[]), BTreeMap::from([(3, 12)]));
+        assert_eq!(auth.removals_by(&records, &admitted, &bob.public()), vec![(3, 12)]);
+        // Once bob is revoked, his removal no longer counts (the owner signs it again).
+        let revoke = Record::revoke(TEAM, &root, 0, 2, &bob.public(), &BTreeSet::new());
+        let records = [grant.clone(), revoke, by_root.clone(), by_bob];
+        let auth = resolve(root.public(), &records);
+        assert_eq!(auth.cuts(&records, &admitted, &[]), BTreeMap::from([(3, 10)]));
+        // Neither the owner's machine nor an admin's is cut, by anyone.
+        let at_root = Record::removal(TEAM, &root, 1, 0);
+        let at_bob = Record::removal(TEAM, &root, 2, 0);
+        let records = [grant, at_root, at_bob];
+        assert!(resolve(root.public(), &records).cuts(&records, &admitted, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_members_seen_claim_raises_a_cut_and_nobody_elses_does() {
+        let (root, bob, cat, eve) = (key(), key(), key(), key());
+        let admitted: Admitted = [(1, root.public()), (2, bob.public()), (3, cat.public())]
+            .into_iter()
+            .map(|(peer, key)| (peer, BTreeSet::from([key])))
+            .collect();
+        let records = [Record::removal(TEAM, &root, 3, 10)];
+        let auth = resolve(root.public(), &records);
+        let cut = |claims: &[Seen]| auth.cuts(&records, &admitted, claims);
+        assert_eq!(cut(&[seen(2, &bob, 3, 14)]), BTreeMap::from([(3, 14)]), "bob, a member");
+        assert_eq!(cut(&[seen(2, &bob, 3, 8)]), BTreeMap::from([(3, 10)]), "never lowered");
+        assert_eq!(cut(&[seen(9, &root, 3, 15)]), BTreeMap::from([(3, 15)]), "the owner");
+        for (claim, why) in [
+            (seen(3, &cat, 3, 99), "the removed machine itself"),
+            (seen(2, &eve, 3, 99), "a key not admitted for that folder"),
+            (seen(1, &bob, 3, 99), "bob's key read from another machine's folder"),
+            (seen(2, &bob, 4, 99), "a peer nobody removed"),
+        ] {
+            assert_eq!(cut(&[claim]), BTreeMap::from([(3, 10)]), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_removal_is_read_only_when_well_formed() {
+        let root = key();
+        let removal = Record::removal(TEAM, &root, 0xab, 2_147_483_647);
+        assert_eq!(Record::parse(TEAM, removal.text()), Some(removal.clone()));
+        let text = removal.text();
+        for (from, to) in [
+            (".2147483647.", ".2147483648."),
+            (".2147483647.", ".-1."),
+            (".00000000000000ab.", ".0000000000000000."),
+            (".00000000000000ab.", ".00000000000000AB."),
+        ] {
+            let changed = text.replacen(from, to, 1);
+            assert_ne!(changed, text);
+            let (signed, _) = changed.rsplit_once('.').unwrap();
+            let resigned = format!("{signed}.{}", root.sign_authority(TEAM, signed));
+            assert!(Record::parse(TEAM, &resigned).is_none(), "{to}");
+        }
     }
 
     #[test]
