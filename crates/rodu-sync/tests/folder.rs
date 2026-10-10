@@ -2229,3 +2229,41 @@ fn a_key_record_that_jumps_ahead_is_never_taken_nor_uses_up_the_generations() {
     assert!(has(&c, "Sealed with generation 2"));
     assert_eq!(cat_folder.key_state(c.store()).unwrap().unwrap().held, 2);
 }
+
+#[test]
+fn a_re_key_follows_every_key_record_that_counts_even_one_this_machine_lacks() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let bob_key = request_of(&ann_folder, "bob").key;
+    ann_folder.set_admin(a.store(), &bob_key, true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // bob, an admin, changes the key, and cat takes it; ann has heard of bob's record but never
+    // got the key itself.
+    assert_eq!(bob_folder.rekey(b.store()).unwrap(), 1);
+    b.sync(&bob_folder);
+    c.sync(&cat_folder);
+    let records = b.store().authority().unwrap();
+    let (doc_key, text) = records.iter().find(|(_, t)| t.starts_with("key.1.")).unwrap();
+    a.store().set_authority(doc_key, text).unwrap();
+    assert_eq!(ann_folder.key_state(a.store()).unwrap(), Some(KeyState { held: 0, newest: 1 }));
+    // Removing cat, ann's new key goes past bob's, which cat holds: never one of the same
+    // generation that might win on its check.
+    assert!(ann_folder.remove(a.store(), c.store().peer()).unwrap());
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    // ann never gets bob's key: her wrap is gone from bob's keys file.
+    let bob_keys =
+        root.path().join(format!("Shared/Team/sync/{:016x}/keys.json", b.store().peer()));
+    let mut file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&bob_keys).unwrap()).unwrap();
+    let ann = format!("{:016x}.", a.store().peer());
+    file["keys"].as_array_mut().unwrap().retain(|e| !e.as_str().unwrap().starts_with(&ann));
+    std::fs::write(&bob_keys, file.to_string()).unwrap();
+    a.sync(&ann_folder);
+    assert_eq!(ann_folder.key_state(a.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
+    assert!(!std::fs::read_to_string(root.path().join("keys-ann")).unwrap().starts_with("1."));
+    // dan joins and gets only ann's key, never bob's: he takes it all the same, since bob's
+    // record reaches him in ann's authority file.
+    let (dan_folder, d) = dan_joins(root.path(), &ann_folder, &a);
+    assert_eq!(dan_folder.key_state(d.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
+}
