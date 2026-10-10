@@ -510,6 +510,7 @@ provider cannot read the board.
    adds the readable copy, live watching in `web` and `mcp`, compaction and the numbering
    hand-over. Compaction is done, with the `stat` skip, and so are live sync in `web` and `mcp`
    the numbering hand-over and the readable copy, all under "The team folder". Step 4 is done.
-5. Later: `rodu relay` for live sync.
+5. Later: `rodu relay` for live sync, after the members list and signing in ADR 0002, so a relay
+   can refuse files from non-members.
 6. Move to the Loro release that replaces `im` with `imbl` once loro-dev/loro#1122 lands, and
    drop the advisory exceptions.
