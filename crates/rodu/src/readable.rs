@@ -3,11 +3,13 @@
 //! encrypted. Only the numbering machine writes it, so folder apps never see two machines writing
 //! the same files.
 //!
-//! Rodu deletes or overwrites only files it wrote: `readable/.rodu-readable.json` records each
-//! file's name and the SHA-256 of what was written, and a file whose content no longer matches
-//! (a person edited it, or put their own file under that name) is left alone, with a warning.
-//! File names come only from card keys, filtered to ASCII letters, digits and `-`, so text in a
-//! card can never choose where a file goes.
+//! Rodu deletes or overwrites only files it wrote. Anyone who can write to the folder can also
+//! write the record of them, `readable/.rodu-readable.json`, so a file must pass every check:
+//! a name shaped like a card key (or `index.md`), a plain file (never a symlink), content still
+//! matching the SHA-256 recorded for it, and the heading Rodu writes on that very file. A person's
+//! own file, an edited copy, or a symlink is left alone, with a warning. The copy's folder itself
+//! must be a plain folder, not a symlink. File names come only from card keys, so text in a card
+//! can never choose where a file goes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -41,17 +43,46 @@ fn sha256(text: &str) -> String {
     Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A card's file name: its key, filtered to ASCII letters, digits and `-`, plus `.md`.
-fn file_name(key: &str) -> Option<String> {
-    let stem: String = key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
-    (!stem.is_empty() && !stem.eq_ignore_ascii_case("index")).then(|| format!("{stem}.md"))
+/// Whether `stem` has the shape of a card key: `DEMO-12`, a provisional `DEMO-KQMRTZ`, or a
+/// card id (a lowercase UUID), which a card shows when its key clashed.
+fn key_shaped(stem: &str) -> bool {
+    let uuid = stem.len() == 36
+        && stem.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_digit() || ('a'..='f').contains(&c),
+        });
+    let key = stem.split_once('-').is_some_and(|(collection, rest)| {
+        let mut chars = collection.chars();
+        chars.next().is_some_and(|c| c.is_ascii_uppercase())
+            && (2..=10).contains(&collection.len())
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && ((1..=18).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_digit())
+                || (6..=10).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_uppercase()))
+    });
+    uuid || key
 }
 
-/// A name Rodu could have written: a card file or the index. A manifest from the folder is
-/// checked against this, so it can never point outside the copy's folder.
-fn is_ours(name: &str) -> bool {
-    name == INDEX || name.strip_suffix(".md").and_then(file_name).as_deref() == Some(name)
+/// A card's file name: its key plus `.md`, if the key has a card key's shape (letters, digits
+/// and `-` only); a card with any other key is listed in the index without a file.
+fn file_name(key: &str) -> Option<String> {
+    key_shaped(key).then(|| format!("{key}.md"))
 }
+
+/// A name Rodu could have written: a card file or the index. A record from the folder is
+/// checked against this, so it can never name anything else, inside the folder or outside it.
+fn is_ours(name: &str) -> bool {
+    name == INDEX || name.strip_suffix(".md").is_some_and(key_shaped)
+}
+
+/// The start of every file Rodu writes under `name`.
+fn heading(name: &str) -> String {
+    match name.strip_suffix(".md") {
+        Some(stem) if name != INDEX => format!("# {stem}: "),
+        _ => INDEX_HEADING.to_owned(),
+    }
+}
+
+const INDEX_HEADING: &str = "# Board\n\nA read-only copy kept by Rodu.";
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -67,6 +98,17 @@ pub(crate) fn refresh(
 ) -> Vec<String> {
     let dir = root.join(DIR);
     let mut warnings = Vec::new();
+    // A symlink, or anything but a folder, under the copy's name is never followed.
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if !meta.file_type().is_dir() => {
+            warnings.push(format!(
+                "readable copy: {} is not a plain folder; nothing was written",
+                dir.display()
+            ));
+            return warnings;
+        }
+        _ => {}
+    }
     if !on {
         if dir.join(MANIFEST).is_file() {
             remove(&dir, &mut warnings);
@@ -85,23 +127,35 @@ pub(crate) fn refresh(
     warnings
 }
 
+/// Reads a plain file; a symlink or anything else reads as nothing.
+fn read_plain(path: &Path) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    meta.file_type().is_file().then(|| fs::read_to_string(path).ok()).flatten()
+}
+
 fn load(dir: &Path) -> Manifest {
-    let mut manifest: Manifest = fs::read_to_string(dir.join(MANIFEST))
-        .ok()
+    let mut manifest: Manifest = read_plain(&dir.join(MANIFEST))
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
     manifest.files.retain(|name, _| is_ours(name));
     manifest
 }
 
-/// Whether `path` still holds exactly what Rodu wrote there.
-fn unchanged(path: &Path, hash: Option<&String>) -> bool {
-    hash.is_some_and(|hash| fs::read_to_string(path).is_ok_and(|text| &sha256(&text) == hash))
+/// Whether `dir/name` is a plain file still holding exactly what Rodu wrote there: the content
+/// matches the recorded hash and starts with the heading Rodu writes under that name.
+fn unchanged(dir: &Path, name: &str, hash: Option<&String>) -> bool {
+    let Some(hash) = hash else { return false };
+    read_plain(&dir.join(name))
+        .is_some_and(|text| &sha256(&text) == hash && text.starts_with(&heading(name)))
 }
 
+/// Writes through a fresh temp file and a rename. The temp file is created new, so a symlink
+/// planted under its name is never followed, and the rename replaces a name, never a target.
 fn write_file(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
     let temp = dir.join(format!(".{name}.tmp"));
-    fs::write(&temp, text)?;
+    let _ = fs::remove_file(&temp);
+    fs::OpenOptions::new().write(true).create_new(true).open(&temp)?.write_all(text.as_bytes())?;
     fs::rename(&temp, dir.join(name)).inspect_err(|_| {
         let _ = fs::remove_file(&temp);
     })
@@ -129,12 +183,13 @@ fn write(
     for (name, text) in &files {
         let path = dir.join(name);
         let hash = sha256(text);
-        let current = fs::read_to_string(&path).ok();
+        let current = read_plain(&path);
         if current.as_deref() == Some(text.as_str()) {
             kept.files.insert(name.clone(), hash);
             continue;
         }
-        if current.is_some() && !unchanged(&path, old.files.get(name)) {
+        let taken = fs::symlink_metadata(&path).is_ok();
+        if taken && !unchanged(dir, name, old.files.get(name)) {
             warnings.push(format!("readable copy: {name} was changed by someone else; left as is"));
             continue;
         }
@@ -153,10 +208,10 @@ fn write(
             continue;
         }
         let path = dir.join(name);
-        if !path.exists() {
+        if fs::symlink_metadata(&path).is_err() {
             continue;
         }
-        if unchanged(&path, Some(hash)) {
+        if unchanged(dir, name, Some(hash)) {
             if let Err(e) = fs::remove_file(&path) {
                 warnings.push(format!("readable copy: cannot remove {name}: {e}"));
                 kept.files.insert(name.clone(), hash.clone());
@@ -182,10 +237,10 @@ fn remove(dir: &Path, warnings: &mut Vec<String>) {
     let mut left = BTreeMap::new();
     for (name, hash) in manifest.files {
         let path = dir.join(&name);
-        if !path.exists() {
+        if fs::symlink_metadata(&path).is_err() {
             continue;
         }
-        if !unchanged(&path, Some(&hash)) {
+        if !unchanged(dir, &name, Some(&hash)) {
             warnings.push(format!("readable copy: {name} was changed by someone else; left as is"));
         } else if let Err(e) = fs::remove_file(&path) {
             warnings.push(format!("readable copy: cannot remove {name}: {e}"));
@@ -216,10 +271,8 @@ fn render<S: Store>(service: &RoduService<S>) -> Result<BTreeMap<String, String>
         let keys: HashMap<&str, &str> =
             items.iter().map(|i| (i.id.as_str(), i.key.as_str())).collect();
         let mut files = BTreeMap::new();
-        let mut index = String::from(
-            "# Board\n\nA read-only copy kept by Rodu. Edit cards in Rodu: changes here are not \
-             read back.\n",
-        );
+        let mut index =
+            format!("{INDEX_HEADING} Edit cards in Rodu: changes here are not read back.\n");
         for collection in &collections {
             let cycles: HashMap<String, String> = service
                 .store
@@ -364,14 +417,16 @@ mod tests {
     #[test]
     fn file_names_come_only_from_safe_key_characters() {
         assert_eq!(file_name("DEMO-12").as_deref(), Some("DEMO-12.md"));
-        assert_eq!(file_name("../x").as_deref(), Some("x.md"));
-        assert_eq!(file_name("..\\..\\C:"), Some("C.md".to_owned()));
-        assert_eq!(file_name("/."), None);
-        assert_eq!(file_name("index"), None, "never the index");
+        assert_eq!(file_name("DEMO-KQMRTZ").as_deref(), Some("DEMO-KQMRTZ.md"));
+        let id = "01a121d8-732e-72dc-9f4f-b17823008ea5";
+        assert_eq!(file_name(id), Some(format!("{id}.md")));
+        for bad in ["../x", "..\\..\\C:", "/.", "index", "notes", "DEMO-", "D-1", "DEMO-1/x"] {
+            assert_eq!(file_name(bad), None, "{bad}");
+        }
         assert!(is_ours("DEMO-1.md") && is_ours("index.md"));
-        assert!(
-            !is_ours("../DEMO-1.md") && !is_ours("notes.txt") && !is_ours(".rodu-readable.json")
-        );
+        for bad in ["../DEMO-1.md", "notes.md", "notes.txt", ".rodu-readable.json", "DEMO-1.txt"] {
+            assert!(!is_ours(bad), "{bad}");
+        }
     }
 
     #[test]

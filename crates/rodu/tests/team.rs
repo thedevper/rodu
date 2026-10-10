@@ -699,5 +699,68 @@ fn a_card_that_leaves_the_copy_loses_its_file_and_problems_are_warnings() {
     std::fs::write(&copy, "not a folder").unwrap();
     let run = rodu(&team.ann, &["add", "Still works"]);
     assert_eq!(run.code, 0, "{}", run.err);
-    assert!(run.err.contains("readable copy: cannot make"), "{}", run.err);
+    assert!(run.err.contains("not a plain folder"), "{}", run.err);
+}
+
+/// Records `name` in the copy's record as a file Rodu wrote, with the hash of what it holds now:
+/// what anyone who can write to the folder can forge.
+fn forge_record(copy: &Path, name: &str) {
+    use sha2::Digest;
+    let manifest = copy.join(".rodu-readable.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    let bytes = std::fs::read(copy.join(name)).unwrap_or_default();
+    let hash: String = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    record["files"][name] = hash.into();
+    record["version"] = "".into();
+    std::fs::write(&manifest, record.to_string()).unwrap();
+}
+
+#[test]
+fn a_forged_record_never_gets_a_persons_file_removed() {
+    let team = team();
+    ok(&team.ann, &["team", "readable-copy", "on"]);
+    let copy = readable(&team);
+    std::fs::write(copy.join("notes.md"), "my notes").unwrap();
+    std::fs::write(copy.join("DEMO-50.md"), "named like a card, written by a person").unwrap();
+    forge_record(&copy, "notes.md");
+    forge_record(&copy, "DEMO-50.md");
+    let _ = rodu(&team.ann, &["sync"]);
+    let off = rodu(&team.ann, &["team", "readable-copy", "off"]);
+    assert_eq!(off.code, 0, "{}", off.err);
+    assert_eq!(std::fs::read_to_string(copy.join("notes.md")).unwrap(), "my notes");
+    assert!(copy.join("DEMO-50.md").is_file());
+    assert!(!copy.join("DEMO-1.md").exists(), "Rodu's own files went");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_in_the_copy_are_never_followed() {
+    use std::os::unix::fs::symlink;
+    let team = team();
+    let outside = team.folder.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let secret = outside.join("secret.txt");
+    std::fs::write(&secret, "keep").unwrap();
+
+    // The copy's folder as a symlink: nothing is written through it.
+    let copy = readable(&team);
+    symlink(&outside, &copy).unwrap();
+    let run = rodu(&team.ann, &["team", "readable-copy", "on"]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(run.err.contains("not a plain folder"), "{}", run.err);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "nothing written outside");
+    std::fs::remove_file(&copy).unwrap();
+
+    // A symlink under a temp file's name, or under a card file's recorded name.
+    ok(&team.ann, &["sync"]);
+    symlink(&secret, copy.join(".DEMO-1.md.tmp")).unwrap();
+    std::fs::remove_file(copy.join("DEMO-1.md")).unwrap();
+    symlink(&secret, copy.join("DEMO-1.md")).unwrap();
+    forge_record(&copy, "DEMO-1.md");
+    let _ = rodu(&team.ann, &["sync"]);
+    let left = rodu(&team.ann, &["add", "Another"]);
+    assert!(left.err.contains("DEMO-1.md was changed by someone else"), "{}", left.err);
+    let _ = rodu(&team.ann, &["team", "readable-copy", "off"]);
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "keep");
 }
