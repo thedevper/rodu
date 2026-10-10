@@ -41,8 +41,8 @@ use rodu_store::index::Parked;
 use sha2::{Digest, Sha256};
 
 use crate::layout::{
-    self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS, NUMBERING_PEER, PRINCIPALS,
-    READABLE_COPY, TEAM,
+    self, ADMISSIONS, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS, NUMBERING_PEER,
+    PRINCIPALS, READABLE_COPY, TEAM,
 };
 use crate::names::{self, Entry};
 use crate::{Checker, MAX_IMPORT_BYTES, SyncError, Untrusted, check_import};
@@ -58,6 +58,8 @@ const META_DOC: &str = "doc_sha256";
 const META_PEER: &str = "peer";
 /// This replica's own operation counter up to which [`LoroStore::export_own`] has exported.
 const META_EXPORTED: &str = "exported_counter";
+/// Prefix of the keys [`LoroStore::local_note`] keeps.
+const LOCAL_NOTE: &str = "local/";
 /// The number of the sync file this replica last compacted its own files into.
 const META_COMPACTED: &str = "compacted_file";
 /// How many entities the index holds differently from the document until something else arrives:
@@ -137,6 +139,7 @@ enum Change {
     NumberingPeer(u64),
     ReadableCopy(bool),
     Member(u64, String),
+    Admission(u64, String),
 }
 
 /// Which entities a document change touched.
@@ -396,6 +399,46 @@ impl LoroStore {
                 }
             });
             Ok(members)
+        })
+    }
+
+    /// The admission records in the document with the peer each is for, unchecked: whoever reads
+    /// one checks its signature ([`crate::sign::check_admission`]). Each record has its own entry,
+    /// keyed by peer and admitted key, so admitting a machine never replaces another's record.
+    /// Entries whose key does not start with a peer id, or whose value is not text, are left out.
+    pub fn admissions(&self) -> Result<Vec<(u64, String)>> {
+        self.transaction(TxMode::Write, || {
+            let doc = self.doc.borrow();
+            let mut admissions = Vec::new();
+            doc.get_map(ADMISSIONS).for_each(|key, value| {
+                let peer = key.split_once('.').and_then(|(peer, _)| layout::parse_peer(peer));
+                if let (Some(peer), ValueOrContainer::Value(LoroValue::String(record))) =
+                    (peer, value)
+                {
+                    admissions.push((peer, record.to_string()));
+                }
+            });
+            Ok(admissions)
+        })
+    }
+
+    /// A value this replica keeps for itself, never synced: what it learned from the folder that
+    /// must outlive a later change to the document, such as an admission it checked.
+    pub fn local_note(&self, key: &str) -> Result<Option<String>> {
+        self.sql.index_meta(&format!("{LOCAL_NOTE}{key}"))
+    }
+
+    pub fn set_local_note(&self, key: &str, value: &str) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            self.sql.set_index_meta(&format!("{LOCAL_NOTE}{key}"), value)
+        })
+    }
+
+    /// Writes an admission record for `peer`, for every machine once they sync.
+    pub fn set_admission(&self, peer: u64, record: &str) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            self.pending.borrow_mut().push(Change::Admission(peer, record.to_string()));
+            Ok(())
         })
     }
 
@@ -917,6 +960,11 @@ impl LoroStore {
                 doc.get_map(MEMBERS)
                     .insert(&layout::peer_text(*peer), id.as_str())
                     .map_err(internal)
+            }
+            Change::Admission(peer, record) => {
+                let admitted = record.split_once('.').map_or("", |(key, _)| key);
+                let key = format!("{}.{admitted}", layout::peer_text(*peer));
+                doc.get_map(ADMISSIONS).insert(&key, record.as_str()).map_err(internal)
             }
             Change::Item(change) => {
                 let (old, i) = &**change;

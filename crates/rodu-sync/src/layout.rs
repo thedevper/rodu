@@ -37,6 +37,9 @@ pub const READABLE_COPY: &str = "readable_copy";
 /// Which person each machine writes for: a map from peer id (as [`peer_text`] writes it) to the
 /// id of a human principal (ADR 0002, step 1). Nothing proves an entry yet.
 pub const MEMBERS: &str = "members";
+/// Admissions of machines to a signed team: a map from peer id to the root key's signed record
+/// (see [`crate::sign`]). A record counts only by its signature.
+pub const ADMISSIONS: &str = "admissions";
 
 /// A peer id as written to the document.
 pub fn peer_text(peer: u64) -> String {

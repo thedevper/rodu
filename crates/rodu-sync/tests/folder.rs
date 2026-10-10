@@ -1038,3 +1038,285 @@ fn a_compaction_that_cannot_remove_a_file_warns_and_the_push_still_counts() {
     write_each(&b, &b_folder, "More", 4);
     assert!(!stuck.exists());
 }
+
+// --- signed teams (ADR 0002, step 2a) ---------------------------------------------------------
+
+use rodu_sync::sign::{self, MachineKey, PublicKey};
+
+const TEAM_ID: &str = "0190aaaa-0000-7000-8000-00000000000a";
+const ROOT_KEY: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+
+fn root_public() -> PublicKey {
+    MachineKey::from_hex(ROOT_KEY).unwrap().public()
+}
+
+/// The folder as the machine holding `key` sees it, in a team whose root is [`ROOT_KEY`].
+fn signed_at(root: &std::path::Path, key: &str) -> TeamFolder {
+    TeamFolder::new(root.join("Shared/Team"))
+        .signed(MachineKey::from_hex(key).unwrap(), root_public())
+}
+
+fn key_hex() -> String {
+    MachineKey::generate().unwrap().to_hex().to_string()
+}
+
+/// A machine joining a signed team: it takes in the board, asks to join, and pushes its first
+/// file.
+fn join_signed(folder: &TeamFolder, name: &str) -> Machine {
+    let machine = join(folder, name);
+    folder.write_request(machine.store().peer(), name).unwrap();
+    machine
+}
+
+fn names(machine: &Machine) -> Vec<String> {
+    let mut names: Vec<String> =
+        machine.store().list_principals().unwrap().into_iter().map(|p| p.name).collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_signed_team_takes_in_a_machine_only_once_the_root_admits_it() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    assert_eq!(ann_folder.info().unwrap().format, 3);
+    let bob_key = key_hex();
+    let bob_folder = signed_at(root.path(), &bob_key);
+    let b = join_signed(&bob_folder, "bob");
+    assert!(b.titles().contains(&"Made alone".to_owned()), "the root's files land at once");
+
+    // bob's file waits, and is read again on every pull until he is admitted.
+    for _ in 0..2 {
+        let report = a.sync(&ann_folder);
+        assert_eq!(report.awaiting, vec![(b.store().peer(), 1)], "{report:?}");
+        assert!(report.damaged.is_empty(), "{report:?}");
+        assert_eq!(names(&a), ["ann"]);
+    }
+    let requests = ann_folder.requests().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!((requests[0].peer, requests[0].name.as_str()), (b.store().peer(), "bob"));
+    assert_eq!(requests[0].key, MachineKey::from_hex(&bob_key).unwrap().public());
+    // Only the root admits.
+    assert!(bob_folder.admit(b.store(), &requests[0]).is_err());
+    ann_folder.admit(a.store(), &requests[0]).unwrap();
+    let report = a.sync(&ann_folder);
+    assert!(report.awaiting.is_empty(), "{report:?}");
+    assert_eq!(names(&a), ["ann", "bob"]);
+
+    // bob's later work flows both ways.
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "From bob" })], None).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    assert!(a.titles().contains(&"From bob".to_owned()));
+    assert_eq!(ann_folder.admissions(a.store()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_pull_that_brings_an_admission_takes_in_the_admitted_machines_files_at_once() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    let (bob_key, cat_key) = (key_hex(), key_hex());
+    let b = join_signed(&signed_at(root.path(), &bob_key), "bob");
+    let c = join_signed(&signed_at(root.path(), &cat_key), "cat");
+    for request in ann_folder.requests().unwrap() {
+        ann_folder.admit(a.store(), &request).unwrap();
+    }
+    a.sync(&ann_folder);
+    // cat had not seen bob's admission: one pull brings it, then bob's file.
+    let report = c.sync(&signed_at(root.path(), &cat_key));
+    assert!(report.awaiting.is_empty(), "{report:?}");
+    assert_eq!(names(&c), ["ann", "bob", "cat"]);
+    drop(b);
+}
+
+/// A sync file's Loro update, taken out of its frame and signature.
+fn update_of(path: &std::path::Path, peer: u64) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap();
+    let Frame::Complete(payload) = unframe(&bytes) else { panic!("not a plain sync file") };
+    sign::open_file(TEAM_ID, peer, payload).expect("signed").1.to_vec()
+}
+
+#[test]
+fn files_changed_moved_or_unsigned_are_refused_once_and_a_strangers_wait() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    let bob_key = key_hex();
+    let bob_folder = signed_at(root.path(), &bob_key);
+    let b = join_signed(&bob_folder, "bob");
+    let cat_key = key_hex();
+    let c = join_signed(&signed_at(root.path(), &cat_key), "cat");
+    for request in ann_folder.requests().unwrap() {
+        ann_folder.admit(a.store(), &request).unwrap();
+    }
+    a.sync(&ann_folder);
+    b.svc.create_items(&b.me, "DEMO", &[json!({ "title": "Kept" })], None).unwrap();
+    let good = bob_folder.push(b.store()).unwrap().written.unwrap();
+    let b_dir = good.parent().unwrap().to_path_buf();
+    let update = update_of(&good, b.store().peer());
+
+    // bob's update signed by a stranger's key, under bob's folder.
+    let stranger = MachineKey::generate().unwrap();
+    let forged = stranger.sign_file(TEAM_ID, b.store().peer(), &update);
+    std::fs::write(b_dir.join("0000000050.update"), frame(&forged)).unwrap();
+    // Signed by the root, but changed afterwards (the outer hash recomputed).
+    let mut changed =
+        MachineKey::from_hex(ROOT_KEY).unwrap().sign_file(TEAM_ID, b.store().peer(), &update);
+    *changed.last_mut().unwrap() ^= 1;
+    std::fs::write(b_dir.join("0000000051.update"), frame(&changed)).unwrap();
+    // bob's file copied into cat's folder.
+    let c_dir = ann_folder.root().join("sync").join(format!("{:016x}", c.store().peer()));
+    std::fs::copy(&good, c_dir.join("0000000052.update")).unwrap();
+    // An unsigned file.
+    std::fs::write(b_dir.join("0000000053.update"), frame(&update)).unwrap();
+
+    let report = a.sync(&ann_folder);
+    assert_eq!(report.damaged.len(), 3, "{report:?}");
+    // The stranger's file is validly signed, by a key nobody admitted for bob's folder: it waits.
+    assert_eq!(report.awaiting, vec![(b.store().peer(), 1)], "{report:?}");
+    assert!(a.titles().contains(&"Kept".to_owned()), "the good file still lands");
+    let again = a.sync(&ann_folder);
+    assert!(again.damaged.is_empty(), "reported once: {again:?}");
+    assert_eq!(again.awaiting, vec![(b.store().peer(), 1)], "still waiting: {again:?}");
+    // A waiting file is not read again: the same name, size and time with other bytes (which
+    // would be refused as damaged if read) still counts as waiting.
+    let waiting = b_dir.join("0000000050.update");
+    let time = std::fs::metadata(&waiting).unwrap().modified().unwrap();
+    let len = std::fs::metadata(&waiting).unwrap().len() as usize;
+    std::fs::write(&waiting, vec![b'x'; len]).unwrap();
+    std::fs::File::options().write(true).open(&waiting).unwrap().set_modified(time).unwrap();
+    let third = a.sync(&ann_folder);
+    assert!(third.damaged.is_empty(), "not read again: {third:?}");
+    assert_eq!(third.awaiting, vec![(b.store().peer(), 1)], "{third:?}");
+}
+
+#[test]
+fn an_admission_not_signed_by_the_root_admits_nobody() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    let bob_key = key_hex();
+    let bob_folder = signed_at(root.path(), &bob_key);
+    let b = join_signed(&bob_folder, "bob");
+    let request = ann_folder.requests().unwrap().pop().unwrap();
+    ann_folder.admit(a.store(), &request).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // eve asks to join; admitted bob writes an admission for her with his own key.
+    let eve_key = key_hex();
+    let e = join_signed(&signed_at(root.path(), &eve_key), "eve");
+    let eve = MachineKey::from_hex(&eve_key).unwrap().public();
+    let bob_signed = MachineKey::from_hex(&bob_key).unwrap().admit(TEAM_ID, e.store().peer(), &eve);
+    b.store().set_admission(e.store().peer(), &bob_signed).unwrap();
+    b.sync(&bob_folder);
+    let report = a.sync(&ann_folder);
+    assert_eq!(report.awaiting, vec![(e.store().peer(), 1)], "{report:?}");
+    assert!(!names(&a).contains(&"eve".to_owned()));
+    assert!(!ann_folder.admissions(a.store()).unwrap().contains_key(&e.store().peer()));
+}
+
+#[test]
+fn signing_is_the_workspaces_choice_never_the_folders() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    let team_file = ann_folder.root().join("rodu-team.json");
+    let signed_text = std::fs::read_to_string(&team_file).unwrap();
+    // A workspace that does not sign refuses a signed folder.
+    let err = TeamFolder::new(ann_folder.root()).pull(a.store(), &checker()).unwrap_err();
+    assert!(err.message.contains("signed team"), "{}", err.message);
+    // Another root key in the team file is refused.
+    let other = MachineKey::generate().unwrap().public().to_hex();
+    let swapped = signed_text.replace(&root_public().to_hex(), &other);
+    std::fs::write(&team_file, &swapped).unwrap();
+    let err = ann_folder.push(a.store()).unwrap_err();
+    assert!(err.message.contains("another root key"), "{}", err.message);
+    // A team file turned back to unsigned is refused: nothing is written unsigned.
+    let plain = json!({"format": 1, "workspaceId": TEAM_ID}).to_string();
+    std::fs::write(&team_file, plain).unwrap();
+    let err = ann_folder.push(a.store()).unwrap_err();
+    assert!(err.message.contains("not a signed team"), "{}", err.message);
+    // A format 3 file with a bad root, or without signing, is not a team file.
+    for bad in [
+        json!({"format": 3, "workspaceId": TEAM_ID, "signing": "ed25519", "root": "00"}),
+        json!({"format": 3, "workspaceId": TEAM_ID, "root": root_public().to_hex()}),
+        json!({"format": 1, "workspaceId": TEAM_ID, "signing": "ed25519", "root": root_public().to_hex()}),
+    ] {
+        std::fs::write(&team_file, bad.to_string()).unwrap();
+        assert!(ann_folder.info().is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn an_encrypted_signed_team_hides_requests_and_still_admits() {
+    let root = tempfile::tempdir().unwrap();
+    let at = |key: &str| {
+        TeamFolder::sealed(root.path().join("Shared/Team"), TeamKey::from_hex(KEY).unwrap())
+            .signed(MachineKey::from_hex(key).unwrap(), root_public())
+    };
+    let ann_folder = at(ROOT_KEY);
+    let a = first(&ann_folder);
+    let info = ann_folder.info().unwrap();
+    assert!(info.format == 3 && info.encrypted());
+    let bob_key = key_hex();
+    let b = join_signed(&at(&bob_key), "bob");
+    let bytes = folder_bytes(&ann_folder);
+    assert!(!bytes.windows(3).any(|w| w == b"bob"), "the request's name is sealed");
+    let request = ann_folder.requests().unwrap().pop().unwrap();
+    assert_eq!(request.name, "bob");
+    ann_folder.admit(a.store(), &request).unwrap();
+    a.sync(&ann_folder);
+    assert_eq!(names(&a), ["ann", "bob"]);
+    drop(b);
+}
+
+#[test]
+fn an_admission_once_checked_survives_a_member_overwriting_it() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    let (bob_key, cat_key) = (key_hex(), key_hex());
+    let bob_folder = signed_at(root.path(), &bob_key);
+    let b = join_signed(&bob_folder, "bob");
+    let cat_folder = signed_at(root.path(), &cat_key);
+    let c = join_signed(&cat_folder, "cat");
+    for request in ann_folder.requests().unwrap() {
+        ann_folder.admit(a.store(), &request).unwrap();
+    }
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // bob, admitted, overwrites cat's admission in the document.
+    let cat = MachineKey::from_hex(&cat_key).unwrap().public();
+    b.store()
+        .set_admission(c.store().peer(), &format!("{}.{}", cat.to_hex(), "00".repeat(64)))
+        .unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    assert!(
+        ann_folder.admissions(a.store()).unwrap()[&c.store().peer()].contains(&cat),
+        "ann checked cat's admission before: it stays"
+    );
+    // cat's later work still reaches ann.
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "From cat" })], None).unwrap();
+    c.sync(&cat_folder);
+    let report = a.sync(&ann_folder);
+    assert!(report.awaiting.is_empty(), "{report:?}");
+    assert!(a.titles().contains(&"From cat".to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_request_behind_a_linked_replica_folder_is_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let _a = first(&ann_folder);
+    let bob_key = key_hex();
+    let b = join_signed(&signed_at(root.path(), &bob_key), "bob");
+    let real = ann_folder.root().join("sync").join(format!("{:016x}", b.store().peer()));
+    let outside = root.path().join("elsewhere");
+    std::fs::rename(&real, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &real).unwrap();
+    assert!(ann_folder.requests().unwrap().is_empty());
+}
