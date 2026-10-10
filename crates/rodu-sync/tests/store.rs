@@ -931,3 +931,29 @@ fn the_numbering_peer_is_shared_and_a_malformed_one_is_none() {
         assert_eq!(c.store().numbering_peer().unwrap(), None, "{bad:?}");
     }
 }
+
+#[test]
+fn the_readable_copy_setting_is_shared_and_only_true_turns_it_on() {
+    let a = Peer::first();
+    assert!(!a.store().readable_copy().unwrap());
+    a.store().set_readable_copy(true).unwrap();
+    let b = Peer::join(&a, "bob");
+    assert!(b.store().readable_copy().unwrap());
+    b.store().set_readable_copy(false).unwrap();
+    exchange(&a, &b);
+    assert!(!a.store().readable_copy().unwrap());
+
+    for bad in [LoroValue::from("true"), LoroValue::from(1_i64)] {
+        let c = Peer::first();
+        let raw = LoroDoc::new();
+        raw.set_peer_id(99).unwrap();
+        let empty = LoroDoc::new().oplog_vv().encode();
+        raw.import(&c.store().updates_since(&empty).unwrap()).unwrap();
+        let start = raw.oplog_vv();
+        raw.get_map("team").insert("readable_copy", bad.clone()).unwrap();
+        raw.commit();
+        let update = raw.export(loro::ExportMode::updates(&start)).unwrap();
+        c.store().import_untrusted(&update, &checker()).unwrap();
+        assert!(!c.store().readable_copy().unwrap(), "{bad:?}");
+    }
+}

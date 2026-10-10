@@ -13,6 +13,7 @@ use rodu_sync::seal::TeamKey;
 use rodu_sync::{Checker, LoroStore};
 use serde::{Deserialize, Serialize};
 
+use crate::readable;
 use crate::store::AnyStore;
 use crate::{
     Args, Config, Io, Workspace, create_private_dir, find_dir, open, resolve, var,
@@ -149,7 +150,28 @@ pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
     {
         warn(io, &format!("numbering new cards: {}", e.message));
     }
+    if let Some(team) = &ws.config.team {
+        refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
+    }
 }
+
+/// Brings the team's readable copy up to date, or removes it once it is turned off. Only the
+/// numbering machine writes it, and only into a team folder that is there.
+fn refresh_copy(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> Vec<String> {
+    let Some(store) = service.store.team() else { return Vec::new() };
+    let root = Path::new(&team.folder);
+    if !service.numbering() || !root.join(SYNC_DIR).is_dir() {
+        return Vec::new();
+    }
+    match store.readable_copy() {
+        Ok(on) => readable::refresh(root, dir, service, on, &store.version()),
+        Err(e) => vec![format!("readable copy: {}", e.message)],
+    }
+}
+
+/// The warning shown whenever the readable copy is turned on.
+const READABLE_WARNING: &str = "The readable copy is plain Markdown in the team folder's readable/ \
+     folder and is never encrypted: anyone with access to the folder can read the board";
 
 /// Takes in what teammates wrote; false if the folder could not be read (a warning).
 fn pull_folder(io: &mut Io<'_>, ws: &Workspace) -> bool {
@@ -217,6 +239,7 @@ pub(crate) fn after(io: &mut Io<'_>, ws: &Workspace) {
         Ok(pushed) => pushed.warnings.iter().for_each(|line| warn(io, line)),
         Err(e) => warn(io, &format!("{} (your changes stay here and go out next time)", e.message)),
     }
+    refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
 }
 
 /// After `web` or `mcp` stop: their store is gone, so the workspace is opened again to push.
@@ -279,12 +302,15 @@ impl LiveSync<AnyStore> for FolderLive {
                 Err(e) => pulled.warnings.push(format!("numbering new cards: {}", e.message)),
             }
         }
+        pulled.warnings.extend(refresh_copy(&self.dir, &self.team, service));
         Ok(pulled)
     }
 
     fn push(&self, service: &RoduService<AnyStore>) -> Result<Vec<String>> {
         let Some(store) = service.store.team() else { return Ok(Vec::new()) };
-        Ok(team_folder(&self.dir, &self.team)?.push(store)?.warnings)
+        let mut warnings = team_folder(&self.dir, &self.team)?.push(store)?.warnings;
+        warnings.extend(refresh_copy(&self.dir, &self.team, service));
+        Ok(warnings)
     }
 }
 
@@ -335,6 +361,7 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
             "could not send your changes"
         }
     };
+    refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
     (io.out)(&format!(
         "Imported {} file(s), {} still arriving; numbered {numbered} card(s); {sent}",
         report.batch.imported.len(),
@@ -420,6 +447,11 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
                 );
             }
             (io.out)(&format!("This machine: {:016x}", store.peer()));
+            (io.out)(if store.readable_copy()? {
+                "Readable copy: on (plain Markdown in the folder's readable/, never encrypted)"
+            } else {
+                "Readable copy: off"
+            });
             (io.out)(&match store.numbering_peer()? {
                 Some(peer) if peer == store.peer() => {
                     "Numbering: this machine gives new cards their numbers".to_owned()
@@ -538,7 +570,12 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     .expecting(&workspace_id);
     folder.create(&workspace_id, store.peer())?;
     store.set_numbering_peer(store.peer())?;
+    let readable_copy = args.flag("readable-copy");
+    if readable_copy {
+        store.set_readable_copy(true)?;
+    }
     folder.push(&store)?;
+    drop(store);
     config.team = Some(TeamConfig {
         folder: folder_path.display().to_string(),
         workspace_id: workspace_id.clone(),
@@ -568,6 +605,50 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
             "The sync files are not encrypted: anyone with access to the folder can read them.",
         );
     }
+    if readable_copy {
+        (io.out)(READABLE_WARNING);
+        let ws = open(io, false)?;
+        if let Some(team) = &ws.config.team {
+            refresh_copy(&ws.dir, team, &ws.service).iter().for_each(|line| warn(io, line));
+        }
+    }
+    Ok(())
+}
+
+/// `rodu team readable-copy on|off`: turns the team's readable copy on or off for every machine.
+/// The numbering machine writes it, or removes what it wrote, when it next syncs.
+pub(crate) fn readable_copy(io: &mut Io<'_>, setting: Option<&String>) -> Result<()> {
+    let on = match setting.map(String::as_str) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            return Err(RoduError::invalid("Say on or off")
+                .with_hint("rodu team readable-copy on, or rodu team readable-copy off"));
+        }
+    };
+    let ws = open(io, false)?;
+    let Some(store) = ws.service.store.team() else {
+        return Err(RoduError::invalid("This is not a team workspace")
+            .with_hint("The readable copy lives in a team's shared folder"));
+    };
+    before(io, &ws);
+    if store.readable_copy()? != on {
+        store.set_readable_copy(on)?;
+    }
+    // after() pushes and brings the copy up to date; its problems are warnings, said above.
+    after(io, &ws);
+    if on {
+        (io.out)(READABLE_WARNING);
+    }
+    (io.out)(match (on, ws.service.numbering()) {
+        (true, true) => "Readable copy: on, kept by this machine",
+        (true, false) => "Readable copy: on; the numbering machine writes it when it next syncs",
+        (false, true) => {
+            "Readable copy: off; this machine removed the files it wrote (any it kept are named \
+             in the warnings above)"
+        }
+        (false, false) => "Readable copy: off; the numbering machine removes it when it next syncs",
+    });
     Ok(())
 }
 
