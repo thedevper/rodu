@@ -152,6 +152,62 @@ Where 2a differs from the text above, 2a is what holds:
   it stops calling the list unproven for admitted machines, but the name each machine gives
   stays a claim.
 
+#### Step 2b as built (admins and ownership transfer)
+
+Where 2b differs from Roles below, 2b is what holds.
+
+- **Rights belong to machine keys.** Owner and admin are recorded per machine key. The commands
+  take a person's name and act on that person's admitted machine (found through the `members`
+  entry of each admitted peer). When the person has more than one, `--machine <id>` names it.
+- **Authority records.** These live in the team document's root map `authority`. Each key is the
+  hex SHA-256 of its value, so a value that was changed no longer matches its key and is ignored.
+  Every record is signed, and its signer is named in it:
+  - `owner.<epoch>.<new owner key>.<signer key>.<signature>`: a transfer. It is valid when the
+    owner of epoch `epoch - 1` signed it. The owner of epoch 0 is the root key.
+  - `admin.<epoch>.<n>.<target key>.on.<signer key>.<signature>`: a grant, valid when the owner
+    of `epoch` signed it.
+  - `admin.<epoch>.<n>.<target key>.off.<kept admissions>.<signer key>.<signature>`: a revocation,
+    valid on the same rule. `kept admissions` is a comma-separated list of `<peer>:<key>`, or `-`.
+  - The signatures cover `"rodu-authority-1" 0x00 || workspace id length (u64 LE) || workspace id
+    || the record text up to its signer key`.
+- **The owner.** Starting from the root, each epoch's owner is the new key of the valid transfer
+  for that epoch. If the owner signed two transfers for the same epoch, the one whose record hash
+  is lowest counts, on every replica. The chain stops at the first epoch with no valid transfer.
+  Only the current owner can transfer (`rodu team transfer-owner <name> --yes`).
+- **Admins.**
+  - Every key that was ever owner is an admin from the epoch it stopped being owner, as if granted
+    with `n = 0`.
+  - For each target key, the valid grant or revocation with the highest `(epoch, n)` decides. A
+    revocation wins a tie.
+  - `rodu team admin <name> on|off [--machine <id>]` (current owner only) writes one record for
+    that machine key. `n` is one more than the highest `n` for that target in the current epoch.
+- **Who can admit.**
+  - An admission record is now `<member key>.<signer key>.<signature>`. The 2a form, without a
+    signer, means the root signed it.
+  - An admission counts when its signer is the current owner, or is an admin now.
+  - It also counts when the signer was an admin and the revocation that decides that signer lists
+    the admission in its kept admissions.
+  - When the owner revokes an admin, the revocation keeps every admission that admin signed which
+    the owner's machine holds. An admission the admin signed offline at the same moment is
+    therefore not kept, and the machine waits to be admitted again.
+- **The root key.** In 2a a file signed by the root key was taken in from any replica folder. Now
+  that holds only while the root key is the owner or an admin. Once revoked, the root's machine
+  needs an admission like any other (`rodu team create --signed` admits it from the start).
+- **Admitted keys are not admins.** Admins admit and (in step 3) remove members. They cannot
+  grant or revoke admin, or transfer ownership. So no two people can ever shut each other out at
+  once.
+- **Kept once checked.** Each replica already keeps every admission it checked (2a). It now also
+  keeps every authority record it checked, and it notes the signer of each admission it keeps, so
+  a revocation still takes effect locally.
+- **Left for later.** A member who deletes an authority record before some replica has read it
+  can keep that replica from seeing it. For a revocation, that replica would still accept
+  admissions the revoked admin signs. Only a replica that has never seen the revocation (such as
+  one that joins later) is affected. Step 3 removes such a member.
+- **Also left for later.** A pull decides whose files it takes in before it reads them. If one pull
+  brings a revocation together with files from a machine the revoked admin admitted late, those
+  files can land before the revocation counts. Work already taken in is never taken out again;
+  later work from that machine waits. Step 3's removal covers what such a machine wrote.
+
 ### Step 3: removing someone
 
 - `rodu team remove <name>` (owner or admin, within the limits under Roles) signs a removal

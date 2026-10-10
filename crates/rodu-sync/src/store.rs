@@ -41,8 +41,8 @@ use rodu_store::index::Parked;
 use sha2::{Digest, Sha256};
 
 use crate::layout::{
-    self, ADMISSIONS, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS, NUMBERING_PEER,
-    PRINCIPALS, READABLE_COPY, TEAM,
+    self, ADMISSIONS, AUTHORITY, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS,
+    NUMBERING_PEER, PRINCIPALS, READABLE_COPY, TEAM,
 };
 use crate::names::{self, Entry};
 use crate::{Checker, MAX_IMPORT_BYTES, SyncError, Untrusted, check_import};
@@ -140,6 +140,7 @@ enum Change {
     ReadableCopy(bool),
     Member(u64, String),
     Admission(u64, String),
+    Authority(String, String),
 }
 
 /// Which entities a document change touched.
@@ -419,6 +420,30 @@ impl LoroStore {
                 }
             });
             Ok(admissions)
+        })
+    }
+
+    /// The authority records in the document with their keys, unchecked: whoever reads one checks
+    /// that its key is its hash and that it is signed ([`crate::authority::Record::parse`]).
+    /// Entries whose value is not text are left out.
+    pub fn authority(&self) -> Result<Vec<(String, String)>> {
+        self.transaction(TxMode::Write, || {
+            let doc = self.doc.borrow();
+            let mut records = Vec::new();
+            doc.get_map(AUTHORITY).for_each(|key, value| {
+                if let ValueOrContainer::Value(LoroValue::String(record)) = value {
+                    records.push((key.to_string(), record.to_string()));
+                }
+            });
+            Ok(records)
+        })
+    }
+
+    /// Writes an authority record under `key`, for every machine once they sync.
+    pub fn set_authority(&self, key: &str, record: &str) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            self.pending.borrow_mut().push(Change::Authority(key.to_string(), record.to_string()));
+            Ok(())
         })
     }
 
@@ -965,6 +990,9 @@ impl LoroStore {
                 let admitted = record.split_once('.').map_or("", |(key, _)| key);
                 let key = format!("{}.{admitted}", layout::peer_text(*peer));
                 doc.get_map(ADMISSIONS).insert(&key, record.as_str()).map_err(internal)
+            }
+            Change::Authority(key, record) => {
+                doc.get_map(AUTHORITY).insert(key, record.as_str()).map_err(internal)
             }
             Change::Item(change) => {
                 let (old, i) = &**change;

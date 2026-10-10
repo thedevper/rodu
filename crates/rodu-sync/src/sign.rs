@@ -19,8 +19,10 @@
 //!     || the admitted peer id, u64 LE || the admitted machine's public key (32 bytes)
 //! ```
 //!
-//! and the record is kept in the team document as `<public key, 64 hex>.<signature, 128 hex>`.
-//! A record counts only by its signature, never by which machine wrote it into the document.
+//! An admission is kept in the team document as `<admitted key, 64 hex>.<signer key, 64
+//! hex>.<signature, 128 hex>` (or, as first written, without the signer key, meaning the root
+//! signed it). Who may sign one is decided by the team's authority records ([`crate::authority`]);
+//! a record never counts by which machine wrote it into the document.
 //!
 //! A machine asks to join by signing its own request, so nobody can file a request under another
 //! machine's key:
@@ -45,6 +47,7 @@ pub const OVERHEAD: usize = 1 + KEY_LEN + SIGNATURE_LEN;
 const FILE_DOMAIN: &[u8] = b"rodu-sync-sign-1\0";
 const ADMIT_DOMAIN: &[u8] = b"rodu-admit-1\0";
 const REQUEST_DOMAIN: &[u8] = b"rodu-request-1\0";
+const AUTHORITY_DOMAIN: &[u8] = b"rodu-authority-1\0";
 
 /// Exactly `2 * N` lowercase hex digits.
 fn from_hex<const N: usize>(text: &str) -> Option<Zeroizing<[u8; N]>> {
@@ -74,6 +77,17 @@ fn file_message(workspace_id: &str, peer: u64, update: &[u8]) -> Vec<u8> {
 fn admit_message(workspace_id: &str, peer: u64, member: &PublicKey) -> Vec<u8> {
     let mut message = with_team(ADMIT_DOMAIN, workspace_id, peer);
     message.extend(member.0);
+    message
+}
+
+fn authority_message(workspace_id: &str, text: &str) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(AUTHORITY_DOMAIN.len() + 16 + workspace_id.len() + text.len());
+    message.extend(AUTHORITY_DOMAIN);
+    message.extend((workspace_id.len() as u64).to_le_bytes());
+    message.extend(workspace_id.as_bytes());
+    message.extend((text.len() as u64).to_le_bytes());
+    message.extend(text.as_bytes());
     message
 }
 
@@ -175,10 +189,20 @@ impl MachineKey {
         hex::encode(self.0.sign(&request_message(workspace_id, peer, name)).to_bytes())
     }
 
-    /// The admission record of `member` writing as `peer`, signed with this (the root) key.
+    /// The admission record of `member` writing as `peer`, signed with this key.
     pub fn admit(&self, workspace_id: &str, peer: u64, member: &PublicKey) -> String {
         let signature = self.0.sign(&admit_message(workspace_id, peer, member));
-        format!("{}.{}", member.to_hex(), hex::encode(signature.to_bytes()))
+        format!(
+            "{}.{}.{}",
+            member.to_hex(),
+            self.public().to_hex(),
+            hex::encode(signature.to_bytes())
+        )
+    }
+
+    /// This key's signature, 128 hex, on an authority record's text up to its signer key.
+    pub fn sign_authority(&self, workspace_id: &str, text: &str) -> String {
+        hex::encode(self.0.sign(&authority_message(workspace_id, text)).to_bytes())
     }
 }
 
@@ -200,17 +224,37 @@ pub fn open_file<'a>(
         .then_some((signer, update))
 }
 
-/// The machine key an admission record admits for `peer`, if `root` signed it for this team.
+/// The machine key an admission record admits for `peer`, and the key that signed it, if the
+/// signature verifies. A record without a signer key was signed by `root`. Whether that signer
+/// may admit is the caller's to check.
 pub fn check_admission(
     root: &PublicKey,
     workspace_id: &str,
     peer: u64,
     record: &str,
-) -> Option<PublicKey> {
-    let (member, signature) = record.split_once('.')?;
+) -> Option<(PublicKey, PublicKey)> {
+    let parts: Vec<&str> = record.split('.').collect();
+    let (member, signer, signature) = match parts.as_slice() {
+        [member, signature] => (*member, *root, *signature),
+        [member, signer, signature] => (*member, PublicKey::from_hex(signer)?, *signature),
+        _ => return None,
+    };
     let member = PublicKey::from_hex(member)?;
     let signature = from_hex::<SIGNATURE_LEN>(signature)?;
-    root.verifies(&admit_message(workspace_id, peer, &member), &signature).then_some(member)
+    signer
+        .verifies(&admit_message(workspace_id, peer, &member), &signature)
+        .then_some((member, signer))
+}
+
+/// Whether `signer` signed the authority record text `text` (up to and including its signer key).
+pub fn check_authority(
+    signer: &PublicKey,
+    workspace_id: &str,
+    text: &str,
+    signature: &str,
+) -> bool {
+    from_hex::<SIGNATURE_LEN>(signature)
+        .is_some_and(|sig| signer.verifies(&authority_message(workspace_id, text), &sig))
 }
 
 /// Whether `key` signed a request to join as `peer` under `name`.
@@ -274,12 +318,26 @@ mod tests {
         let root = MachineKey::generate().unwrap();
         let member = MachineKey::generate().unwrap().public();
         let record = root.admit(TEAM, 9, &member);
-        assert_eq!(check_admission(&root.public(), TEAM, 9, &record), Some(member));
+        assert_eq!(
+            check_admission(&root.public(), TEAM, 9, &record),
+            Some((member, root.public()))
+        );
         assert_eq!(check_admission(&root.public(), TEAM, 10, &record), None, "another peer");
         let other = MachineKey::generate().unwrap();
-        assert_eq!(check_admission(&other.public(), TEAM, 9, &record), None, "not the root's");
-        let forged = other.admit(TEAM, 9, &member);
-        assert_eq!(check_admission(&root.public(), TEAM, 9, &forged), None);
+        // Signed by another key: it names that key as its signer, which the caller then checks.
+        let theirs = other.admit(TEAM, 9, &member);
+        assert_eq!(
+            check_admission(&root.public(), TEAM, 9, &theirs),
+            Some((member, other.public()))
+        );
+        // A record claiming the root signed it, with another key's signature, does not verify.
+        let claimed = theirs.replace(&other.public().to_hex(), &root.public().to_hex());
+        assert_eq!(check_admission(&root.public(), TEAM, 9, &claimed), None);
+        // The first form, without a signer, is the root's.
+        let (key, signature) = (member.to_hex(), record.rsplit_once('.').unwrap().1);
+        let short = format!("{key}.{signature}");
+        assert_eq!(check_admission(&root.public(), TEAM, 9, &short), Some((member, root.public())));
+        assert_eq!(check_admission(&other.public(), TEAM, 9, &short), None);
         for bad in ["", ".", "zz", &record.to_uppercase(), &record[..record.len() - 2]] {
             assert_eq!(check_admission(&root.public(), TEAM, 9, bad), None, "{bad:?}");
         }
@@ -295,6 +353,32 @@ mod tests {
         let other = MachineKey::generate().unwrap().public();
         assert!(!check_request(&other, TEAM, 5, "bob", &signature));
         assert!(!check_request(&key.public(), TEAM, 5, "bob", "00"));
+    }
+
+    #[test]
+    fn an_authority_signature_covers_the_team_and_the_whole_text() {
+        let key = MachineKey::generate().unwrap();
+        let text = format!("owner.1.{}.{}", "ab".repeat(32), key.public().to_hex());
+        let signature = key.sign_authority(TEAM, &text);
+        assert!(check_authority(&key.public(), TEAM, &text, &signature));
+        assert!(!check_authority(
+            &key.public(),
+            "0190f0c4-0000-7000-8000-000000000002",
+            &text,
+            &signature
+        ));
+        assert!(!check_authority(
+            &key.public(),
+            TEAM,
+            &text.replace("owner.1", "owner.2"),
+            &signature
+        ));
+        let other = MachineKey::generate().unwrap().public();
+        assert!(!check_authority(&other, TEAM, &text, &signature));
+        // Not an admission's signature, nor a file's.
+        let admission = key.admit(TEAM, 1, &other);
+        let admit_sig = admission.rsplit_once('.').unwrap().1;
+        assert!(!check_authority(&key.public(), TEAM, &text, admit_sig));
     }
 
     #[test]
