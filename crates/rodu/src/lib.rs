@@ -348,7 +348,8 @@ async fn command_result(
             Some("readable-copy") => team::readable_copy(io, rest.get(1)).map(|()| 0),
             Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
                 .with_hint(
-                    "rodu team, rodu team create, rodu team join, rodu team take-numbering",
+                    "rodu team, rodu team create, rodu team join, rodu team take-numbering, \
+                     rodu team readable-copy",
                 )),
         },
         "sync" => team::sync(io).map(|()| 0),

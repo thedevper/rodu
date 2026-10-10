@@ -676,11 +676,11 @@ fn a_card_that_leaves_the_copy_loses_its_file_and_problems_are_warnings() {
     let team = team();
     ok(&team.ann, &["team", "readable-copy", "on"]);
     let copy = readable(&team);
-    // A file Rodu wrote for a card that is no longer there (as after a renumbering): its record
-    // says Rodu wrote it, so it goes. The record is edited so the copy is rendered again.
+    // A file this machine wrote for a card that is no longer there (as after a renumbering): its
+    // own record says so, so it goes. The record is edited so the copy is rendered again.
     let stale = "# DEMO-9: gone\n";
     std::fs::write(copy.join("DEMO-9.md"), stale).unwrap();
-    let manifest = copy.join(".rodu-readable.json");
+    let manifest = team.ann.join(".rodu/readable-copy.json");
     let mut record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
     let hash: String =
@@ -723,14 +723,43 @@ fn a_forged_record_never_gets_a_persons_file_removed() {
     let copy = readable(&team);
     std::fs::write(copy.join("notes.md"), "my notes").unwrap();
     std::fs::write(copy.join("DEMO-50.md"), "named like a card, written by a person").unwrap();
+    // Even content that looks exactly like Rodu's, with the folder's record forged to match.
+    std::fs::write(copy.join("DEMO-51.md"), "# DEMO-51: looks like Rodu's\n").unwrap();
+    // A render rewrites the folder's record, dropping forged names: that must not delete them.
+    forge_record(&copy, "DEMO-51.md");
+    let _ = rodu(&team.ann, &["sync"]);
+    assert!(copy.join("DEMO-51.md").is_file());
+    // Turned off by a teammate, then forged before ann's machine removes the copy.
+    let bob = join(&team, "bob");
+    ok(&bob, &["team", "readable-copy", "off"]);
     forge_record(&copy, "notes.md");
     forge_record(&copy, "DEMO-50.md");
-    let _ = rodu(&team.ann, &["sync"]);
-    let off = rodu(&team.ann, &["team", "readable-copy", "off"]);
+    forge_record(&copy, "DEMO-51.md");
+    let off = rodu(&team.ann, &["sync"]);
     assert_eq!(off.code, 0, "{}", off.err);
     assert_eq!(std::fs::read_to_string(copy.join("notes.md")).unwrap(), "my notes");
-    assert!(copy.join("DEMO-50.md").is_file());
+    assert!(copy.join("DEMO-50.md").is_file() && copy.join("DEMO-51.md").is_file());
     assert!(!copy.join("DEMO-1.md").exists(), "Rodu's own files went");
+}
+
+#[test]
+fn after_a_hand_over_the_new_numbering_machine_keeps_the_copy_up_to_date() {
+    let team = team();
+    let bob = join(&team, "bob");
+    ok(&team.ann, &["team", "readable-copy", "on"]);
+    let copy = readable(&team);
+    assert!(copy.join("DEMO-1.md").is_file());
+    ok(&bob, &["team", "take-numbering", "--yes"]);
+    ok(&bob, &["mv", "DEMO-1", "Todo"]);
+    // bob overwrites ann's file, as the folder's record allows, with no warning.
+    assert!(std::fs::read_to_string(copy.join("DEMO-1.md")).unwrap().contains("- Status: Todo"));
+    // A sync with nothing new rewrites nothing.
+    let before = modified(&copy.join("DEMO-1.md"));
+    ok(&bob, &["sync"]);
+    assert_eq!(modified(&copy.join("DEMO-1.md")), before);
+    // Off, bob removes the files he wrote.
+    ok(&bob, &["team", "readable-copy", "off"]);
+    assert!(!copy.join("DEMO-1.md").exists());
 }
 
 #[cfg(unix)]
