@@ -8,6 +8,7 @@
 //! imports into this process only when the child survives. A refused file is an error and leaves
 //! the replica unchanged.
 
+pub mod authority;
 pub mod folder;
 mod layout;
 mod names;

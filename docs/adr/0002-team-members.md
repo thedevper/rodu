@@ -50,7 +50,7 @@ Three steps, each shippable alone.
   nothing behind. It uses that person's agent, or makes `<name>-agent` if they have none. A
   machine claimed for an agent is listed as unknown.
 
-### Step 2: each machine signs what it writes
+### Step 2: each machine signs what it writes (2a and 2b built 2026-10-10)
 
 - **Keys per machine, not per person.** `team create` and `team join` generate an Ed25519 key
   pair. The private key is kept in `.rodu/identity.key` (mode 0600, zeroized in memory, like
@@ -151,6 +151,85 @@ Where 2a differs from the text above, 2a is what holds:
   `rodu team members` marks machines waiting for admission and lists requests. On a signed team,
   it stops calling the list unproven for admitted machines, but the name each machine gives
   stays a claim.
+
+#### Step 2b as built (admins and ownership transfer; built 2026-10-10)
+
+Where 2b differs from Roles below, 2b is what holds.
+
+- **Rights belong to machine keys.** Owner and admin are recorded per machine key. The commands
+  take a person's name and act on that person's admitted machine (found through the `members`
+  entry of each admitted peer). Which person a machine belongs to is only what it says, so
+  granting admin and handing the team over also take the machine's code, which the person reads
+  out from their own machine, as admitting does: `rodu team admin <name> on <code>`,
+  `rodu team transfer-owner <name> <code> --yes`. Revoking (`rodu team admin <name> off`) takes
+  `--machine <id>` when the person has more than one.
+- **Authority records.** These live in the team document's root map `authority`. Each key is the
+  hex SHA-256 of its value, so a value that was changed no longer matches its key and is ignored.
+  Every record is signed, and its signer is named in it:
+  - `owner.<epoch>.<new owner key>.<carried records>.<signer key>.<signature>`: a transfer. It
+    is valid when the owner of epoch `epoch - 1` signed it. The owner of epoch 0 is the root key.
+    `carried records` lists (comma-separated, or `-`) the hashes of every admin record the owner
+    signed in the epoch the transfer ends.
+  - `admin.<epoch>.<n>.<target key>.on.<signer key>.<signature>`: a grant, valid when the owner
+    of `epoch` signed it.
+  - `admin.<epoch>.<n>.<target key>.off.<kept admissions>.<signer key>.<signature>`: a revocation,
+    valid on the same rule. `kept admissions` is a comma-separated list of `<peer>:<key>`, or `-`.
+  - The signatures cover `"rodu-authority-1" 0x00 || workspace id length (u64 LE) || workspace id
+    || the record text up to its signer key`.
+- **The owner.** Starting from the root, each epoch's owner is the new key of the valid transfer
+  for that epoch. The chain stops at the first epoch with no valid transfer. Only the current
+  owner can transfer (`rodu team transfer-owner <name> --yes`).
+- **A second transfer for one epoch.** An owner who hands the team on still holds its key, and
+  could sign another transfer for the same epoch later, to a key of its own. So each replica notes
+  the transfers it follows (local note `owners`) and keeps following them: a later transfer for an
+  epoch it already settled never moves it, whatever its hash. A replica that sees two at once, and
+  settled neither, takes the one with the lowest record hash, as every such replica does. Either
+  way it marks the team disputed, and `rodu team` warns.
+- **Admins.**
+  - Every key that was ever owner is an admin from the epoch it stopped being owner, as if granted
+    with `n = 0`.
+  - An admin record of the current epoch counts when the current owner signed it. One of an
+    earlier epoch counts only when the transfer that ended that epoch carries its hash. So nothing
+    a former owner signs for its own epoch after handing over counts (it cannot name admins).
+  - For each target key, the counting grant or revocation with the highest `(epoch, n)` decides.
+    A revocation wins a tie.
+  - `rodu team admin` (current owner only) writes one record for that machine key. `n` is one more than the highest `n` for that target in the current epoch.
+- **Who can admit.**
+  - An admission record is now `<member key>.<signer key>.<signature>`. The 2a form, without a
+    signer, means the root signed it.
+  - An admission counts when its signer is the current owner, or is an admin now.
+  - It also counts when the signer was an admin and the revocation that decides that signer lists
+    the admission in its kept admissions.
+  - When the owner revokes an admin, the revocation keeps every admission that admin signed which
+    the owner's machine holds. An admission the admin signed offline at the same moment is
+    therefore not kept, and the machine waits to be admitted again.
+- **The root key.** In 2a a file signed by the root key was taken in from any replica folder. Now
+  that holds only while the root key is the owner or an admin. Once revoked, the root's machine
+  needs an admission like any other (`rodu team create --signed` admits it from the start).
+- **Admitted keys are not admins.** Admins admit and (in step 3) remove members. They cannot
+  grant or revoke admin, or transfer ownership. So no two people can ever shut each other out at
+  once.
+- **Kept once checked.** Each replica already keeps every admission it checked (2a). It now also
+  keeps every authority record it checked that could ever count (see below), and it notes the
+  signer of each admission it keeps, so a revocation still takes effect locally. An entry that fails its check (a key that is not its
+  hash, a bad signature, a malformed text) is noted by the hash of its key and text (up to 4096),
+  so it is not checked again; its text is not kept. A valid record is kept only when its signer
+  is the root or a key that some kept transfer hands the team to: a record signed by any other key
+  can never count, and keeping it would let anyone who can write to the folder grow the notes
+  without end. (An owner, or a former owner, can still sign as many records as it likes; that is
+  bounded only by the document.)
+- **Left for later.** A member who deletes an authority record before some replica has read it
+  can keep that replica from seeing it. For a revocation, that replica would still accept
+  admissions the revoked admin signs. Only a replica that has never seen the revocation (such as
+  one that joins later) is affected. Step 3 removes such a member.
+- **Also left for later: a disputed hand-over.** A replica that never saw the first transfer for
+  an epoch (one that joins after a former owner signed a second) may follow the second. It warns
+  that the team is disputed; the owner it should follow is settled between people, and step 3
+  lets the owner remove the former owner's machine.
+- **Also left for later.** A pull decides whose files it takes in before it reads them. If one pull
+  brings a revocation together with files from a machine the revoked admin admitted late, those
+  files can land before the revocation counts. Work already taken in is never taken out again;
+  later work from that machine waits. Step 3's removal covers what such a machine wrote.
 
 ### Step 3: removing someone
 
