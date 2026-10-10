@@ -41,7 +41,8 @@ use rodu_store::index::Parked;
 use sha2::{Digest, Sha256};
 
 use crate::layout::{
-    self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, NUMBERING_PEER, PRINCIPALS, TEAM,
+    self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, NUMBERING_PEER, PRINCIPALS,
+    READABLE_COPY, TEAM,
 };
 use crate::names::{self, Entry};
 use crate::{Checker, MAX_IMPORT_BYTES, SyncError, Untrusted, check_import};
@@ -134,6 +135,7 @@ enum Change {
     Comment(Comment),
     Link(Link),
     NumberingPeer(u64),
+    ReadableCopy(bool),
 }
 
 /// Which entities a document change touched.
@@ -351,6 +353,26 @@ impl LoroStore {
                 Some(ValueOrContainer::Value(LoroValue::String(text))) => layout::parse_peer(&text),
                 _ => None,
             })
+        })
+    }
+
+    /// Whether the team keeps a readable copy of the board. Anything but `true`, such as a value
+    /// a broken machine wrote, is off.
+    pub fn readable_copy(&self) -> Result<bool> {
+        self.transaction(TxMode::Write, || {
+            let doc = self.doc.borrow();
+            Ok(matches!(
+                doc.get_map(TEAM).get(READABLE_COPY),
+                Some(ValueOrContainer::Value(LoroValue::Bool(true)))
+            ))
+        })
+    }
+
+    /// Turns the team's readable copy on or off, for every machine once they sync.
+    pub fn set_readable_copy(&self, on: bool) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            self.pending.borrow_mut().push(Change::ReadableCopy(on));
+            Ok(())
         })
     }
 
@@ -852,6 +874,9 @@ impl LoroStore {
             }
             Change::NumberingPeer(peer) => {
                 doc.get_map(TEAM).insert(NUMBERING_PEER, layout::peer_text(*peer)).map_err(internal)
+            }
+            Change::ReadableCopy(on) => {
+                doc.get_map(TEAM).insert(READABLE_COPY, *on).map_err(internal)
             }
             Change::Item(change) => {
                 let (old, i) = &**change;
