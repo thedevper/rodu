@@ -1041,7 +1041,9 @@ fn a_compaction_that_cannot_remove_a_file_warns_and_the_push_still_counts() {
 
 // --- signed teams (ADR 0002, step 2a) ---------------------------------------------------------
 
+use rodu_sync::authority::Record;
 use rodu_sync::sign::{self, MachineKey, PublicKey};
+use std::collections::BTreeSet;
 
 const TEAM_ID: &str = "0190aaaa-0000-7000-8000-00000000000a";
 const ROOT_KEY: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
@@ -1319,4 +1321,272 @@ fn a_request_behind_a_linked_replica_folder_is_skipped() {
     std::fs::rename(&real, &outside).unwrap();
     std::os::unix::fs::symlink(&outside, &real).unwrap();
     assert!(ann_folder.requests().unwrap().is_empty());
+}
+
+// --- admins and ownership (ADR 0002, step 2b) -------------------------------------------------
+
+/// ann (the root, her machine admitted as `rodu team create --signed` does) and bob, admitted,
+/// both synced.
+fn ann_and_bob(root: &std::path::Path) -> (TeamFolder, Machine, String, TeamFolder, Machine) {
+    let ann_folder = signed_at(root, ROOT_KEY);
+    let a = first(&ann_folder);
+    let me = rodu_sync::folder::JoinRequest {
+        peer: a.store().peer(),
+        name: "ann".to_owned(),
+        key: root_public(),
+    };
+    ann_folder.admit(a.store(), &me).unwrap();
+    let bob_key = key_hex();
+    let bob_folder = signed_at(root, &bob_key);
+    let b = join_signed(&bob_folder, "bob");
+    for request in ann_folder.requests().unwrap() {
+        ann_folder.admit(a.store(), &request).unwrap();
+    }
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    (ann_folder, a, bob_key, bob_folder, b)
+}
+
+fn public(key: &str) -> PublicKey {
+    MachineKey::from_hex(key).unwrap().public()
+}
+
+fn request_of(folder: &TeamFolder, name: &str) -> rodu_sync::folder::JoinRequest {
+    folder.requests().unwrap().into_iter().find(|r| r.name == name).unwrap()
+}
+
+#[test]
+fn an_admin_admits_and_a_revocation_keeps_only_the_machines_let_in_before() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root.path());
+    let bob = public(&bob_key);
+    let cat_key = key_hex();
+    let cat_folder = signed_at(root.path(), &cat_key);
+    let c = join_signed(&cat_folder, "cat");
+    // Not an admin yet.
+    assert!(bob_folder.admit(b.store(), &request_of(&bob_folder, "cat")).is_err());
+    // Only the owner chooses admins.
+    assert!(bob_folder.set_admin(b.store(), &bob, true).is_err());
+    ann_folder.set_admin(a.store(), &bob, true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    assert!(bob_folder.authority(b.store()).unwrap().is_admin(&bob));
+    // An admin cannot choose admins or hand over the team.
+    assert!(bob_folder.set_admin(b.store(), &public(&cat_key), true).is_err());
+    assert!(bob_folder.transfer(b.store(), &bob).is_err());
+    bob_folder.admit(b.store(), &request_of(&bob_folder, "cat")).unwrap();
+    b.sync(&bob_folder);
+    let report = a.sync(&ann_folder);
+    assert!(report.awaiting.is_empty(), "{report:?}");
+    assert_eq!(names(&a), ["ann", "bob", "cat"]);
+
+    // dan asks; ann revokes bob, then bob (not having seen it) admits dan.
+    let dan_key = key_hex();
+    let d = join_signed(&signed_at(root.path(), &dan_key), "dan");
+    ann_folder.set_admin(a.store(), &bob, false).unwrap();
+    a.sync(&ann_folder);
+    bob_folder.admit(b.store(), &request_of(&bob_folder, "dan")).unwrap();
+    b.sync(&bob_folder);
+    let report = a.sync(&ann_folder);
+    assert_eq!(report.awaiting, vec![(d.store().peer(), 1)], "{report:?}");
+    let admitted = ann_folder.admissions(a.store()).unwrap();
+    assert!(admitted[&c.store().peer()].contains(&public(&cat_key)), "kept: {admitted:?}");
+    assert!(!admitted.contains_key(&d.store().peer()), "{admitted:?}");
+    // cat's files still land; on cat's machine too, the revocation keeps cat.
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "From cat" })], None).unwrap();
+    c.sync(&cat_folder);
+    a.sync(&ann_folder);
+    assert!(a.titles().contains(&"From cat".to_owned()));
+    assert!(!cat_folder.authority(c.store()).unwrap().is_admin(&bob));
+    assert!(
+        cat_folder.admissions(c.store()).unwrap()[&c.store().peer()].contains(&public(&cat_key))
+    );
+}
+
+#[test]
+fn a_new_owner_decides_and_the_old_one_stays_an_admin_until_revoked() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root.path());
+    let (ann, bob) = (root_public(), public(&bob_key));
+    ann_folder.transfer(a.store(), &bob).unwrap();
+    // ann no longer owns the team, at once.
+    assert!(ann_folder.transfer(a.store(), &ann).is_err());
+    assert!(ann_folder.set_admin(a.store(), &bob, false).is_err());
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    let auth = bob_folder.authority(b.store()).unwrap();
+    assert_eq!((auth.owner(), auth.epoch()), (bob, 1));
+    assert!(auth.is_admin(&ann));
+
+    // ann, now an admin, still admits.
+    let c = join_signed(&signed_at(root.path(), &key_hex()), "cat");
+    ann_folder.admit(a.store(), &request_of(&ann_folder, "cat")).unwrap();
+    a.sync(&ann_folder);
+    assert!(b.sync(&bob_folder).awaiting.is_empty());
+    assert_eq!(names(&b), ["ann", "bob", "cat"]);
+    // bob revokes ann. On her machine, once it arrives, she cannot admit any more; her own
+    // machine stays admitted: her work still lands.
+    bob_folder.set_admin(b.store(), &ann, false).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    let d = join_signed(&signed_at(root.path(), &key_hex()), "dan");
+    assert!(ann_folder.admit(a.store(), &request_of(&ann_folder, "dan")).is_err());
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "From ann" })], None).unwrap();
+    a.sync(&ann_folder);
+    assert_eq!(b.sync(&bob_folder).awaiting, vec![(d.store().peer(), 1)], "only dan waits");
+    assert!(b.titles().contains(&"From ann".to_owned()));
+    // An admission she signed anyway (as if before the revocation reached her) counts for nobody.
+    let dan = request_of(&ann_folder, "dan");
+    let late = MachineKey::from_hex(ROOT_KEY).unwrap().admit(TEAM_ID, dan.peer, &dan.key);
+    a.store().set_admission(dan.peer, &late).unwrap();
+    assert_eq!(a.sync(&ann_folder).awaiting, vec![(d.store().peer(), 1)]);
+    let report = b.sync(&bob_folder);
+    assert_eq!(report.awaiting, vec![(d.store().peer(), 1)], "{report:?}");
+    // cat, whom she admitted before, stays.
+    assert!(bob_folder.admissions(b.store()).unwrap().contains_key(&c.store().peer()));
+}
+
+#[test]
+fn an_authority_record_once_checked_outlives_its_entry_being_overwritten() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root.path());
+    let cat_key = key_hex();
+    let cat_folder = signed_at(root.path(), &cat_key);
+    let c = join_signed(&cat_folder, "cat");
+    ann_folder.set_admin(a.store(), &public(&cat_key), true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // bob overwrites every authority entry with something else, and adds a self-signed grant.
+    for (key, _) in b.store().authority().unwrap() {
+        b.store().set_authority(&key, "admin.0.9.x.on.y.z").unwrap();
+    }
+    let own =
+        Record::grant(TEAM_ID, &MachineKey::from_hex(&bob_key).unwrap(), 0, 9, &public(&bob_key));
+    b.store().set_authority(&rodu_sync::authority::key_of(own.text()), own.text()).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    let auth = ann_folder.authority(a.store()).unwrap();
+    assert!(auth.is_admin(&public(&cat_key)), "ann checked the grant before");
+    assert!(!auth.is_admin(&public(&bob_key)), "bob's own grant counts for nothing");
+    // A record signed by the owner, but under a key that is not its hash, is not read.
+    let misplaced =
+        Record::grant(TEAM_ID, &MachineKey::from_hex(ROOT_KEY).unwrap(), 0, 20, &public(&bob_key));
+    b.store().set_authority(&"0".repeat(64), misplaced.text()).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    assert!(!ann_folder.authority(a.store()).unwrap().is_admin(&public(&bob_key)));
+    drop(c);
+}
+
+#[test]
+fn the_root_key_is_trusted_in_any_folder_only_while_it_may_admit() {
+    let root = tempfile::tempdir().unwrap();
+    // ann's machine is not admitted: the root key alone lets her files in.
+    let ann_folder = signed_at(root.path(), ROOT_KEY);
+    let a = first(&ann_folder);
+    let bob_key = key_hex();
+    let bob_folder = signed_at(root.path(), &bob_key);
+    let b = join_signed(&bob_folder, "bob");
+    ann_folder.admit(a.store(), &request_of(&ann_folder, "bob")).unwrap();
+    ann_folder.transfer(a.store(), &public(&bob_key)).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // A former owner is an admin: still trusted.
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "As admin" })], None).unwrap();
+    a.sync(&ann_folder);
+    assert!(b.sync(&bob_folder).awaiting.is_empty());
+    assert!(b.titles().contains(&"As admin".to_owned()));
+    bob_folder.set_admin(b.store(), &root_public(), false).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "Revoked" })], None).unwrap();
+    a.sync(&ann_folder);
+    let report = b.sync(&bob_folder);
+    assert_eq!(report.awaiting, vec![(a.store().peer(), 1)], "{report:?}");
+    assert!(!b.titles().contains(&"Revoked".to_owned()));
+}
+
+#[test]
+fn a_former_owner_cannot_take_the_team_back_or_name_admins_afterwards() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root.path());
+    let (ann, bob) = (MachineKey::from_hex(ROOT_KEY).unwrap(), public(&bob_key));
+    ann_folder.transfer(a.store(), &bob).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    bob_folder.set_admin(b.store(), &ann.public(), false).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    // ann signs, as owner of epoch 0, a grant for a key she controls, and as owner of epoch 0
+    // a second transfer, to that key. Try many keys: one of them has a lower hash than the
+    // transfer to bob.
+    let (to_bob, _) = b
+        .store()
+        .authority()
+        .unwrap()
+        .into_iter()
+        .find(|(_, text)| text.starts_with("owner."))
+        .unwrap();
+    let mut lowest_beaten = false;
+    for _ in 0..40 {
+        let mine = MachineKey::generate().unwrap();
+        let grant = Record::grant(TEAM_ID, &ann, 0, 50, &mine.public());
+        let back = Record::transfer(TEAM_ID, &ann, 1, &mine.public(), &BTreeSet::new());
+        lowest_beaten |= rodu_sync::authority::key_of(back.text()) < to_bob;
+        for record in [grant, back] {
+            a.store()
+                .set_authority(&rodu_sync::authority::key_of(record.text()), record.text())
+                .unwrap();
+        }
+    }
+    assert!(lowest_beaten, "some forged transfer has the lowest hash");
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    for (folder, machine) in [(&bob_folder, &b), (&ann_folder, &a)] {
+        let auth = folder.authority(machine.store()).unwrap();
+        assert_eq!(auth.owner(), bob, "bob still owns the team");
+        assert!(auth.disputed());
+        assert!(!auth.may_admit(&ann.public()));
+    }
+}
+
+#[test]
+fn authority_entries_that_fail_their_check_are_noted_and_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root.path());
+    b.store().set_authority(&"1".repeat(64), "not a record").unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    let auth = ann_folder.authority(a.store()).unwrap();
+    assert_eq!(auth.owner(), root_public());
+    assert!(!auth.is_admin(&public(&bob_key)));
+    assert_eq!(a.store().local_note("authority-refused").unwrap().unwrap().lines().count(), 1);
+    // Records signed by keys that could never own the team are not kept, however many.
+    for _ in 0..3 {
+        let stranger = MachineKey::generate().unwrap();
+        let own = Record::grant(TEAM_ID, &stranger, 0, 1, &stranger.public());
+        b.store().set_authority(&rodu_sync::authority::key_of(own.text()), own.text()).unwrap();
+    }
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    assert_eq!(a.store().authority().unwrap().len(), 4, "in the document");
+    assert!(a.store().local_note("authority").unwrap().unwrap_or_default().is_empty());
+
+    // A note that still holds an outsider's record (as an earlier build kept them): a record
+    // from the owner that a pull brings is noted all the same, and the outsider's dropped.
+    let stranger = MachineKey::generate().unwrap();
+    let outsider = Record::grant(TEAM_ID, &stranger, 0, 1, &stranger.public());
+    ann_folder.set_admin(a.store(), &public(&bob_key), true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    b.store().set_local_note("authority", outsider.text()).unwrap();
+    // The next read checks it: one record in the note before, one after, not the same one.
+    assert!(bob_folder.authority(b.store()).unwrap().is_admin(&public(&bob_key)));
+    for (key, _) in b.store().authority().unwrap() {
+        b.store().set_authority(&key, "gone").unwrap();
+    }
+    let note = b.store().local_note("authority").unwrap().unwrap();
+    assert_eq!(note.lines().count(), 1, "{note}");
+    assert!(!note.contains(outsider.text()));
+    assert!(bob_folder.authority(b.store()).unwrap().is_admin(&public(&bob_key)));
 }

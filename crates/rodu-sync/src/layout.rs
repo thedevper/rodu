@@ -40,6 +40,10 @@ pub const MEMBERS: &str = "members";
 /// Admissions of machines to a signed team: a map from peer id to the root key's signed record
 /// (see [`crate::sign`]). A record counts only by its signature.
 pub const ADMISSIONS: &str = "admissions";
+/// Who owns a signed team and who may admit machines: a map from the hex SHA-256 of a signed
+/// record to the record (see [`crate::authority`]). A record counts only by its signature and
+/// the chain of owners.
+pub const AUTHORITY: &str = "authority";
 
 /// A peer id as written to the document.
 pub fn peer_text(peer: u64) -> String {

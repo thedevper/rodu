@@ -30,6 +30,7 @@ use rodu_core::{Result, RoduError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::authority::{self, Authority, Record};
 use crate::seal::{self, TeamKey};
 use crate::sign::{self, MachineKey, PublicKey};
 use crate::{BatchReport, Checker, Incoming, LoroStore, MAX_IMPORT_BYTES};
@@ -203,8 +204,32 @@ enum Verdict<'a> {
 /// The machines a signed team admits: for each peer, the keys admitted for it.
 pub type Admitted = BTreeMap<u64, BTreeSet<PublicKey>>;
 
-/// The local note listing the admissions this replica checked, one `<peer>.<key>` per line.
+/// Whose files a signed team takes in: the machines admitted, and the root key for any replica
+/// folder while it still owns the team or is an admin.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Trusted {
+    admitted: Admitted,
+    root: Option<PublicKey>,
+}
+
+impl Trusted {
+    fn lets(&self, peer: u64, signer: &PublicKey) -> bool {
+        self.root.as_ref() == Some(signer)
+            || self.admitted.get(&peer).is_some_and(|keys| keys.contains(signer))
+    }
+}
+
+/// The local note listing the admissions this replica checked, one `<peer>.<key>.<signer>` per
+/// line (`<peer>.<key>` when the root signed it, as step 2a wrote them).
 const NOTE_ADMITTED: &str = "admitted";
+/// The local note listing every signed authority record this replica checked, one per line.
+const NOTE_AUTHORITY: &str = "authority";
+/// The local note listing the authority entries that failed their check, one hash per line.
+const NOTE_AUTHORITY_REFUSED: &str = "authority-refused";
+/// The most refused authority entries noted.
+const MAX_REFUSED: usize = 4096;
+/// The local note listing the hashes of the transfers this replica follows, epoch 1 first.
+const NOTE_OWNERS: &str = "owners";
 /// The local note on a file that waits for its signer to be admitted: the signer's key.
 fn await_note(stat: &str) -> String {
     format!("await/{stat}")
@@ -641,21 +666,22 @@ impl TeamFolder {
     /// Signed team: the machines admitted, by peer.
     pub fn admissions(&self, store: &LoroStore) -> Result<Admitted> {
         let info = self.checked_info()?;
-        self.admitted(store, &info)
+        Ok(self.trusted(store, &info)?.admitted)
     }
 
-    /// Signed team, on the root machine: admits `request` by writing the root's signed record into
-    /// the team document; the next push sends it.
+    /// Signed team, on the owner's or an admin's machine: admits `request` by writing this
+    /// machine's signed record into the team document; the next push sends it.
     pub fn admit(&self, store: &LoroStore, request: &JoinRequest) -> Result<()> {
         let info = self.checked_info()?;
+        let authority = self.authority_of(store, &info)?;
         match &self.signing {
-            Some((key, root)) if key.public() == *root => store.set_admission(
+            Some((key, _)) if authority.may_admit(&key.public()) => store.set_admission(
                 request.peer,
                 &key.admit(self.team_id(&info), request.peer, &request.key),
             ),
-            _ => {
-                Err(RoduError::invalid("Only the machine that created the team can admit machines"))
-            }
+            _ => Err(RoduError::invalid(
+                "Only the team owner's machine, or an admin's, can admit machines",
+            )),
         }
     }
 
@@ -664,72 +690,246 @@ impl TeamFolder {
     /// reads the folder once more, so they land now rather than on the next command.
     pub fn pull(&self, store: &LoroStore, checker: &Checker) -> Result<PullReport> {
         let info = self.checked_info()?;
-        let admitted = self.admitted(store, &info)?;
-        let first = self.pull_once(store, checker, &info, &admitted)?;
+        let trusted = self.trusted(store, &info)?;
+        let first = self.pull_once(store, checker, &info, &trusted)?;
         if first.awaiting.is_empty() {
             return Ok(first);
         }
-        let now = self.admitted(store, &info)?;
-        if now == admitted {
+        let now = self.trusted(store, &info)?;
+        if now == trusted {
             return Ok(first);
         }
         let second = self.pull_once(store, checker, &info, &now)?;
         Ok(first.then(second))
     }
 
-    /// The machines admitted, by peer: every record in the team document the root key signed for
-    /// this team, and every one this replica checked before. Any member can change the document,
-    /// so a record once checked is kept here: overwriting or deleting it later never shuts out
-    /// that machine on this replica. Empty for a team that does not sign.
-    fn admitted(&self, store: &LoroStore, info: &TeamInfo) -> Result<Admitted> {
-        let Some((_, root)) = &self.signing else { return Ok(Admitted::new()) };
-        let team = self.team_id(info);
+    /// The machines admitted, by peer: every admission in the team document or checked before
+    /// whose signer counts under the team's authority ([`Authority::counts`]). Any member can
+    /// change the document, so a record once checked is kept here (admissions with their signer,
+    /// and every signed authority record, whether it counts now or not): overwriting or deleting
+    /// it later changes nothing on this replica. Empty for a team that does not sign.
+    /// The root key is trusted for every replica folder while it owns the team or is an admin.
+    fn trusted(&self, store: &LoroStore, info: &TeamInfo) -> Result<Trusted> {
+        let Some((_, root)) = &self.signing else { return Ok(Trusted::default()) };
+        let authority = self.authority_of(store, info)?;
         let mut admitted = Admitted::new();
+        for (peer, member, signer) in self.checked_admissions(store, info)? {
+            if authority.counts(&signer, peer, &member) {
+                admitted.entry(peer).or_default().insert(member);
+            }
+        }
+        Ok(Trusted { admitted, root: authority.may_admit(root).then_some(*root) })
+    }
+
+    /// Every admission this replica checked, as (peer, member, signer): the local note's, and the
+    /// document's whose signature verifies. Saves the note when the document added some.
+    fn checked_admissions(
+        &self,
+        store: &LoroStore,
+        info: &TeamInfo,
+    ) -> Result<BTreeSet<(u64, PublicKey, PublicKey)>> {
+        let Some((_, root)) = &self.signing else { return Ok(BTreeSet::new()) };
+        let team = self.team_id(info);
         let noted = store.local_note(NOTE_ADMITTED)?.unwrap_or_default();
+        let mut checked = BTreeSet::new();
         for line in noted.lines() {
-            let parsed = line
-                .split_once('.')
-                .and_then(|(peer, key)| Some((parse_peer_dir(peer)?, PublicKey::from_hex(key)?)));
-            if let Some((peer, key)) = parsed {
-                admitted.entry(peer).or_default().insert(key);
-            }
+            // `<peer>.<member>`, admitted by the root (step 2a), or `<peer>.<member>.<signer>`.
+            let parts: Vec<&str> = line.split('.').collect();
+            let parsed = match parts.as_slice() {
+                [peer, member] => {
+                    (|| Some((parse_peer_dir(peer)?, PublicKey::from_hex(member)?, *root)))()
+                }
+                [peer, member, signer] => (|| {
+                    Some((
+                        parse_peer_dir(peer)?,
+                        PublicKey::from_hex(member)?,
+                        PublicKey::from_hex(signer)?,
+                    ))
+                })(),
+                _ => None,
+            };
+            checked.extend(parsed);
         }
-        let before = admitted.clone();
+        let before = checked.len();
         for (peer, record) in store.admissions()? {
-            if let Some(key) = sign::check_admission(root, team, peer, &record) {
-                admitted.entry(peer).or_default().insert(key);
+            if let Some((member, signer)) = sign::check_admission(root, team, peer, &record) {
+                checked.insert((peer, member, signer));
             }
         }
-        if admitted != before {
-            let lines: Vec<String> = admitted
+        if checked.len() != before {
+            let lines: Vec<String> = checked
                 .iter()
-                .flat_map(|(peer, keys)| {
-                    keys.iter().map(move |key| format!("{}.{}", peer_dir_name(*peer), key.to_hex()))
+                .map(|(peer, member, signer)| {
+                    format!("{}.{}.{}", peer_dir_name(*peer), member.to_hex(), signer.to_hex())
                 })
                 .collect();
             store.set_local_note(NOTE_ADMITTED, &lines.join("\n"))?;
         }
-        Ok(admitted)
+        Ok(checked)
+    }
+
+    /// Every authority record this replica checked: the local note's, and the document's whose
+    /// key is its hash and whose signature verifies, whether it counts now or not, as long as its
+    /// signer could own the team ([`authority::worth_keeping`]). An entry that
+    /// fails the check is noted too (by the hash of its key and text), so it is not checked again.
+    /// Saves the notes when the document added something.
+    fn authority_records(&self, store: &LoroStore, info: &TeamInfo) -> Result<Vec<Record>> {
+        let team = self.team_id(info);
+        let noted = store.local_note(NOTE_AUTHORITY)?.unwrap_or_default();
+        let mut records: BTreeMap<String, Record> = noted
+            .lines()
+            .filter_map(|text| Record::parse(team, text))
+            .map(|record| (authority::key_of(record.text()), record))
+            .collect();
+        let refused_note = store.local_note(NOTE_AUTHORITY_REFUSED)?.unwrap_or_default();
+        let mut refused: BTreeSet<String> = refused_note.lines().map(str::to_owned).collect();
+        let refused_before = refused.len();
+        for (key, text) in store.authority()? {
+            if records.get(&key).is_some_and(|r| r.text() == text) {
+                continue;
+            }
+            let entry = authority::key_of(&format!("{key}\0{text}"));
+            if refused.contains(&entry) {
+                continue;
+            }
+            match Record::parse(team, &text).filter(|_| authority::key_of(&text) == key) {
+                Some(record) => {
+                    records.insert(key, record);
+                }
+                None if refused.len() < MAX_REFUSED => {
+                    refused.insert(entry);
+                }
+                None => {}
+            }
+        }
+        let Some((_, root)) = &self.signing else { return Ok(Vec::new()) };
+        let kept = authority::worth_keeping(*root, records.into_values().collect());
+        let lines: Vec<&str> = kept.iter().map(Record::text).collect();
+        if lines.join("\n") != noted {
+            store.set_local_note(NOTE_AUTHORITY, &lines.join("\n"))?;
+        }
+        if refused.len() != refused_before {
+            let lines: Vec<&str> = refused.iter().map(String::as_str).collect();
+            store.set_local_note(NOTE_AUTHORITY_REFUSED, &lines.join("\n"))?;
+        }
+        Ok(kept)
+    }
+
+    /// The team's authority from `records`, following the transfers this replica followed before
+    /// ([`Authority::resolve`]), and noting the ones it follows now.
+    fn resolve(&self, store: &LoroStore, records: &[Record]) -> Result<Authority> {
+        let Some((_, root)) = &self.signing else {
+            return Err(RoduError::internal("only a signed team has owners"));
+        };
+        let noted = store.local_note(NOTE_OWNERS)?.unwrap_or_default();
+        let settled: Vec<authority::Hash> = noted
+            .lines()
+            .map_while(|line| hex::decode(line).ok().and_then(|bytes| bytes.try_into().ok()))
+            .collect();
+        let authority = Authority::resolve(*root, records, &settled);
+        if authority.settled() != settled {
+            let lines: Vec<String> = authority.settled().iter().map(hex::encode).collect();
+            store.set_local_note(NOTE_OWNERS, &lines.join("\n"))?;
+        }
+        Ok(authority)
+    }
+
+    fn authority_of(&self, store: &LoroStore, info: &TeamInfo) -> Result<Authority> {
+        let records = self.authority_records(store, info)?;
+        self.resolve(store, &records)
+    }
+
+    /// Signed team: who owns it and who may admit machines, as this replica knows it.
+    pub fn authority(&self, store: &LoroStore) -> Result<Authority> {
+        let info = self.checked_info()?;
+        self.authority_of(store, &info)
+    }
+
+    /// This machine's key, when it owns the team; otherwise the error saying who may `what`.
+    fn owner_key(&self, authority: &Authority, what: &str) -> Result<&MachineKey> {
+        match &self.signing {
+            Some((key, _)) if key.public() == authority.owner() => Ok(key),
+            _ => Err(RoduError::invalid(format!("Only the team owner's machine can {what}"))),
+        }
+    }
+
+    /// Signed team, on the owner's machine: makes `target` an admin, or stops it being one. A
+    /// revocation keeps the admissions `target` signed that count now, so the machines it let in
+    /// stay in. The next push sends the record.
+    pub fn set_admin(&self, store: &LoroStore, target: &PublicKey, on: bool) -> Result<()> {
+        let info = self.checked_info()?;
+        let team = self.team_id(&info);
+        let records = self.authority_records(store, &info)?;
+        let authority = self.resolve(store, &records)?;
+        let key = self.owner_key(&authority, "choose admins")?;
+        if *target == authority.owner() {
+            return Err(RoduError::invalid("The team owner is not made an admin"));
+        }
+        let (epoch, n) = (authority.epoch(), authority.next_n(&records, target));
+        let record = if on {
+            Record::grant(team, key, epoch, n, target)
+        } else {
+            let kept = self
+                .checked_admissions(store, &info)?
+                .into_iter()
+                .filter(|(peer, member, signer)| {
+                    signer == target && authority.counts(signer, *peer, member)
+                })
+                .map(|(peer, member, _)| (peer, member))
+                .collect();
+            Record::revoke(team, key, epoch, n, target, &kept)
+        };
+        self.write_authority(store, &info, &record)
+    }
+
+    /// Signed team, on the owner's machine: hands ownership to `new`, carrying the admin records
+    /// of the epoch it ends. This machine stays an admin, and nothing it signs for the epoch it
+    /// ended counts any more. The next push sends the record.
+    pub fn transfer(&self, store: &LoroStore, new: &PublicKey) -> Result<()> {
+        let info = self.checked_info()?;
+        let records = self.authority_records(store, &info)?;
+        let authority = self.resolve(store, &records)?;
+        let key = self.owner_key(&authority, "hand over the team")?;
+        if *new == authority.owner() {
+            return Err(RoduError::invalid("That machine already owns the team"));
+        }
+        let carried = authority.carry(&records);
+        let record =
+            Record::transfer(self.team_id(&info), key, authority.epoch() + 1, new, &carried);
+        self.write_authority(store, &info, &record)
+    }
+
+    fn write_authority(&self, store: &LoroStore, info: &TeamInfo, record: &Record) -> Result<()> {
+        store.set_authority(&authority::key_of(record.text()), record.text())?;
+        // Noted right away, so a document change before the next pull cannot take it back here,
+        // and a transfer is followed here from now on.
+        let mut lines: Vec<String> =
+            self.authority_records(store, info)?.iter().map(|r| r.text().to_owned()).collect();
+        if !lines.iter().any(|text| text == record.text()) {
+            lines.push(record.text().to_owned());
+            store.set_local_note(NOTE_AUTHORITY, &lines.join("\n"))?;
+        }
+        let records = self.authority_records(store, info)?;
+        self.resolve(store, &records)?;
+        Ok(())
     }
 
     /// What a signed team does with a file's payload once it is unframed and opened: its Loro
-    /// update when the root key, or the key admitted for `peer`, signed it.
+    /// update when a key [`Trusted`] for `peer` signed it.
     fn verify<'a>(
         &self,
         info: &TeamInfo,
-        admitted: &Admitted,
+        trusted: &Trusted,
         peer: u64,
         payload: &'a [u8],
     ) -> Verdict<'a> {
-        let Some((_, root)) = &self.signing else { return Verdict::Accept(payload) };
+        if self.signing.is_none() {
+            return Verdict::Accept(payload);
+        }
         let Some((signer, update)) = sign::open_file(self.team_id(info), peer, payload) else {
             return Verdict::Damaged("is not signed, or its signature does not verify");
         };
-        if signer == *root || admitted.get(&peer).is_some_and(|keys| keys.contains(&signer)) {
-            Verdict::Accept(update)
-        } else {
-            Verdict::Await(signer)
-        }
+        if trusted.lets(peer, &signer) { Verdict::Accept(update) } else { Verdict::Await(signer) }
     }
 
     fn pull_once(
@@ -737,7 +937,7 @@ impl TeamFolder {
         store: &LoroStore,
         checker: &Checker,
         info: &TeamInfo,
-        admitted: &Admitted,
+        trusted: &Trusted,
     ) -> Result<PullReport> {
         let info = info.clone();
         let mut awaiting: BTreeMap<u64, usize> = BTreeMap::new();
@@ -793,7 +993,7 @@ impl TeamFolder {
                 if let Some(stat) = &stat
                     && let Some(signer) = store.local_note(&await_note(stat))?
                     && let Some(signer) = PublicKey::from_hex(&signer)
-                    && !admitted.get(&peer).is_some_and(|keys| keys.contains(&signer))
+                    && !trusted.lets(peer, &signer)
                 {
                     *awaiting.entry(peer).or_default() += 1;
                     continue;
@@ -837,7 +1037,7 @@ impl TeamFolder {
                     Frame::Damaged(why) => Err(why),
                 };
                 let verdict = match opened {
-                    Ok(payload) => self.verify(&info, admitted, peer, payload),
+                    Ok(payload) => self.verify(&info, trusted, peer, payload),
                     Err(why) => Verdict::Damaged(why),
                 };
                 match verdict {
