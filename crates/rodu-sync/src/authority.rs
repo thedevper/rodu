@@ -254,6 +254,27 @@ impl Record {
 /// can never count, and keeping it would let anyone who can write to the folder make a replica's
 /// notes grow without end.
 pub fn worth_keeping(root: PublicKey, records: Vec<Record>) -> Vec<Record> {
+    let (owners, granted) = key_sets(root, &records);
+    records
+        .into_iter()
+        .filter(|r| {
+            owners.contains(&r.signer)
+                || (matches!(r.kind, Kind::Remove { .. }) && granted.contains(&r.signer))
+        })
+        .collect()
+}
+
+/// The keys that could ever admit a machine: `root`, every key a transfer among `records` hands
+/// the team to, and every key such a key granted admin. An admission any other key signed can
+/// never count.
+pub fn admitters(root: PublicKey, records: &[Record]) -> BTreeSet<PublicKey> {
+    let (owners, granted) = key_sets(root, records);
+    owners.into_iter().chain(granted).collect()
+}
+
+/// The keys that could own the team (`root` and those transfers signed by such keys hand it to),
+/// and the keys they granted admin.
+fn key_sets(root: PublicKey, records: &[Record]) -> (BTreeSet<PublicKey>, BTreeSet<PublicKey>) {
     let mut keys = BTreeSet::from([root]);
     loop {
         let more: Vec<PublicKey> = records
@@ -278,13 +299,7 @@ pub fn worth_keeping(root: PublicKey, records: Vec<Record>) -> Vec<Record> {
             _ => None,
         })
         .collect();
-    records
-        .into_iter()
-        .filter(|r| {
-            keys.contains(&r.signer)
-                || (matches!(r.kind, Kind::Remove { .. }) && granted.contains(&r.signer))
-        })
-        .collect()
+    (keys, granted)
 }
 
 /// What a key's latest admin record says.

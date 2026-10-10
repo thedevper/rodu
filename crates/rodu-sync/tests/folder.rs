@@ -1661,6 +1661,9 @@ fn a_removed_machine_keeps_what_it_wrote_before_and_nothing_after() {
         assert!(!m.titles().contains(&"After".to_owned()));
         assert!(m.sync(folder).cut.is_empty(), "said once");
     }
+    // Nor does making its key an admin bring it back.
+    let cat_key = request_of(&ann_folder, "cat").key;
+    assert!(ann_folder.set_admin(a.store(), &cat_key, true).is_err());
     // Once cat hears, its machine writes nothing more, and cannot be admitted again.
     cat_folder.pull(c.store(), &checker()).unwrap();
     let refused = cat_folder.push(c.store()).unwrap_err();
@@ -1781,9 +1784,11 @@ fn authority_and_seen_files_count_only_for_what_their_signatures_prove() {
     assert_eq!(cut.keys().collect::<Vec<_>>(), [&cat], "bob is not removed");
     assert!(cut[&cat] < 99, "eve's claim does not move cat's cut");
     assert!(!ann_folder.admissions(a.store()).unwrap().contains_key(&eve_peer));
-    // Nor is her claim kept in ann's notes.
-    let noted = a.store().local_note("seen").unwrap().unwrap_or_default();
-    assert!(!noted.contains(&eve.public().to_hex()), "{noted}");
+    // Nor is her claim or her admission kept in ann's notes.
+    for note in ["seen", "admitted"] {
+        let noted = a.store().local_note(note).unwrap().unwrap_or_default();
+        assert!(!noted.contains(&eve.public().to_hex()), "{note}: {noted}");
+    }
     // A claim bob signs counts only where bob's key is admitted: in his own folder, not eve's.
     let text = format!("{cat:016x}:98");
     let bob_key = MachineKey::from_hex(&bob_key).unwrap();

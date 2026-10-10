@@ -1091,9 +1091,14 @@ impl TeamFolder {
             checked.extend(parsed);
         }
         let before = checked.len();
+        // An admission signed by a key that could never admit is not noted: anyone who can write
+        // to the folder could otherwise grow the note without end.
+        let admitters = authority::admitters(*root, &self.authority_records(store, info)?);
         let mirrored = self.mirrored(info)?.admissions;
         for (peer, record) in store.admissions()?.into_iter().chain(mirrored) {
-            if let Some((member, signer)) = sign::check_admission(root, team, peer, &record) {
+            if let Some((member, signer)) = sign::check_admission(root, team, peer, &record)
+                && admitters.contains(&signer)
+            {
                 checked.insert((peer, member, signer));
             }
         }
@@ -1250,6 +1255,17 @@ impl TeamFolder {
         let key = self.owner_key(&authority, "choose admins")?;
         if *target == authority.owner() {
             return Err(RoduError::invalid("The team owner is not made an admin"));
+        }
+        // An admin's machine is never cut, so making a removed machine's key an admin would
+        // undo its removal.
+        let trusted = self.trusted(store, &info)?;
+        let removed = trusted
+            .admitted
+            .iter()
+            .any(|(peer, keys)| trusted.cut.contains_key(peer) && keys.contains(target));
+        if on && removed {
+            return Err(RoduError::invalid("That machine was removed from the team")
+                .with_hint("It can join again as a new machine, from a new workspace"));
         }
         let (epoch, n) = (authority.epoch(), authority.next_n(&records, target));
         let record = if on {
