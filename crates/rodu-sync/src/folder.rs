@@ -1046,7 +1046,8 @@ impl TeamFolder {
     }
 
     /// Writes this machine's authority file afresh: every authority record and admission this
-    /// replica checked that this machine's key signed (from its local notes, so a file that was
+    /// replica checked that this machine's key signed, and every key record whoever signed it
+    /// (from its local notes, so a file that was
     /// damaged, grew too large or was changed loses nothing), with `also`, and whatever the file
     /// held that still reads.
     fn mirror(&self, store: &LoroStore, info: &TeamInfo, also: Option<&Record>) -> Result<()> {
@@ -1056,7 +1057,9 @@ impl TeamFolder {
             .authority_file(info, store.peer())?
             .unwrap_or(AuthorityFile { format: 1, ..Default::default() });
         let records = self.authority_records(store, info)?;
-        let signed = records.iter().chain(also).filter(|r| r.signer() == me);
+        // Every key record too, whoever signed it: a machine that never got an earlier key still
+        // learns its record here, sealed with a key it can get, and so takes the keys after it.
+        let signed = records.iter().chain(also).filter(|r| r.signer() == me || r.is_team_key());
         for text in signed.map(|r| r.text().to_owned()) {
             if !file.records.contains(&text) {
                 file.records.push(text);
@@ -1593,14 +1596,15 @@ impl TeamFolder {
             .and_then(|records| Ok(self.resolve(store, &records)?.team_keys(&records)));
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let counting = counting?;
-        // Taken as a chain: a key is kept only when this machine holds the one before it, so no
-        // single record, however high its generation, becomes the newest key without the ones
-        // before it (an admin cannot use up the generations, nor stay the writing key for good).
+        // Taken as a chain: a key is kept only when every generation before it is held here or
+        // named by a counting record, so no single record, however high its generation, becomes
+        // the newest key on its own (an admin cannot use up the generations, nor stay the writing
+        // key for good).
         found.sort_by(|a, b| a.generation.cmp(&b.generation).then_with(|| a.check.cmp(&b.check)));
         let mut top = held.first().map_or(0, |h| h.generation);
         let mut kept: Vec<Held> = Vec::new();
         for candidate in found {
-            if candidate.generation <= top + 1
+            if candidate.generation <= Self::chain(top, &counting) + 1
                 && counting.contains(&(candidate.generation, candidate.check.clone()))
             {
                 top = top.max(candidate.generation);
@@ -1611,7 +1615,7 @@ impl TeamFolder {
     }
 
     /// The newest generation reachable from `held` through generations that `named` holds one
-    /// after another: the newest a machine holding `held` can take.
+    /// after another: the newest a machine holding `held` can take, and what a new key follows.
     fn chain(held: u64, named: &BTreeSet<(u64, String)>) -> u64 {
         let mut top = held;
         while named.iter().any(|(g, _)| *g == top + 1) {
@@ -1747,10 +1751,11 @@ impl TeamFolder {
                 ));
             }
         };
-        // The one after the newest this machine holds, which every machine takes once it holds
-        // that one (a second key of the same generation is settled by its check). A record that
-        // jumps ahead, however high, never uses up the generations.
-        let generation = self.held(false)?.first().map_or(0, |h| h.generation) + 1;
+        // Past every generation a counting record names along the chain from what this machine
+        // holds, so the new key is newer than any key a removed machine may hold, even one this
+        // machine never received; a record that jumps ahead never uses up the generations.
+        let newest_held = self.held(false)?.first().map_or(0, |h| h.generation);
+        let generation = Self::chain(newest_held, &authority.team_keys(&records)) + 1;
         if authority::generation(&generation.to_string()).is_none() {
             return Err(RoduError::invalid("This team changed its key as often as it can"));
         }

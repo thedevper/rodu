@@ -217,6 +217,11 @@ impl Record {
         self.signer
     }
 
+    /// Whether it names a team key.
+    pub fn is_team_key(&self) -> bool {
+        matches!(self.kind, Kind::Key { .. })
+    }
+
     fn sign(workspace_id: &str, key: &MachineKey, body: String) -> Record {
         let signed = format!("{body}.{}", key.public().to_hex());
         let signature = key.sign_authority(workspace_id, &signed);
