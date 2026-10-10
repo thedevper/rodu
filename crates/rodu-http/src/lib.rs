@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -16,12 +17,15 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use rodu_api::{
     BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody, ItemDetail,
-    ItemView, MeView, MoveRequest, PatchRequest, PrincipalView, StateView, TransitionRequest,
+    ItemView, MeView, MoveRequest, PatchRequest, PrincipalView, RevisionView, StateView,
+    TransitionRequest,
 };
 use rodu_core::query::parse_query;
 use rodu_core::service::Placement;
 use rodu_core::store::{Store, TxMode};
-use rodu_core::{Actor, Collection, Comment, ErrorCode, Item, RoduError, RoduService};
+use rodu_core::{
+    Actor, Collection, Comment, ErrorCode, Item, Live, LiveSync, RoduError, RoduService,
+};
 use rodu_store::compile::{CompileContext, to_sql};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -51,6 +55,8 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
 pub struct WebServerOptions<S: Store> {
     pub service: RoduService<S>,
     pub actor: Actor,
+    /// Live sync while the server runs, such as with a team folder.
+    pub live: Option<LiveOptions<S>>,
     /// 0 picks a free port.
     pub port: u16,
     /// Built web UI on disk to serve at /.
@@ -86,6 +92,15 @@ impl RunningServer {
     }
 }
 
+/// How a server syncs while it runs: a pull and a push every `every`, and a push after each write.
+pub struct LiveOptions<S: Store> {
+    pub sync: Arc<dyn LiveSync<S>>,
+    pub every: std::time::Duration,
+}
+
+/// The interval `rodu web` syncs at.
+pub const LIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A failure answered with the shared error JSON.
 enum Failure {
     Http { status: StatusCode, code: &'static str, message: String },
@@ -111,6 +126,10 @@ struct App<S: Store> {
     allowed_hosts: [String; 2],
     dist_dir: Option<PathBuf>,
     files: Option<HashMap<String, Bytes>>,
+    live: Option<Live<S>>,
+    /// Raised by every pull that took something in and every write, so the board can ask
+    /// cheaply whether to reload.
+    revision: AtomicU64,
 }
 
 pub async fn start_web_server<S>(options: WebServerOptions<S>) -> std::io::Result<RunningServer>
@@ -135,17 +154,44 @@ where
         allowed_hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
         dist_dir,
         files: options.files,
+        live: options.live.as_ref().map(|live| Live::new(Arc::clone(&live.sync))),
+        revision: AtomicU64::new(0),
     });
+    // The live sync timer runs in the server's own task, so it stops with the server.
+    let ticking = options.live.map(|live| (Arc::clone(&app), live.every));
     let router = Router::new().fallback(handle::<S>).with_state(app);
     let (shutdown, signal) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                let _ = signal.await;
-            })
-            .await
+        let serve = axum::serve(listener, router).with_graceful_shutdown(async {
+            let _ = signal.await;
+        });
+        match ticking {
+            None => serve.await,
+            Some((app, every)) => tokio::select! {
+                served = serve => served,
+                () = tick(app, every) => Ok(()),
+            },
+        }
     });
     Ok(RunningServer { url: format!("http://127.0.0.1:{port}/"), port, token, shutdown, task })
+}
+
+/// Pulls and pushes every `every` while the server runs, under the service lock like a request.
+async fn tick<S: Store + Send + 'static>(app: Arc<App<S>>, every: std::time::Duration) {
+    let mut timer = tokio::time::interval(every);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        timer.tick().await;
+        let app = Arc::clone(&app);
+        let _ = tokio::task::spawn_blocking(move || {
+            let (Some(live), Ok(service)) = (&app.live, app.service.lock()) else { return };
+            if live.pull(&service) {
+                app.revision.fetch_add(1, Ordering::SeqCst);
+            }
+            live.push(&service);
+        })
+        .await;
+    }
 }
 
 fn random_token() -> std::io::Result<String> {
@@ -226,6 +272,7 @@ enum Endpoint {
     Transition,
     Move,
     Comments,
+    Revision,
 }
 
 fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
@@ -237,6 +284,7 @@ fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
         "/api/collections" => return Some((Endpoint::Collections, None, GET)),
         "/api/principals" => return Some((Endpoint::Principals, None, GET)),
         "/api/board" => return Some((Endpoint::Board, None, GET)),
+        "/api/revision" => return Some((Endpoint::Revision, None, GET)),
         "/api/items" => return Some((Endpoint::Create, None, POST)),
         _ => {}
     }
@@ -302,7 +350,8 @@ where
         let ctx = Ctx { service: &service, actor: &app.actor };
         let key = key.as_deref().unwrap_or_default();
         let body = body.unwrap_or(serde_json::Value::Null);
-        match endpoint {
+        let writes = method != Method::GET;
+        let answer = match endpoint {
             Endpoint::Me => {
                 ok(StatusCode::OK, &MeView { name: ctx.name(Some(&app.actor.principal_id))? })
             }
@@ -362,7 +411,18 @@ where
                 let made = service.comment(&app.actor, key, &input.body)?;
                 ok(StatusCode::CREATED, &ctx.comment_view(&made)?)
             }
+            Endpoint::Revision => {
+                ok(StatusCode::OK, &RevisionView { revision: app.revision.load(Ordering::SeqCst) })
+            }
+        };
+        // A change made here goes out at once, and other tabs see it on their next look.
+        if writes && answer.is_ok() {
+            app.revision.fetch_add(1, Ordering::SeqCst);
+            if let Some(live) = &app.live {
+                live.push(&service);
+            }
         }
+        answer
     })
     .await
     .map_err(|e| Failure::Domain(RoduError::internal(format!("request task failed: {e}"))))?

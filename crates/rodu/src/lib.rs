@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use rodu_core::format::item_line;
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
-use rodu_http::{Bytes, RunningServer, WebServerOptions, start_web_server};
+use rodu_http::{
+    Bytes, LIVE_EVERY, LiveOptions, RunningServer, WebServerOptions, start_web_server,
+};
 use rodu_store::SqliteStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -349,7 +351,8 @@ async fn command_result(
             team::before(io, &ws);
             // Only MCP messages may go to stdout; the status line goes to stderr.
             (io.err)(&format!("rodu mcp: serving {} on stdio", ws.dir.display()));
-            let served = rodu_mcp::serve_stdio(ws.service, ws.actor)
+            let live = team::live(&ws);
+            let served = rodu_mcp::serve_stdio_live(ws.service, ws.actor, live)
                 .await
                 .map_err(|e| RoduError::internal(format!("MCP server stopped: {e}")));
             team::after_reopen(io, true);
@@ -474,6 +477,7 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
         }
     };
     let dir = ws.dir.clone();
+    let live = team::live(&ws).map(|sync| LiveOptions { sync, every: LIVE_EVERY });
     let server = start_web_server(WebServerOptions {
         service: ws.service,
         actor: ws.actor,
@@ -481,6 +485,7 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
         dist_dir,
         files,
         token: None,
+        live,
     })
     .await
     .map_err(|e| {

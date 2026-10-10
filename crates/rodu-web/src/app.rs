@@ -13,6 +13,13 @@ use crate::panel::ItemPanel;
 
 const LAST_COLLECTION: &str = "rodu.collection";
 const DRAG_TYPE: &str = "application/x-rodu-item";
+/// How often an open board asks whether teammates changed it.
+const LIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+thread_local! {
+    /// Whether a card is being dragged: the board is not reloaded under the user's hand.
+    static DRAGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Remembering the last collection is a convenience only; storage errors are ignored.
 fn remember(key: &str, value: &str) {
@@ -78,11 +85,17 @@ fn Workspace(api: Api) -> impl IntoView {
 
     // Only the newest board request may update the screen; an older, slower one is dropped.
     let latest_board = StoredValue::new(0_u64);
+    // The server's revision as of the board on screen, read before the board itself, so a change
+    // that lands in between is reloaded again rather than missed.
+    let seen = StoredValue::new(None::<u64>);
     let reload = move || async move {
         let Some(collection) = collection_key.get_untracked() else { return };
         let q = applied.get_untracked();
         latest_board.update_value(|n| *n += 1);
         let request = latest_board.get_value();
+        if let Ok(now) = api.revision().await {
+            seen.set_value(Some(now));
+        }
         let result = api.board(&collection, &q).await;
         if request != latest_board.get_value() {
             return;
@@ -101,6 +114,25 @@ fn Workspace(api: Api) -> impl IntoView {
         applied.track();
         spawn_local(reload());
     });
+
+    // Live: while the page is visible and no card is held, ask whether the board changed (a
+    // teammate's change came in) and reload it when it did. The item panel is left alone, so an
+    // edit in progress is never overwritten; a save on a stale card is refused by its version.
+    set_interval(
+        move || {
+            let hidden = document().hidden();
+            if hidden || DRAGGING.with(std::cell::Cell::get) {
+                return;
+            }
+            spawn_local(async move {
+                let Ok(now) = api.revision().await else { return };
+                if seen.get_value() != Some(now) {
+                    reload().await;
+                }
+            });
+        },
+        LIVE_EVERY,
+    );
 
     // Report a failed action, then show the board as the server now has it.
     let finish = move |result: Result<(), ApiError>| async move {
@@ -511,7 +543,9 @@ fn Card(item: ItemView, on_open: Callback<String>) -> impl IntoView {
             class="card"
             data-card=key.clone()
             draggable="true"
+            on:dragend=move |_| DRAGGING.with(|d| d.set(false))
             on:dragstart=move |e| {
+                DRAGGING.with(|d| d.set(true));
                 if let Some(dt) = e.data_transfer() {
                     let payload = serde_json::json!({ "key": drag_key }).to_string();
                     let _ = dt.set_data(DRAG_TYPE, &payload);

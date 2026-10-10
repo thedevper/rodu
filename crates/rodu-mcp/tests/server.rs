@@ -334,3 +334,115 @@ async fn caps_unbounded_string_arguments() {
     let create = tools.iter().find(|t| t.name == "create_items").unwrap();
     assert_eq!(create.input_schema["properties"]["collection"]["maxLength"], 40);
 }
+
+// --- live sync ---
+
+/// Records the order of its calls; each pull warns with the text in `warning`.
+#[derive(Default)]
+struct Recording {
+    calls: std::sync::Mutex<Vec<&'static str>>,
+    warning: std::sync::Mutex<Option<String>>,
+}
+
+impl rodu_core::LiveSync<SqliteStore> for Recording {
+    fn pull(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<rodu_core::Pulled> {
+        self.calls.lock().unwrap().push("pull");
+        let warnings = self.warning.lock().unwrap().iter().cloned().collect();
+        Ok(rodu_core::Pulled { changed: false, warnings })
+    }
+
+    fn push(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<Vec<String>> {
+        self.calls.lock().unwrap().push("push");
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn a_live_server_pulls_before_each_tool_call_and_pushes_after() {
+    let (service, actor) = demo_service(SqliteStore::memory().unwrap());
+    let sync = std::sync::Arc::new(Recording::default());
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = RoduMcp::new(service, actor).with_live(sync.clone());
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client: Client = ().serve(client_io).await.unwrap();
+    call(&client, "create_items", json!({ "collection": "DEMO", "items": [{ "title": "A" }] }))
+        .await;
+    call(&client, "search", json!({ "query": "" })).await;
+    assert_eq!(*sync.calls.lock().unwrap(), ["pull", "push", "pull", "push"]);
+}
+
+/// Pulls slowly, so a tool call that is not serialized with sync work shows up in the order.
+struct Slow(std::sync::Mutex<Vec<&'static str>>);
+
+impl rodu_core::LiveSync<SqliteStore> for Slow {
+    fn pull(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<rodu_core::Pulled> {
+        self.0.lock().unwrap().push("pull");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        Ok(rodu_core::Pulled::default())
+    }
+
+    fn push(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<Vec<String>> {
+        self.0.lock().unwrap().push("push");
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_tool_calls_each_run_pull_tool_push_without_interleaving() {
+    let (service, actor) = demo_service(SqliteStore::memory().unwrap());
+    let sync = std::sync::Arc::new(Slow(std::sync::Mutex::default()));
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = RoduMcp::new(service, actor).with_live(sync.clone());
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client: Client = ().serve(client_io).await.unwrap();
+    let search = || call(&client, "search", json!({ "query": "" }));
+    tokio::join!(search(), search(), search(), search());
+    assert_eq!(*sync.0.lock().unwrap(), ["pull", "push"].repeat(4));
+}
+
+#[tokio::test]
+async fn a_tool_call_that_fails_still_pulls_and_pushes() {
+    let (service, actor) = demo_service(SqliteStore::memory().unwrap());
+    let sync = std::sync::Arc::new(Recording::default());
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = RoduMcp::new(service, actor).with_live(sync.clone());
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client: Client = ().serve(client_io).await.unwrap();
+    let result = call(&client, "transition", json!({ "ref": "DEMO-99", "to": "Done" })).await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(*sync.calls.lock().unwrap(), ["pull", "push"]);
+}
+
+#[test]
+fn live_sync_warnings_are_written_once_until_they_change() {
+    let (service, _) = demo_service(SqliteStore::memory().unwrap());
+    let sync = std::sync::Arc::new(Recording::default());
+    let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = written.clone();
+    let live = rodu_core::Live::writing_to(sync.clone(), move |line| {
+        sink.lock().unwrap().push(line.to_owned())
+    });
+    *sync.warning.lock().unwrap() = Some("folder unreachable".into());
+    for _ in 0..3 {
+        live.pull(&service);
+    }
+    assert_eq!(*written.lock().unwrap(), ["warning: sync: folder unreachable"]);
+    // Once it clears and comes back, it is said again.
+    *sync.warning.lock().unwrap() = None;
+    live.pull(&service);
+    *sync.warning.lock().unwrap() = Some("folder unreachable".into());
+    live.pull(&service);
+    assert_eq!(written.lock().unwrap().len(), 2);
+}

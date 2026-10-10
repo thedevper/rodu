@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
-use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
+use rodu_core::{Actor, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService};
 use rodu_sync::folder::{PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::seal::TeamKey;
 use rodu_sync::{Checker, LoroStore};
@@ -166,17 +166,56 @@ pub(crate) fn after_reopen(io: &mut Io<'_>, via_agent: bool) {
 }
 
 fn warn_report(io: &mut Io<'_>, report: &PullReport) {
-    for line in report.damaged.iter().chain(&report.batch.refused) {
-        warn(io, &format!("skipped {line}"));
+    for line in report_lines(report) {
+        warn(io, &line);
     }
-    for line in &report.missing {
-        warn(io, line);
+}
+
+/// What a pull found that the user should hear about.
+fn report_lines(report: &PullReport) -> Vec<String> {
+    let skipped =
+        report.damaged.iter().chain(&report.batch.refused).map(|l| format!("skipped {l}"));
+    let index = report.batch.index.problems.iter().chain(&report.batch.index.conflicts);
+    skipped.chain(report.missing.iter().chain(&report.batch.notes).chain(index).cloned()).collect()
+}
+
+/// Live sync with the team folder while `rodu web` or `rodu mcp` runs: the same pull, numbering
+/// and push every other command does before and after it runs.
+pub(crate) struct FolderLive {
+    dir: PathBuf,
+    team: TeamConfig,
+    user: Actor,
+}
+
+/// The live sync of a team workspace; `None` for a plain one.
+pub(crate) fn live(ws: &Workspace) -> Option<std::sync::Arc<dyn LiveSync<AnyStore>>> {
+    let team = ws.config.team.clone()?;
+    ws.service.store.team()?;
+    Some(std::sync::Arc::new(FolderLive {
+        dir: ws.dir.clone(),
+        team,
+        user: user_actor(&ws.config),
+    }))
+}
+
+impl LiveSync<AnyStore> for FolderLive {
+    fn pull(&self, service: &RoduService<AnyStore>) -> Result<Pulled> {
+        let Some(store) = service.store.team() else { return Ok(Pulled::default()) };
+        let report = team_folder(&self.dir, &self.team)?.pull(store, &checker())?;
+        let mut pulled =
+            Pulled { changed: !report.batch.imported.is_empty(), warnings: report_lines(&report) };
+        if self.team.numbering {
+            match service.assign_numbers(&self.user) {
+                Ok(numbered) => pulled.changed |= !numbered.is_empty(),
+                Err(e) => pulled.warnings.push(format!("numbering new cards: {}", e.message)),
+            }
+        }
+        Ok(pulled)
     }
-    for line in report.batch.notes.iter() {
-        warn(io, line);
-    }
-    for line in report.batch.index.problems.iter().chain(&report.batch.index.conflicts) {
-        warn(io, line);
+
+    fn push(&self, service: &RoduService<AnyStore>) -> Result<Vec<String>> {
+        let Some(store) = service.store.team() else { return Ok(Vec::new()) };
+        Ok(team_folder(&self.dir, &self.team)?.push(store)?.warnings)
     }
 }
 
