@@ -31,6 +31,9 @@ pub const ITEMS: &str = "items";
 pub const TEAM: &str = "team";
 /// In [`TEAM`]: the peer that numbers cards, as 16 lowercase hex digits.
 pub const NUMBERING_PEER: &str = "numbering_peer";
+/// In [`TEAM`]: whether the numbering peer keeps a plain Markdown copy of the board in the
+/// folder. Only `true` turns it on.
+pub const READABLE_COPY: &str = "readable_copy";
 
 /// The numbering peer as written to the document.
 pub fn peer_text(peer: u64) -> String {
