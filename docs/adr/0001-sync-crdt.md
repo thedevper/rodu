@@ -352,8 +352,8 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
     so a planted symlink is never followed. A file found already identical to the card does not
     become this machine's to remove unless its own record had it. Turning the copy off removes
     this machine's files and the folder if it is then empty; a file it could not remove stays in
-    its record for the next sync. Files are read back only up to 4 MiB, so a huge planted file is
-    never loaded.
+    its record for the next sync. Card files are checked by hashing them as they are read, so a
+    file of any size is never loaded whole, and records are read only up to 16 MiB.
   - Residuals: files an earlier numbering machine wrote and the new one never rewrote stay after a
     hand-over, named once in a warning; giving the new machine the right to remove them would
     mean trusting the forgeable folder record. A file a forged folder entry let it overwrite is
