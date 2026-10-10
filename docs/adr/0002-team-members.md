@@ -38,8 +38,9 @@ Three steps, each shippable alone.
   peer under that existing principal instead of creating `bob2`.
 - `rodu team members` lists each person with their agents and their machines (short peer id:
   the first 8 hex digits, which the replica folder's name starts with, or all 16 when two listed
-  machines share them; marks this machine and the numbering machine). A replica folder whose peer is in no entry is
-  listed as "unknown machine". The readable copy and `rodu team` do not change.
+  machines share them; marks this machine and the numbering machine). A replica folder whose
+  peer is in no entry is listed as "unknown machine". The readable copy and `rodu team` do not
+  change.
 - This is a claim, not proof: anyone who can write to the folder can write an entry. The command
   says so until step 2 is in.
 - As built: an entry whose key is not 16 lowercase hex digits, or whose value is not the id of a
