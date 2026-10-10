@@ -1571,4 +1571,22 @@ fn authority_entries_that_fail_their_check_are_noted_and_ignored() {
     a.sync(&ann_folder);
     assert_eq!(a.store().authority().unwrap().len(), 4, "in the document");
     assert!(a.store().local_note("authority").unwrap().unwrap_or_default().is_empty());
+
+    // A note that still holds an outsider's record (as an earlier build kept them): a record
+    // from the owner that a pull brings is noted all the same, and the outsider's dropped.
+    let stranger = MachineKey::generate().unwrap();
+    let outsider = Record::grant(TEAM_ID, &stranger, 0, 1, &stranger.public());
+    ann_folder.set_admin(a.store(), &public(&bob_key), true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    b.store().set_local_note("authority", outsider.text()).unwrap();
+    // The next read checks it: one record in the note before, one after, not the same one.
+    assert!(bob_folder.authority(b.store()).unwrap().is_admin(&public(&bob_key)));
+    for (key, _) in b.store().authority().unwrap() {
+        b.store().set_authority(&key, "gone").unwrap();
+    }
+    let note = b.store().local_note("authority").unwrap().unwrap();
+    assert_eq!(note.lines().count(), 1, "{note}");
+    assert!(!note.contains(outsider.text()));
+    assert!(bob_folder.authority(b.store()).unwrap().is_admin(&public(&bob_key)));
 }

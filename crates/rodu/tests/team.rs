@@ -1019,6 +1019,9 @@ fn the_owner_chooses_admins_who_admit_and_hands_the_team_on() {
     // is bob's has another.
     let no_code = rodu(&team.ann, &["team", "admin", "bob", "on"]);
     assert!(no_code.err.contains("Give the machine's code too"), "{}", no_code.err);
+    let typo = format!("{bob_code}z");
+    let typed = rodu(&team.ann, &["team", "admin", "bob", "on", &typo]);
+    assert!(typed.err.contains("no admitted machine with code"), "{}", typed.err);
     let wrong = rodu(&team.ann, &["team", "admin", "bob", "on", &cat_code]);
     assert!(wrong.err.contains("bob has no admitted machine with code"), "{}", wrong.err);
     let out = ok(&team.ann, &["team", "admin", "bob", "on", &bob_code]);

@@ -768,9 +768,7 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
         return Ok(());
     };
     // Read out with or without its dashes.
-    let digits = |code: &str| -> String {
-        code.chars().filter(char::is_ascii_hexdigit).map(|c| c.to_ascii_lowercase()).collect()
-    };
+    let digits = code_digits;
     let code = code.trim();
     let matching: Vec<&JoinRequest> = waiting
         .iter()
@@ -822,8 +820,13 @@ fn signed_team<'a>(io: &mut Io<'_>, ws: &'a Workspace) -> Result<(&'a LoroStore,
     Ok((store, team_folder(&ws.dir, team)?))
 }
 
-/// The hex digits of a machine code, read out with or without its dashes.
+/// The hex digits of a machine code, read out with or without its dashes; empty (matching no
+/// machine) when it holds anything other than hex digits and dashes.
 fn code_digits(code: &str) -> String {
+    let code = code.trim();
+    if !code.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return String::new();
+    }
     code.chars().filter(char::is_ascii_hexdigit).map(|c| c.to_ascii_lowercase()).collect()
 }
 

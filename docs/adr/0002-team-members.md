@@ -210,8 +210,8 @@ Where 2b differs from Roles below, 2b is what holds.
   grant or revoke admin, or transfer ownership. So no two people can ever shut each other out at
   once.
 - **Kept once checked.** Each replica already keeps every admission it checked (2a). It now also
-  keeps every authority record it checked, and it notes the signer of each admission it keeps, so
-  a revocation still takes effect locally. An entry that fails its check (a key that is not its
+  keeps every authority record it checked that could ever count (see below), and it notes the
+  signer of each admission it keeps, so a revocation still takes effect locally. An entry that fails its check (a key that is not its
   hash, a bad signature, a malformed text) is noted by the hash of its key and text (up to 4096),
   so it is not checked again; its text is not kept. A valid record is kept only when its signer
   is the root or a key that some kept transfer hands the team to: a record signed by any other key
