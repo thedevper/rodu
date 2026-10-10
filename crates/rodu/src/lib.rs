@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use crate::store::AnyStore;
 use crate::team::TeamConfig;
 
+mod readable;
 mod store;
 pub mod team;
 
@@ -36,9 +37,10 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
   team [--show-invite]       where this workspace syncs, and its invite code
-  team create --folder <shared folder> --encrypt|--no-encrypt   share this workspace with a team
+  team create --folder <shared folder> --encrypt|--no-encrypt [--readable-copy]   share this workspace with a team
   team join <invite code|-> --folder <shared folder> --name <you>   join a team here (- reads the code from stdin)
   team take-numbering --yes   number the team's cards here, when the machine that did is gone for good
+  team readable-copy on|off   keep a plain Markdown copy of the board in the team folder (never encrypted)
   sync                       sync with the team folder now (every command also does)
   --version                  print the version
 
@@ -88,7 +90,7 @@ const STRING_OPTIONS: &[&str] = &[
     "folder",
 ];
 const BOOL_OPTIONS: &[&str] =
-    &["no-open", "version", "help", "encrypt", "no-encrypt", "show-invite", "yes"];
+    &["no-open", "version", "help", "encrypt", "no-encrypt", "show-invite", "yes", "readable-copy"];
 
 #[derive(Debug, Default)]
 struct Args {
@@ -343,6 +345,7 @@ async fn command_result(
             Some("create") => team::create(io, args).map(|()| 0),
             Some("join") => team::join(io, args, rest.get(1)).map(|()| 0),
             Some("take-numbering") => team::take_numbering(io, args).map(|()| 0),
+            Some("readable-copy") => team::readable_copy(io, rest.get(1)).map(|()| 0),
             Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
                 .with_hint(
                     "rodu team, rodu team create, rodu team join, rodu team take-numbering",

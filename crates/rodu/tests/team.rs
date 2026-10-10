@@ -586,3 +586,118 @@ fn a_running_board_stops_numbering_when_the_role_moves() {
     let said = std::fs::read_to_string(team.ann.join("web-stderr.txt")).unwrap();
     assert_eq!(said.matches("numbering moved to machine").count(), 1, "{said}");
 }
+
+// --- the readable copy ---
+
+fn readable(team: &Team) -> PathBuf {
+    team.folder.join("readable")
+}
+
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+#[test]
+fn a_readable_copy_follows_the_board_and_rewrites_only_what_changed() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("Drive/Team board");
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
+    ok(&ann, &["add", "Made alone"]);
+    let out = ok(
+        &ann,
+        &[
+            "team",
+            "create",
+            "--folder",
+            folder.to_str().unwrap(),
+            "--no-encrypt",
+            "--readable-copy",
+        ],
+    );
+    assert!(out.contains("never encrypted"), "{out}");
+    let copy = folder.join("readable");
+    let first = std::fs::read_to_string(copy.join("DEMO-1.md")).unwrap();
+    assert!(first.starts_with("# DEMO-1: Made alone"), "{first}");
+    assert!(
+        std::fs::read_to_string(copy.join("index.md")).unwrap().contains("[DEMO-1](DEMO-1.md)")
+    );
+    assert!(ok(&ann, &["team"]).contains("Readable copy: on"));
+
+    let code = out.lines().find_map(|l| l.strip_prefix("Invite code: ")).unwrap().to_owned();
+    let team = Team { _root: root, folder, ann, code };
+    let bob = join(&team, "bob");
+    ok(&bob, &["add", "From bob"]);
+    let mut names: Vec<String> = std::fs::read_dir(&copy)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, [".rodu-readable.json", "DEMO-1.md", "index.md"], "only ann writes the copy");
+    ok(&team.ann, &["ls"]);
+    assert!(std::fs::read_to_string(copy.join("DEMO-2.md")).unwrap().contains("From bob"));
+
+    let untouched = modified(&copy.join("DEMO-1.md"));
+    ok(&bob, &["mv", "DEMO-2", "Todo"]);
+    ok(&team.ann, &["sync"]);
+    assert!(std::fs::read_to_string(copy.join("DEMO-2.md")).unwrap().contains("- Status: Todo"));
+    assert_eq!(modified(&copy.join("DEMO-1.md")), untouched, "an unchanged card is not rewritten");
+}
+
+#[test]
+fn the_readable_copy_is_switched_by_any_member_and_removes_only_rodus_files() {
+    let team = team();
+    let bob = join(&team, "bob");
+    let copy = readable(&team);
+    let on = ok(&bob, &["team", "readable-copy", "on"]);
+    assert!(on.contains("never encrypted") && on.contains("numbering machine writes it"), "{on}");
+    assert!(!copy.exists());
+    ok(&team.ann, &["sync"]);
+    assert!(copy.join("DEMO-1.md").is_file());
+
+    // A person's own file, and a card file someone edited, are never removed.
+    std::fs::write(copy.join("notes.txt"), "mine").unwrap();
+    ok(&team.ann, &["add", "Second"]);
+    std::fs::write(copy.join("DEMO-2.md"), "edited by hand").unwrap();
+    ok(&bob, &["team", "readable-copy", "off"]);
+    let off = rodu(&team.ann, &["sync"]);
+    assert_eq!(off.code, 0, "{}", off.err);
+    assert!(off.err.contains("DEMO-2.md was changed by someone else"), "{}", off.err);
+    assert!(!copy.join("DEMO-1.md").exists() && !copy.join("index.md").exists());
+    assert_eq!(std::fs::read_to_string(copy.join("notes.txt")).unwrap(), "mine");
+    assert_eq!(std::fs::read_to_string(copy.join("DEMO-2.md")).unwrap(), "edited by hand");
+    assert!(ok(&bob, &["team"]).contains("Readable copy: off"));
+}
+
+#[test]
+fn a_card_that_leaves_the_copy_loses_its_file_and_problems_are_warnings() {
+    use sha2::Digest;
+    let team = team();
+    ok(&team.ann, &["team", "readable-copy", "on"]);
+    let copy = readable(&team);
+    // A file Rodu wrote for a card that is no longer there (as after a renumbering): its record
+    // says Rodu wrote it, so it goes. The record is edited so the copy is rendered again.
+    let stale = "# DEMO-9: gone\n";
+    std::fs::write(copy.join("DEMO-9.md"), stale).unwrap();
+    let manifest = copy.join(".rodu-readable.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    let hash: String =
+        sha2::Sha256::digest(stale.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    record["files"]["DEMO-9.md"] = hash.into();
+    record["files"]["../outside.md"] = "00".into();
+    record["version"] = "".into();
+    std::fs::write(&manifest, record.to_string()).unwrap();
+    std::fs::write(team.folder.join("outside.md"), "keep").unwrap();
+    ok(&team.ann, &["sync"]);
+    assert!(!copy.join("DEMO-9.md").exists());
+    assert!(team.folder.join("outside.md").is_file(), "a record never reaches outside readable/");
+
+    // A copy folder that cannot be written is a warning; the command still works.
+    std::fs::remove_dir_all(&copy).unwrap();
+    std::fs::write(&copy, "not a folder").unwrap();
+    let run = rodu(&team.ann, &["add", "Still works"]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(run.err.contains("readable copy: cannot make"), "{}", run.err);
+}
