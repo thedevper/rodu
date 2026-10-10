@@ -914,8 +914,9 @@ pub(crate) fn transfer_owner(io: &mut Io<'_>, args: &Args, name: Option<&String>
     let (peer, key) = person_machine(&ws, store, &folder, name, args.value("machine"))?;
     if !args.flag("yes") {
         return Err(RoduError::invalid("Handing over the team needs --yes").with_hint(format!(
-            "The new owner alone then chooses admins and can hand it on; this cannot be taken \
-             back from here. Then run: rodu team transfer-owner {name} --yes"
+            "The new owner alone then chooses admins and can hand it on; this machine stays an \
+             admin until they say otherwise, and cannot take the team back. Then run: rodu team \
+             transfer-owner {name} --yes"
         )));
     }
     folder.transfer(store, &key)?;
@@ -930,6 +931,17 @@ fn is_admitted(admitted: &Admitted, peer: u64, key: &PublicKey) -> bool {
     admitted.get(&peer).is_some_and(|keys| keys.contains(key))
 }
 
+/// The role of `me`, for a warning that comes after it.
+fn role_text(authority: &rodu_sync::authority::Authority, me: &PublicKey, code: &str) -> String {
+    if authority.owner() == *me {
+        format!("this machine owns the team (code {code})")
+    } else if authority.is_admin(me) {
+        format!("this machine is an admin (code {code})")
+    } else {
+        format!("this machine's code is {code}")
+    }
+}
+
 /// Where this machine stands in a signed team.
 fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
     let Ok(Some(identity)) = load_identity(dir) else {
@@ -940,6 +952,11 @@ fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
     let state = team_folder(dir, team)
         .and_then(|folder| Ok((folder.authority(store)?, folder.admissions(store)?)));
     match state {
+        Ok((authority, _)) if authority.disputed() => format!(
+            "{}; warning: a former owner signed a second hand-over of the team. This machine keeps \
+             following the first it saw, but a machine that never saw it may follow the other",
+            role_text(&authority, &me, code.as_str())
+        ),
         Ok((authority, _)) if authority.owner() == me => {
             format!("this machine owns the team and admits others (code {code})")
         }

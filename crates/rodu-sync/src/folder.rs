@@ -224,6 +224,12 @@ impl Trusted {
 const NOTE_ADMITTED: &str = "admitted";
 /// The local note listing every signed authority record this replica checked, one per line.
 const NOTE_AUTHORITY: &str = "authority";
+/// The local note listing the authority entries that failed their check, one hash per line.
+const NOTE_AUTHORITY_REFUSED: &str = "authority-refused";
+/// The most refused authority entries noted.
+const MAX_REFUSED: usize = 4096;
+/// The local note listing the hashes of the transfers this replica follows, epoch 1 first.
+const NOTE_OWNERS: &str = "owners";
 /// The local note on a file that waits for its signer to be admitted: the signer's key.
 fn await_note(stat: &str) -> String {
     format!("await/{stat}")
@@ -763,8 +769,9 @@ impl TeamFolder {
     }
 
     /// Every authority record this replica checked: the local note's, and the document's whose
-    /// key is its hash and whose signature verifies, whether it counts now or not. Saves the note
-    /// when the document added some.
+    /// key is its hash and whose signature verifies, whether it counts now or not. An entry that
+    /// fails the check is noted too (by the hash of its key and text), so it is not checked again.
+    /// Saves the notes when the document added something.
     fn authority_records(&self, store: &LoroStore, info: &TeamInfo) -> Result<Vec<Record>> {
         let team = self.team_id(info);
         let noted = store.local_note(NOTE_AUTHORITY)?.unwrap_or_default();
@@ -773,27 +780,60 @@ impl TeamFolder {
             .filter_map(|text| Record::parse(team, text))
             .map(|record| (authority::key_of(record.text()), record))
             .collect();
-        let before = records.len();
+        let refused_note = store.local_note(NOTE_AUTHORITY_REFUSED)?.unwrap_or_default();
+        let mut refused: BTreeSet<String> = refused_note.lines().map(str::to_owned).collect();
+        let (before, refused_before) = (records.len(), refused.len());
         for (key, text) in store.authority()? {
-            if !records.contains_key(&key)
-                && authority::key_of(&text) == key
-                && let Some(record) = Record::parse(team, &text)
-            {
-                records.insert(key, record);
+            if records.get(&key).is_some_and(|r| r.text() == text) {
+                continue;
+            }
+            let entry = authority::key_of(&format!("{key}\0{text}"));
+            if refused.contains(&entry) {
+                continue;
+            }
+            match Record::parse(team, &text).filter(|_| authority::key_of(&text) == key) {
+                Some(record) => {
+                    records.insert(key, record);
+                }
+                None if refused.len() < MAX_REFUSED => {
+                    refused.insert(entry);
+                }
+                None => {}
             }
         }
         if records.len() != before {
             let lines: Vec<&str> = records.values().map(Record::text).collect();
             store.set_local_note(NOTE_AUTHORITY, &lines.join("\n"))?;
         }
+        if refused.len() != refused_before {
+            let lines: Vec<&str> = refused.iter().map(String::as_str).collect();
+            store.set_local_note(NOTE_AUTHORITY_REFUSED, &lines.join("\n"))?;
+        }
         Ok(records.into_values().collect())
     }
 
-    fn authority_of(&self, store: &LoroStore, info: &TeamInfo) -> Result<Authority> {
+    /// The team's authority from `records`, following the transfers this replica followed before
+    /// ([`Authority::resolve`]), and noting the ones it follows now.
+    fn resolve(&self, store: &LoroStore, records: &[Record]) -> Result<Authority> {
         let Some((_, root)) = &self.signing else {
             return Err(RoduError::internal("only a signed team has owners"));
         };
-        Ok(Authority::resolve(*root, &self.authority_records(store, info)?))
+        let noted = store.local_note(NOTE_OWNERS)?.unwrap_or_default();
+        let settled: Vec<authority::Hash> = noted
+            .lines()
+            .map_while(|line| hex::decode(line).ok().and_then(|bytes| bytes.try_into().ok()))
+            .collect();
+        let authority = Authority::resolve(*root, records, &settled);
+        if authority.settled() != settled {
+            let lines: Vec<String> = authority.settled().iter().map(hex::encode).collect();
+            store.set_local_note(NOTE_OWNERS, &lines.join("\n"))?;
+        }
+        Ok(authority)
+    }
+
+    fn authority_of(&self, store: &LoroStore, info: &TeamInfo) -> Result<Authority> {
+        let records = self.authority_records(store, info)?;
+        self.resolve(store, &records)
     }
 
     /// Signed team: who owns it and who may admit machines, as this replica knows it.
@@ -817,10 +857,7 @@ impl TeamFolder {
         let info = self.checked_info()?;
         let team = self.team_id(&info);
         let records = self.authority_records(store, &info)?;
-        let Some((_, root)) = &self.signing else {
-            return Err(RoduError::internal("only a signed team has admins"));
-        };
-        let authority = Authority::resolve(*root, &records);
+        let authority = self.resolve(store, &records)?;
         let key = self.owner_key(&authority, "choose admins")?;
         if *target == authority.owner() {
             return Err(RoduError::invalid("The team owner is not made an admin"));
@@ -842,28 +879,35 @@ impl TeamFolder {
         self.write_authority(store, &info, &record)
     }
 
-    /// Signed team, on the owner's machine: hands ownership to `new`. This machine stays an
-    /// admin. The next push sends the record.
+    /// Signed team, on the owner's machine: hands ownership to `new`, carrying the admin records
+    /// of the epoch it ends. This machine stays an admin, and nothing it signs for the epoch it
+    /// ended counts any more. The next push sends the record.
     pub fn transfer(&self, store: &LoroStore, new: &PublicKey) -> Result<()> {
         let info = self.checked_info()?;
-        let authority = self.authority_of(store, &info)?;
+        let records = self.authority_records(store, &info)?;
+        let authority = self.resolve(store, &records)?;
         let key = self.owner_key(&authority, "hand over the team")?;
         if *new == authority.owner() {
             return Err(RoduError::invalid("That machine already owns the team"));
         }
-        let record = Record::transfer(self.team_id(&info), key, authority.epoch() + 1, new);
+        let carried = authority.carry(&records);
+        let record =
+            Record::transfer(self.team_id(&info), key, authority.epoch() + 1, new, &carried);
         self.write_authority(store, &info, &record)
     }
 
     fn write_authority(&self, store: &LoroStore, info: &TeamInfo, record: &Record) -> Result<()> {
         store.set_authority(&authority::key_of(record.text()), record.text())?;
-        // Noted right away, so a document change before the next pull cannot take it back here.
+        // Noted right away, so a document change before the next pull cannot take it back here,
+        // and a transfer is followed here from now on.
         let mut lines: Vec<String> =
             self.authority_records(store, info)?.iter().map(|r| r.text().to_owned()).collect();
         if !lines.iter().any(|text| text == record.text()) {
             lines.push(record.text().to_owned());
             store.set_local_note(NOTE_AUTHORITY, &lines.join("\n"))?;
         }
+        let records = self.authority_records(store, info)?;
+        self.resolve(store, &records)?;
         Ok(())
     }
 
