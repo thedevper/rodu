@@ -770,9 +770,7 @@ impl TeamFolder {
             Some((key, _)) if authority.may_admit(&key.public()) => {
                 let record = key.admit(self.team_id(&info), request.peer, &request.key);
                 store.set_admission(request.peer, &record)?;
-                self.mirror(store, &info, |file| {
-                    file.admissions.push(format!("{}.{record}", peer_dir_name(request.peer)))
-                })
+                self.mirror(store, &info, None)
             }
             _ => Err(RoduError::invalid(
                 "Only the team owner's machine, or an admin's, can admit machines",
@@ -925,17 +923,36 @@ impl TeamFolder {
         Ok(claims)
     }
 
-    /// Adds to this machine's authority file what `add` puts in, and writes it.
-    fn mirror(
-        &self,
-        store: &LoroStore,
-        info: &TeamInfo,
-        add: impl FnOnce(&mut AuthorityFile),
-    ) -> Result<()> {
+    /// Writes this machine's authority file afresh: every authority record and admission this
+    /// replica checked that this machine's key signed (from its local notes, so a file that was
+    /// damaged, grew too large or was changed loses nothing), with `also`, and whatever the file
+    /// held that still reads.
+    fn mirror(&self, store: &LoroStore, info: &TeamInfo, also: Option<&Record>) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
+        let me = key.public();
         let mut file = self
             .authority_file(info, store.peer())?
             .unwrap_or(AuthorityFile { format: 1, ..Default::default() });
-        add(&mut file);
+        let records = self.authority_records(store, info)?;
+        let signed = records.iter().chain(also).filter(|r| r.signer() == me);
+        for text in signed.map(|r| r.text().to_owned()) {
+            if !file.records.contains(&text) {
+                file.records.push(text);
+            }
+        }
+        for (peer, member, signer) in self.checked_admissions(store, info)? {
+            if signer == me {
+                // Ed25519 signs deterministically: the same record as the one first written.
+                let entry = format!(
+                    "{}.{}",
+                    peer_dir_name(peer),
+                    key.admit(self.team_id(info), peer, &member)
+                );
+                if !file.admissions.contains(&entry) {
+                    file.admissions.push(entry);
+                }
+            }
+        }
         let json = serde_json::to_vec(&file).expect("an authority file serializes");
         let (name, bytes) = match &self.key {
             Some(team) => {
@@ -1276,11 +1293,6 @@ impl TeamFolder {
 
     fn write_authority(&self, store: &LoroStore, info: &TeamInfo, record: &Record) -> Result<()> {
         store.set_authority(&authority::key_of(record.text()), record.text())?;
-        self.mirror(store, info, |file| {
-            if !file.records.iter().any(|text| text == record.text()) {
-                file.records.push(record.text().to_owned());
-            }
-        })?;
         // Noted right away, so a document change before the next pull cannot take it back here,
         // and a transfer is followed here from now on.
         let mut lines: Vec<String> =
@@ -1291,7 +1303,7 @@ impl TeamFolder {
         }
         let records = self.authority_records(store, info)?;
         self.resolve(store, &records)?;
-        Ok(())
+        self.mirror(store, info, Some(record))
     }
 
     /// What a signed team does with a file's payload once it is unframed and opened: its Loro

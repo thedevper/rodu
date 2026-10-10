@@ -195,6 +195,11 @@ impl Record {
         self.hash
     }
 
+    /// The key that signed it.
+    pub fn signer(&self) -> PublicKey {
+        self.signer
+    }
+
     fn sign(workspace_id: &str, key: &MachineKey, body: String) -> Record {
         let signed = format!("{body}.{}", key.public().to_hex());
         let signature = key.sign_authority(workspace_id, &signed);
