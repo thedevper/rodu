@@ -40,7 +40,9 @@ use rodu_store::SqliteStore;
 use rodu_store::index::Parked;
 use sha2::{Digest, Sha256};
 
-use crate::layout::{self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, PRINCIPALS};
+use crate::layout::{
+    self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, NUMBERING_PEER, PRINCIPALS, TEAM,
+};
 use crate::names::{self, Entry};
 use crate::{Checker, MAX_IMPORT_BYTES, SyncError, Untrusted, check_import};
 
@@ -131,6 +133,7 @@ enum Change {
     Item(Box<(Option<Item>, Item)>),
     Comment(Comment),
     Link(Link),
+    NumberingPeer(u64),
 }
 
 /// Which entities a document change touched.
@@ -336,6 +339,28 @@ impl LoroStore {
     /// This replica's Loro peer id.
     pub fn peer(&self) -> u64 {
         self.peer.get()
+    }
+
+    /// The machine the team document names to number cards, if it names one. A value that is
+    /// not a peer id (written by a broken or hostile machine) counts as none.
+    pub fn numbering_peer(&self) -> Result<Option<u64>> {
+        // A write transaction, so the document is loaded and settled before it is read.
+        self.transaction(TxMode::Write, || {
+            let doc = self.doc.borrow();
+            Ok(match doc.get_map(TEAM).get(NUMBERING_PEER) {
+                Some(ValueOrContainer::Value(LoroValue::String(text))) => layout::parse_peer(&text),
+                _ => None,
+            })
+        })
+    }
+
+    /// Names `peer` in the team document as the machine that numbers cards. Saved like any
+    /// write, so the next push sends it.
+    pub fn set_numbering_peer(&self, peer: u64) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            self.pending.borrow_mut().push(Change::NumberingPeer(peer));
+            Ok(())
+        })
     }
 
     /// Lowers the bytes checked at once by [`LoroStore::import_batch`], so tests can split a
@@ -824,6 +849,9 @@ impl LoroStore {
             Change::Link(l) => {
                 let key = layout::link_key(&l.from_item_id, l.kind.as_str(), &l.target);
                 put_fields(&entity_map(doc, LINKS, &key)?, layout::link_fields(l), None)
+            }
+            Change::NumberingPeer(peer) => {
+                doc.get_map(TEAM).insert(NUMBERING_PEER, layout::peer_text(*peer)).map_err(internal)
             }
             Change::Item(change) => {
                 let (old, i) = &**change;

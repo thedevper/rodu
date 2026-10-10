@@ -38,6 +38,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   team [--show-invite]       where this workspace syncs, and its invite code
   team create --folder <shared folder> --encrypt|--no-encrypt   share this workspace with a team
   team join <invite code|-> --folder <shared folder> --name <you>   join a team here (- reads the code from stdin)
+  team take-numbering --yes   number the team's cards here, when the machine that did is gone for good
   sync                       sync with the team folder now (every command also does)
   --version                  print the version
 
@@ -87,7 +88,7 @@ const STRING_OPTIONS: &[&str] = &[
     "folder",
 ];
 const BOOL_OPTIONS: &[&str] =
-    &["no-open", "version", "help", "encrypt", "no-encrypt", "show-invite"];
+    &["no-open", "version", "help", "encrypt", "no-encrypt", "show-invite", "yes"];
 
 #[derive(Debug, Default)]
 struct Args {
@@ -341,8 +342,11 @@ async fn command_result(
             None => team::status(io, args).map(|()| 0),
             Some("create") => team::create(io, args).map(|()| 0),
             Some("join") => team::join(io, args, rest.get(1)).map(|()| 0),
+            Some("take-numbering") => team::take_numbering(io, args).map(|()| 0),
             Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
-                .with_hint("rodu team, rodu team create, rodu team join")),
+                .with_hint(
+                    "rodu team, rodu team create, rodu team join, rodu team take-numbering",
+                )),
         },
         "sync" => team::sync(io).map(|()| 0),
         "mcp" => {
