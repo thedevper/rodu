@@ -1041,7 +1041,9 @@ fn a_compaction_that_cannot_remove_a_file_warns_and_the_push_still_counts() {
 
 // --- signed teams (ADR 0002, step 2a) ---------------------------------------------------------
 
+use rodu_sync::authority::Record;
 use rodu_sync::sign::{self, MachineKey, PublicKey};
+use std::collections::BTreeSet;
 
 const TEAM_ID: &str = "0190aaaa-0000-7000-8000-00000000000a";
 const ROOT_KEY: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
@@ -1458,13 +1460,8 @@ fn an_authority_record_once_checked_outlives_its_entry_being_overwritten() {
     for (key, _) in b.store().authority().unwrap() {
         b.store().set_authority(&key, "admin.0.9.x.on.y.z").unwrap();
     }
-    let own = rodu_sync::authority::Record::grant(
-        TEAM_ID,
-        &MachineKey::from_hex(&bob_key).unwrap(),
-        0,
-        9,
-        &public(&bob_key),
-    );
+    let own =
+        Record::grant(TEAM_ID, &MachineKey::from_hex(&bob_key).unwrap(), 0, 9, &public(&bob_key));
     b.store().set_authority(&rodu_sync::authority::key_of(own.text()), own.text()).unwrap();
     b.sync(&bob_folder);
     a.sync(&ann_folder);
@@ -1472,13 +1469,8 @@ fn an_authority_record_once_checked_outlives_its_entry_being_overwritten() {
     assert!(auth.is_admin(&public(&cat_key)), "ann checked the grant before");
     assert!(!auth.is_admin(&public(&bob_key)), "bob's own grant counts for nothing");
     // A record signed by the owner, but under a key that is not its hash, is not read.
-    let misplaced = rodu_sync::authority::Record::grant(
-        TEAM_ID,
-        &MachineKey::from_hex(ROOT_KEY).unwrap(),
-        0,
-        20,
-        &public(&bob_key),
-    );
+    let misplaced =
+        Record::grant(TEAM_ID, &MachineKey::from_hex(ROOT_KEY).unwrap(), 0, 20, &public(&bob_key));
     b.store().set_authority(&"0".repeat(64), misplaced.text()).unwrap();
     b.sync(&bob_folder);
     a.sync(&ann_folder);
@@ -1512,4 +1504,61 @@ fn the_root_key_is_trusted_in_any_folder_only_while_it_may_admit() {
     let report = b.sync(&bob_folder);
     assert_eq!(report.awaiting, vec![(a.store().peer(), 1)], "{report:?}");
     assert!(!b.titles().contains(&"Revoked".to_owned()));
+}
+
+#[test]
+fn a_former_owner_cannot_take_the_team_back_or_name_admins_afterwards() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root.path());
+    let (ann, bob) = (MachineKey::from_hex(ROOT_KEY).unwrap(), public(&bob_key));
+    ann_folder.transfer(a.store(), &bob).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    bob_folder.set_admin(b.store(), &ann.public(), false).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    // ann signs, as owner of epoch 0, a grant for a key she controls, and as owner of epoch 0
+    // a second transfer, to that key. Try many keys: one of them has a lower hash than the
+    // transfer to bob.
+    let (to_bob, _) = b
+        .store()
+        .authority()
+        .unwrap()
+        .into_iter()
+        .find(|(_, text)| text.starts_with("owner."))
+        .unwrap();
+    let mut lowest_beaten = false;
+    for _ in 0..40 {
+        let mine = MachineKey::generate().unwrap();
+        let grant = Record::grant(TEAM_ID, &ann, 0, 50, &mine.public());
+        let back = Record::transfer(TEAM_ID, &ann, 1, &mine.public(), &BTreeSet::new());
+        lowest_beaten |= rodu_sync::authority::key_of(back.text()) < to_bob;
+        for record in [grant, back] {
+            a.store()
+                .set_authority(&rodu_sync::authority::key_of(record.text()), record.text())
+                .unwrap();
+        }
+    }
+    assert!(lowest_beaten, "some forged transfer has the lowest hash");
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    for (folder, machine) in [(&bob_folder, &b), (&ann_folder, &a)] {
+        let auth = folder.authority(machine.store()).unwrap();
+        assert_eq!(auth.owner(), bob, "bob still owns the team");
+        assert!(auth.disputed());
+        assert!(!auth.may_admit(&ann.public()));
+    }
+}
+
+#[test]
+fn authority_entries_that_fail_their_check_are_noted_and_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, bob_folder, b) = ann_and_bob(root.path());
+    b.store().set_authority(&"1".repeat(64), "not a record").unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    let auth = ann_folder.authority(a.store()).unwrap();
+    assert_eq!(auth.owner(), root_public());
+    assert!(!auth.is_admin(&public(&bob_key)));
+    assert_eq!(a.store().local_note("authority-refused").unwrap().unwrap().lines().count(), 1);
 }
