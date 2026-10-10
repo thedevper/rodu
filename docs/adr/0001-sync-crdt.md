@@ -339,11 +339,17 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
   - File names come only from card keys filtered to ASCII letters, digits and `-`, so card text
     never chooses where a file goes. The copy's folder is made only inside a team folder that is
     there; an unmounted folder is never recreated.
-  - Rodu overwrites or deletes only what it wrote: `readable/.rodu-readable.json` records each
-    file and the SHA-256 of what was written, and names in it must be ones Rodu could have
-    written. A file that no longer matches (edited by a person) is left alone with a warning, and
-    other files in the folder are never touched. Turning the copy off removes Rodu's files and
-    the folder if it is then empty.
+  - Rodu overwrites or deletes only what it wrote. `readable/.rodu-readable.json` records each
+    file and the SHA-256 of what was written, but anyone who can write to the folder can write
+    that record too, so a file must also have a card key's shape (or be `index.md`), be a plain
+    file, and start with the heading Rodu writes under that name. A person's own file, an edited
+    copy or a symlink is left alone with a warning. The copy's folder must be a plain folder, not
+    a symlink, and files are written through a temp file created new, so a planted symlink is
+    never followed. Turning the copy off removes Rodu's files and the folder if it is then empty.
+  - A card file shows the fields a card has. Cards have no reporter or labels, and a reporter
+    cannot be derived on the numbering machine, since the event log is local to each machine.
+    There is no archive, so every card is in the copy; a file is removed when its card's name
+    leaves the copy, which no flow does today (tested by planting such a file).
   - Problems writing the copy are warnings; the pull never reads `readable/`. Changes made to the
     copy are not read back.
 - **Left for later steps.** Live sync polls on a timer rather than watching the file system, and an open
