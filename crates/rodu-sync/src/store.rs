@@ -41,8 +41,8 @@ use rodu_store::index::Parked;
 use sha2::{Digest, Sha256};
 
 use crate::layout::{
-    self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS, NUMBERING_PEER, PRINCIPALS,
-    READABLE_COPY, TEAM,
+    self, ADMISSIONS, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS, NUMBERING_PEER,
+    PRINCIPALS, READABLE_COPY, TEAM,
 };
 use crate::names::{self, Entry};
 use crate::{Checker, MAX_IMPORT_BYTES, SyncError, Untrusted, check_import};
@@ -137,6 +137,7 @@ enum Change {
     NumberingPeer(u64),
     ReadableCopy(bool),
     Member(u64, String),
+    Admission(u64, String),
 }
 
 /// Which entities a document change touched.
@@ -396,6 +397,32 @@ impl LoroStore {
                 }
             });
             Ok(members)
+        })
+    }
+
+    /// The admission records in the document, by peer, unchecked: whoever reads one checks its
+    /// signature ([`crate::sign::check_admission`]). Entries whose key is not a peer id or whose
+    /// value is not text are left out.
+    pub fn admissions(&self) -> Result<BTreeMap<u64, String>> {
+        self.transaction(TxMode::Write, || {
+            let doc = self.doc.borrow();
+            let mut admissions = BTreeMap::new();
+            doc.get_map(ADMISSIONS).for_each(|key, value| {
+                if let (Some(peer), ValueOrContainer::Value(LoroValue::String(record))) =
+                    (layout::parse_peer(key), value)
+                {
+                    admissions.insert(peer, record.to_string());
+                }
+            });
+            Ok(admissions)
+        })
+    }
+
+    /// Writes an admission record for `peer`, for every machine once they sync.
+    pub fn set_admission(&self, peer: u64, record: &str) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            self.pending.borrow_mut().push(Change::Admission(peer, record.to_string()));
+            Ok(())
         })
     }
 
@@ -918,6 +945,10 @@ impl LoroStore {
                     .insert(&layout::peer_text(*peer), id.as_str())
                     .map_err(internal)
             }
+            Change::Admission(peer, record) => doc
+                .get_map(ADMISSIONS)
+                .insert(&layout::peer_text(*peer), record.as_str())
+                .map_err(internal),
             Change::Item(change) => {
                 let (old, i) = &**change;
                 if !is_uuid(&i.id) {

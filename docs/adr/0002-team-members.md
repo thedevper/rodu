@@ -78,6 +78,66 @@ Three steps, each shippable alone.
   machine turns signing on: from then on, unsigned files from any peer are held. Each existing
   member's machine signs a request on its next sync, and the admin admits them.
 
+#### Step 2a as built (signed teams from creation; the creating machine admits)
+
+Step 2 is built in two parts. 2a is below; 2b adds admins and the ownership transfer (Roles).
+Where 2a differs from the text above, 2a is what holds:
+
+- **Only new teams sign, for now.** `rodu team create --signed` makes a signed team; an
+  existing team stays unsigned. `rodu team sign` (migration) comes later, and the second open
+  question is settled for now as "a team can be signed from creation".
+- **Only the creating machine admits.** Its public key is the team's root key. In 2a it is the
+  only key that can sign an admission; admins (2b) will be keys the root admits as such.
+- **Team file format 3.** `{"format": 3, "workspaceId", "signing": "ed25519", "root": <root
+  public key, 64 hex>}`, plus `"encryption"` and `"keyCheck"` for an encrypted team. A rodu that
+  knows only formats 1 and 2 refuses it rather than writing unsigned files. The workspace decides,
+  as with encryption: `config.json` records the root key under `team.signing`, and a signed
+  workspace refuses a folder whose team file is unsigned or names another root, and an unsigned
+  workspace refuses a format 3 folder. So whoever writes the folder can stop the sync, but can
+  never turn signing off or swap the root.
+- **Invite code.** `rodu2-<workspace id>.<root public key, 64 hex>[.<team key, 64 hex>]`. The
+  whole public key travels in the code, so a joiner never takes it from the folder.
+- **Machine key.** Ed25519 (`ed25519-dalek` 3.0.0, BSD-3-Clause), 32 random bytes from the OS,
+  stored as hex in `.rodu/identity.key` (0600 on Unix, zeroized in memory).
+- **Signed payload.** Inside the frame, and inside the seal of an encrypted team, the payload is
+  `0x01 || signer public key (32) || signature (64) || Loro update`. The signature covers
+  `"rodu-sync-sign-1" 0x00 || workspace id length (u64 LE) || workspace id || writer peer id
+  (u64 LE) || SHA-256 of the Loro update`. The file name is not signed: a folder app's conflict
+  copy (`0000000003 (1).update`) must still verify, and a file renamed within its own replica
+  folder holds operations readers already ignore by their ids. Moving a file to another replica
+  folder, or to another team, fails the signature.
+- **Who a file is accepted from.** A file signed by the root key is accepted from any replica
+  folder: only the creator holds that key. Any other file is accepted only when the team document
+  holds an admission for that folder's peer whose key is the signer's and whose signature verifies
+  against the root key. A file from a peer with no valid admission waits, unread as done, and is
+  read again on every pull. A file whose signature does not verify, or that is not a signed
+  payload at all, is reported once as damaged. A pull that brings in a new admission reads the
+  folder once more, so the admitted machine's files land in the same command.
+- **Admission record.** The document's root map `admissions`, from peer id (16 hex) to
+  `<member public key, 64 hex>.<signature, 128 hex>`. The signature is the root key's over
+  `"rodu-admit-1" 0x00 || workspace id length (u64 LE) || workspace id || peer id (u64 LE) ||
+  member public key`. Any member can write into the map, so a record counts only by its
+  signature, never by who wrote it.
+- **Asking to join.** `team join` on a signed team writes `sync/<peer>/request.json`
+  (`{"format": 1, "name", "publicKey", "signature"}`; sealed with the team key as
+  `request.sealed` for an encrypted team, so the provider does not learn the name). The machine
+  signs its own request over `"rodu-request-1" 0x00 || workspace id length (u64 LE) || workspace
+  id || peer id (u64 LE) || name length (u64 LE) || name`, so nobody can file a request under
+  another machine's key. Requests that are links, over 4 KiB, unsigned or under a name a person
+  cannot have are skipped. Join prints the machine's code: the
+  first 16 hex digits of the SHA-256 of its public key. The joiner tells the owner the code by
+  some other channel. The owner runs `rodu team admit <name> <code>`, which refuses unless a request
+  under that name has that code. That way a request someone planted in the folder under a
+  teammate's name cannot be admitted by mistake. `rodu team admit` with no arguments lists
+  requests waiting.
+- **The root's own machine** is admitted by the root at create, so every machine of a signed
+  team is listed the same way.
+- **Seeing it.** `rodu team` syncs first, like other commands, then says whether this machine is
+  the root, admitted, or waiting.
+  `rodu team members` marks machines waiting for admission and lists requests. On a signed team,
+  it stops calling the list unproven for admitted machines, but the name each machine gives
+  stays a claim.
+
 ### Step 3: removing someone
 
 - `rodu team remove <name>` (owner or admin, within the limits under Roles) signs a removal

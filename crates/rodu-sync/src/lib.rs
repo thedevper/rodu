@@ -12,6 +12,7 @@ pub mod folder;
 mod layout;
 mod names;
 pub mod seal;
+pub mod sign;
 mod store;
 
 pub use store::{BatchReport, Incoming, IndexReport, LoroStore};

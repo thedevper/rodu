@@ -9,8 +9,9 @@ use std::time::Duration;
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService};
-use rodu_sync::folder::{PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
+use rodu_sync::folder::{JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::seal::TeamKey;
+use rodu_sync::sign::{MachineKey, PublicKey};
 use rodu_sync::{Checker, LoroStore};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,9 @@ pub const CHECK_COMMAND: &str = "__check-import";
 const INVITE_PREFIX: &str = "rodu1-";
 /// An encrypted team's key, in the workspace folder; never in `config.json`.
 const KEY_FILE: &str = "team.key";
+/// A signed team: this machine's private signing key (ADR 0002, step 2a).
+const IDENTITY_FILE: &str = "identity.key";
+const SIGNED_INVITE_PREFIX: &str = "rodu2-";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +44,11 @@ pub struct TeamConfig {
     /// folder, decides how the workspace syncs.
     #[serde(default)]
     pub encrypted: bool,
+    /// A signed team: its root public key, from the invite code (or this machine's own key on
+    /// the machine that created it). This setting, not the folder, decides that files are signed
+    /// and which root is trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<String>,
 }
 
 /// The team key in `dir`, if there is one.
@@ -55,6 +64,29 @@ fn load_key(dir: &Path) -> Result<Option<TeamKey>> {
         .and_then(|text| TeamKey::from_hex(text.trim()))
         .map(Some)
         .ok_or_else(|| RoduError::invalid(format!("{} does not hold a team key", path.display())))
+}
+
+/// This machine's signing key in `dir`, if there is one.
+fn load_identity(dir: &Path) -> Result<Option<MachineKey>> {
+    let path = dir.join(IDENTITY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => zeroize::Zeroizing::new(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(RoduError::invalid(format!("Cannot read {}: {e}", path.display()))),
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| MachineKey::from_hex(text.trim()))
+        .map(Some)
+        .ok_or_else(|| {
+            RoduError::invalid(format!("{} does not hold a machine key", path.display()))
+        })
+}
+
+fn save_identity(dir: &Path, key: &MachineKey) -> Result<()> {
+    let path = dir.join(IDENTITY_FILE);
+    write_private_file(&path, &secret_line(&[key.to_hex().as_str(), "\n"]))
+        .map_err(|e| RoduError::invalid(format!("Cannot write {}: {e}", path.display())))
 }
 
 fn save_key(dir: &Path, key: &TeamKey) -> Result<()> {
@@ -80,38 +112,85 @@ fn team_folder(dir: &Path, team: &TeamConfig) -> Result<TeamFolder> {
     // The fix is in the message itself: the warnings before and after a command show no hint.
     const REJOIN: &str = "join the team again with the invite code, in a new folder";
     let key = load_key(dir).map_err(|e| RoduError::invalid(format!("{}; {REJOIN}", e.message)))?;
-    match (team.encrypted, key) {
-        (true, Some(key)) => {
-            Ok(TeamFolder::sealed(&team.folder, key).expecting(&team.workspace_id))
+    let folder = match (team.encrypted, key) {
+        (true, Some(key)) => TeamFolder::sealed(&team.folder, key).expecting(&team.workspace_id),
+        (false, None) => TeamFolder::new(&team.folder).expecting(&team.workspace_id),
+        (true, None) => {
+            return Err(RoduError::invalid(format!(
+                "this workspace's team key is missing ({}); {REJOIN}",
+                dir.join(KEY_FILE).display()
+            )));
         }
-        (false, None) => Ok(TeamFolder::new(&team.folder).expecting(&team.workspace_id)),
-        (true, None) => Err(RoduError::invalid(format!(
-            "this workspace's team key is missing ({}); {REJOIN}",
-            dir.join(KEY_FILE).display()
-        ))),
-        (false, Some(_)) => Err(RoduError::invalid(format!(
-            "{} is here, but this workspace syncs in plain",
-            dir.join(KEY_FILE).display()
-        ))),
-    }
-}
-
-/// `rodu1-<workspace id>`, then `.<key>` for an encrypted team.
-fn invite_code(workspace_id: &str, key: Option<&TeamKey>) -> zeroize::Zeroizing<String> {
-    zeroize::Zeroizing::new(match key {
-        Some(key) => format!("{INVITE_PREFIX}{workspace_id}.{}", key.to_hex().as_str()),
-        None => format!("{INVITE_PREFIX}{workspace_id}"),
-    })
-}
-
-/// The workspace id and, for an encrypted team, the key an invite code holds.
-fn parse_invite(code: &str) -> Option<(String, Option<TeamKey>)> {
-    let rest = code.trim().strip_prefix(INVITE_PREFIX)?;
-    let (id, key) = match rest.split_once('.') {
-        Some((id, key)) => (id, Some(TeamKey::from_hex(key)?)),
-        None => (rest, None),
+        (false, Some(_)) => {
+            return Err(RoduError::invalid(format!(
+                "{} is here, but this workspace syncs in plain",
+                dir.join(KEY_FILE).display()
+            )));
+        }
     };
-    is_uuid(id).then(|| (id.to_owned(), key))
+    let Some(root) = &team.signing else { return Ok(folder) };
+    let root = PublicKey::from_hex(root).ok_or_else(|| {
+        RoduError::invalid(format!("this workspace's root key is not a key; {REJOIN}"))
+    })?;
+    let identity = load_identity(dir)
+        .map_err(|e| RoduError::invalid(format!("{}; {REJOIN}", e.message)))?
+        .ok_or_else(|| {
+            RoduError::invalid(format!(
+                "this workspace's machine key is missing ({}); {REJOIN}",
+                dir.join(IDENTITY_FILE).display()
+            ))
+        })?;
+    Ok(folder.signed(identity, root))
+}
+
+/// `rodu1-<workspace id>`, then `.<key>` for an encrypted team; a signed team's is
+/// `rodu2-<workspace id>.<root public key>`, then `.<key>` for an encrypted one.
+fn invite_code(
+    workspace_id: &str,
+    root: Option<&str>,
+    key: Option<&TeamKey>,
+) -> zeroize::Zeroizing<String> {
+    let mut code = match root {
+        Some(root) => secret_line(&[SIGNED_INVITE_PREFIX, workspace_id, ".", root]),
+        None => secret_line(&[INVITE_PREFIX, workspace_id]),
+    };
+    if let Some(key) = key {
+        code = secret_line(&[code.as_str(), ".", key.to_hex().as_str()]);
+    }
+    code
+}
+
+/// What an invite code holds.
+struct Invite {
+    workspace_id: String,
+    /// A signed team's root key.
+    root: Option<PublicKey>,
+    /// An encrypted team's key.
+    key: Option<TeamKey>,
+}
+
+fn parse_invite(code: &str) -> Option<Invite> {
+    let code = code.trim();
+    let (root, rest) = match code.strip_prefix(SIGNED_INVITE_PREFIX) {
+        Some(rest) => {
+            let (id, after) = rest.split_once('.')?;
+            let (root, key) = match after.split_once('.') {
+                Some((root, key)) => (root, Some(key)),
+                None => (after, None),
+            };
+            (Some(PublicKey::from_hex(root)?), (id, key))
+        }
+        None => {
+            let rest = code.strip_prefix(INVITE_PREFIX)?;
+            (None, rest.split_once('.').map_or((rest, None), |(id, key)| (id, Some(key))))
+        }
+    };
+    let (id, key) = rest;
+    let key = match key {
+        Some(key) => Some(TeamKey::from_hex(key)?),
+        None => None,
+    };
+    is_uuid(id).then(|| Invite { workspace_id: id.to_owned(), root, key })
 }
 
 /// Runs the import check in a child process of this very executable.
@@ -445,18 +524,22 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
     let ws = open(io, false)?;
     match (&ws.config.team, ws.service.store.team()) {
         (Some(team), Some(store)) => {
+            // Like every command, it shows the team as of a sync: whether this machine was
+            // admitted, or numbering moved, is only known after one.
+            before(io, &ws);
+            after(io, &ws);
             (io.out)(&format!("Team folder: {}", team.folder));
             if !team.encrypted {
                 (io.out)("Encryption: off");
                 (io.out)(&format!(
                     "Invite code: {}",
-                    invite_code(&team.workspace_id, None).as_str()
+                    invite_code(&team.workspace_id, team.signing.as_deref(), None).as_str()
                 ));
             } else if args.flag("show-invite") {
                 (io.out)("Encryption: on");
                 let key = load_key(&ws.dir)?
                     .ok_or_else(|| RoduError::invalid("This workspace's team key is missing"))?;
-                let code = invite_code(&team.workspace_id, Some(&key));
+                let code = invite_code(&team.workspace_id, team.signing.as_deref(), Some(&key));
                 (io.out)(&secret_line(&["Invite code: ", code.as_str()]));
                 (io.out)("Keep it secret: it holds the team key.");
             } else {
@@ -467,6 +550,9 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
                 );
             }
             (io.out)(&format!("This machine: {:016x}", store.peer()));
+            if team.signing.is_some() {
+                (io.out)(&format!("Signing: on; {}", signing_state(&ws.dir, team, store)));
+            }
             (io.out)(if store.readable_copy()? {
                 "Readable copy: on (plain Markdown in the folder's readable/, never encrypted)"
             } else {
@@ -507,6 +593,14 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     };
     let mut principals = ws.service.store.list_principals()?;
     principals.sort_by(|a, b| a.name.cmp(&b.name));
+    // A signed team: which machines the root admitted, and which ask to join.
+    let signed = match &team.signing {
+        Some(_) => {
+            let folder = team_folder(&ws.dir, team)?;
+            Some((folder.admissions(store)?, folder.requests()?))
+        }
+        None => None,
+    };
     // Replica folders are named by peer id; anything else in sync/ is not a machine.
     let folders: BTreeSet<u64> = std::fs::read_dir(Path::new(&team.folder).join(SYNC_DIR))
         .into_iter()
@@ -534,9 +628,12 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
         }
         for peer in machines {
             claimed.insert(peer);
+            let waiting =
+                signed.as_ref().is_some_and(|(admitted, _)| !admitted.contains_key(&peer));
             let marks: Vec<&str> = [
                 (peer == store.peer()).then_some("this machine"),
                 (Some(peer) == numbering).then_some("numbers cards"),
+                waiting.then_some("waiting to be admitted"),
             ]
             .into_iter()
             .flatten()
@@ -557,10 +654,31 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
             (io.out)(&format!("  machine {}", short(peer)));
         }
     }
-    (io.out)(
-        "This list is what each machine says about itself; nothing proves it yet. Anyone who can \
-         write to the team folder can add to it.",
-    );
+    match &signed {
+        Some((admitted, requests)) => {
+            let asking: Vec<&JoinRequest> =
+                requests.iter().filter(|r| admitted.get(&r.peer) != Some(&r.key)).collect();
+            if !asking.is_empty() {
+                (io.out)("Asking to join (the team's creator admits with rodu team admit):");
+                for request in asking {
+                    (io.out)(&format!(
+                        "  {} (code {}, machine {})",
+                        request.name,
+                        request.key.code(),
+                        short(request.peer)
+                    ));
+                }
+            }
+            (io.out)(
+                "The team takes in changes only from machines its creator admitted, proven by \
+                 their signatures. Which person a machine belongs to is what that machine says.",
+            );
+        }
+        None => (io.out)(
+            "This list is what each machine says about itself; nothing proves it yet. Anyone who \
+             can write to the team folder can add to it.",
+        ),
+    }
     after(io, &ws);
     Ok(())
 }
@@ -571,6 +689,104 @@ fn short_peer(peer: u64, all: &BTreeSet<u64>) -> String {
     let full = format!("{peer:016x}");
     let shared = all.iter().any(|other| *other != peer && other >> 32 == peer >> 32);
     if shared { full } else { full[..8].to_owned() }
+}
+
+/// `rodu team admit [<name> <code>]`: on the machine that created a signed team, lists the
+/// machines asking to join, or admits one. The code is the one the person's machine printed when
+/// it joined, read out by them, so a request someone planted in the folder under their name is
+/// never admitted by mistake.
+pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String>) -> Result<()> {
+    let ws = open(io, false)?;
+    let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else {
+        return Err(RoduError::invalid("This is not a team workspace"));
+    };
+    if team.signing.is_none() {
+        return Err(RoduError::invalid(
+            "This team does not sign its files: anyone with the invite code takes part",
+        )
+        .with_hint("A team that admits each machine is made with: rodu team create --signed"));
+    }
+    before(io, &ws);
+    let folder = team_folder(&ws.dir, team)?;
+    let admitted = folder.admissions(store)?;
+    let waiting: Vec<JoinRequest> =
+        folder.requests()?.into_iter().filter(|r| admitted.get(&r.peer) != Some(&r.key)).collect();
+    let (Some(name), Some(code)) = (name, code) else {
+        if name.is_some() {
+            return Err(RoduError::invalid(
+                "Give the machine's code too: rodu team admit <name> <code>",
+            )
+            .with_hint("The person sees it when they join, and in: rodu team"));
+        }
+        if waiting.is_empty() {
+            (io.out)("No machine is waiting to be admitted");
+        }
+        for request in &waiting {
+            (io.out)(&format!(
+                "{}  code {}  machine {:016x}",
+                request.name,
+                request.key.code(),
+                request.peer
+            ));
+        }
+        if !waiting.is_empty() {
+            (io.out)(
+                "Check each code with the person yourself, then: rodu team admit <name> <code>",
+            );
+        }
+        return Ok(());
+    };
+    let code = code.trim().to_ascii_lowercase();
+    let matching: Vec<&JoinRequest> =
+        waiting.iter().filter(|r| r.name == *name && r.key.code() == code).collect();
+    let request = match matching.as_slice() {
+        [request] => *request,
+        [] => {
+            return Err(RoduError::not_found(format!(
+                "No machine asking to join as {} has code {}",
+                name.escape_debug(),
+                code.escape_debug()
+            ))
+            .with_hint(
+                "rodu team admit lists the machines waiting; the code must be the one the \
+                        person sees",
+            ));
+        }
+        _ => {
+            return Err(RoduError::conflict(format!(
+                "More than one machine asking to join as {} has that code",
+                name.escape_debug()
+            )));
+        }
+    };
+    folder.admit(store, request)?;
+    after(io, &ws);
+    (io.out)(&format!(
+        "Admitted {}'s machine {:016x}; each machine takes in its changes when it next syncs",
+        request.name, request.peer
+    ));
+    Ok(())
+}
+
+/// Where this machine stands in a signed team.
+fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
+    let (Ok(Some(identity)), Some(root)) = (load_identity(dir), team.signing.as_deref()) else {
+        return "this machine's key is missing".to_owned();
+    };
+    let code = identity.public().code();
+    if identity.public().to_hex() == root {
+        return format!("this machine created the team and admits others (code {code})");
+    }
+    match team_folder(dir, team).and_then(|folder| folder.admissions(store)) {
+        Ok(admitted) if admitted.get(&store.peer()) == Some(&identity.public()) => {
+            format!("this machine is admitted (code {code})")
+        }
+        Ok(_) => format!(
+            "this machine waits to be admitted (code {code}); the team's creator runs: \
+             rodu team admit <your name> {code}"
+        ),
+        Err(e) => format!("could not read the team folder ({}) (code {code})", e.message),
+    }
 }
 
 fn folder_arg(io: &Io<'_>, args: &Args) -> Result<PathBuf> {
@@ -610,6 +826,7 @@ fn save_config(dir: &Path, config: &Config) -> Result<()> {
 pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     let folder_path = folder_arg(io, args)?;
     let encrypted = encryption_choice(args)?;
+    let signed = args.flag("signed");
     let ws = open(io, false)?;
     if let Some(team) = &ws.config.team {
         return Err(RoduError::conflict(format!(
@@ -646,6 +863,12 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
                 "A team create stopped half way here: run it again with {was}"
             )));
         }
+        if resumed.is_some() && info.root().is_some() != signed {
+            let was = if signed { "without --signed" } else { "with --signed" };
+            return Err(RoduError::conflict(format!(
+                "A team create stopped half way here: run it again {was}"
+            )));
+        }
         match resumed {
             Some(peer) if wrote_alone(&folder_path, peer) => info.workspace_id,
             _ => {
@@ -666,14 +889,39 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     {
         save_key(&dir, key)?;
     }
-    let code = invite_code(&workspace_id, key.as_ref());
+    // This machine's key is the signed team's root; one a create that stopped half way left is
+    // carried on with.
+    let identity = match (signed, load_identity(&dir)?) {
+        (false, _) => None,
+        (true, Some(identity)) => Some(identity),
+        (true, None) => {
+            let identity = MachineKey::generate()?;
+            save_identity(&dir, &identity)?;
+            Some(identity)
+        }
+    };
+    let root = identity.as_ref().map(|identity| identity.public().to_hex());
+    let code = invite_code(&workspace_id, root.as_deref(), key.as_ref());
     let store = if resumed.is_some() { LoroStore::open(&dir)? } else { LoroStore::adopt(&dir)? };
     let folder = match key {
         Some(key) => TeamFolder::sealed(&folder_path, key),
         None => TeamFolder::new(&folder_path),
     }
     .expecting(&workspace_id);
+    let folder = match identity {
+        Some(identity) => {
+            let root = identity.public();
+            folder.signed(identity, root)
+        }
+        None => folder,
+    };
     folder.create(&workspace_id, store.peer())?;
+    if let Some(root) = root.as_deref().and_then(PublicKey::from_hex) {
+        // The root admits its own machine too, so every machine of a signed team is listed the
+        // same way.
+        let me = JoinRequest { peer: store.peer(), name: String::new(), key: root };
+        folder.admit(&store, &me)?;
+    }
     store.set_numbering_peer(store.peer())?;
     store.set_member(store.peer(), &config.user_id)?;
     let readable_copy = args.flag("readable-copy");
@@ -687,6 +935,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
         workspace_id: workspace_id.clone(),
         numbering: true,
         encrypted,
+        signing: root,
     });
     save_config(&dir, &config)?;
     (io.out)(&format!("This workspace now syncs through {}", folder_path.display()));
@@ -709,6 +958,13 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
         ]));
         (io.out)(
             "The sync files are not encrypted: anyone with access to the folder can read them.",
+        );
+    }
+    if signed {
+        (io.out)(
+            "Signing is on: each teammate's machine asks to join, and the team takes in its \
+             changes only once this machine admits it with: rodu team admit <name> <code>. Check \
+             the code with the teammate yourself, not through the folder.",
         );
     }
     if readable_copy {
@@ -792,7 +1048,7 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
         }
         other => other,
     };
-    let (workspace_id, key) = code.and_then(parse_invite).ok_or_else(|| {
+    let Invite { workspace_id, root, key } = code.and_then(parse_invite).ok_or_else(|| {
         RoduError::invalid("team join needs an invite code such as rodu1-0190…")
             .with_hint("The teammate who created the team sees it in: rodu team --show-invite")
     })?;
@@ -818,7 +1074,22 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
             folder_path.display()
         )));
     }
-    // The key is checked before anything is written.
+    // The root key and the team key are checked before anything is written. The root comes from
+    // the invite code, never from the folder.
+    match (root, info.root()) {
+        (None, None) => {}
+        (Some(root), Some(named)) if root == named => {}
+        (Some(_), _) => {
+            return Err(RoduError::invalid("The invite code's root key is not this team's")
+                .with_hint("Ask for the invite code again: rodu team --show-invite"));
+        }
+        (None, Some(_)) => {
+            return Err(RoduError::invalid(
+                "This team signs its files: the invite code needs its root key (rodu2-…)",
+            )
+            .with_hint("Ask for the invite code again: rodu team --show-invite"));
+        }
+    }
     let key_hex = key.as_ref().map(TeamKey::to_hex);
     let folder = match (info.key_check.as_deref(), key) {
         (None, None) => TeamFolder::new(&folder_path).expecting(&workspace_id),
@@ -851,12 +1122,14 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
             dir.display()
         )));
     }
-    // A failed join removes the key file it wrote; one that was there before is not its own.
-    if dir.join(KEY_FILE).exists() {
-        return Err(RoduError::conflict(format!(
-            "{} is already there: move it away to join here",
-            dir.join(KEY_FILE).display()
-        )));
+    // A failed join removes the key files it wrote; one that was there before is not its own.
+    for file in [KEY_FILE, IDENTITY_FILE] {
+        if dir.join(file).exists() {
+            return Err(RoduError::conflict(format!(
+                "{} is already there: move it away to join here",
+                dir.join(file).display()
+            )));
+        }
     }
     if find_dir(io).is_some_and(|found| found != dir) {
         // Not an error: a workspace inside another one is allowed, but say which one this is.
@@ -865,11 +1138,22 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
     let existed = dir.exists();
     create_private_dir(&dir)
         .map_err(|e| RoduError::invalid(format!("Cannot create {}: {e}", dir.display())))?;
-    let result = join_into(io, &dir, &folder, &folder_path, who, workspace_id, key_hex);
+    let signing = match root {
+        Some(root) => Some((MachineKey::generate()?, root)),
+        None => None,
+    };
+    let result = join_into(io, &dir, folder, &folder_path, who, workspace_id, key_hex, signing);
     if result.is_err() {
         // Only what this join made, so it can simply be run again.
-        let made =
-            ["rodu.db", "rodu.db-wal", "rodu.db-shm", "rodu.loro", "config.json.tmp", KEY_FILE];
+        let made = [
+            "rodu.db",
+            "rodu.db-wal",
+            "rodu.db-shm",
+            "rodu.loro",
+            "config.json.tmp",
+            KEY_FILE,
+            IDENTITY_FILE,
+        ];
         for file in made {
             let _ = std::fs::remove_file(dir.join(file));
         }
@@ -927,19 +1211,29 @@ fn join_principals(service: &RoduService<AnyStore>, who: Joining<'_>) -> Result<
     Ok((found.id.clone(), agent))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn join_into(
     io: &mut Io<'_>,
     dir: &Path,
-    folder: &TeamFolder,
+    folder: TeamFolder,
     folder_path: &Path,
     who: Joining<'_>,
     workspace_id: String,
     key_hex: Option<zeroize::Zeroizing<String>>,
+    signing: Option<(MachineKey, PublicKey)>,
 ) -> Result<()> {
     if let Some(hex) = &key_hex {
         let key = TeamKey::from_hex(hex).expect("a key from the invite code");
         save_key(dir, &key)?;
     }
+    let (folder, signed) = match signing {
+        Some((identity, root)) => {
+            save_identity(dir, &identity)?;
+            let code = identity.public().code();
+            (folder.signed(identity, root), Some((root.to_hex(), code)))
+        }
+        None => (folder, None),
+    };
     let db = dir.join("rodu.db");
     write_private_file(&db, "")
         .map_err(|e| RoduError::invalid(format!("Cannot create {}: {e}", db.display())))?;
@@ -967,13 +1261,25 @@ fn join_into(
                 workspace_id,
                 numbering: false,
                 encrypted: key_hex.is_some(),
+                signing: signed.as_ref().map(|(root, _)| root.clone()),
             }),
         })
     })?;
     folder.push(store)?;
-    save_config(dir, &config)?;
     let (Joining::New(name) | Joining::As(name)) = who;
+    if signed.is_some() {
+        folder.write_request(store.peer(), name)?;
+    }
+    save_config(dir, &config)?;
     (io.out)(&format!("Joined the team at {} as {name}", dir.display()));
+    if let Some((_, code)) = signed {
+        (io.out)(&format!("This machine's code: {code}"));
+        (io.out)(&format!(
+            "The team does not take in your changes until the machine that created it admits this \
+             one. Tell its owner your code yourself (not through the team folder) and ask them to \
+             run: rodu team admit {name} {code}"
+        ));
+    }
     Ok(())
 }
 
@@ -991,6 +1297,7 @@ mod tests {
                 workspace_id: "w".into(),
                 numbering,
                 encrypted: false,
+                signing: None,
             }),
         };
         let store = AnyStore::Team(Box::new(LoroStore::open(dir).unwrap()));

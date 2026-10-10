@@ -37,10 +37,11 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
   team [--show-invite]       where this workspace syncs, and its invite code
-  team create --folder <shared folder> --encrypt|--no-encrypt [--readable-copy]   share this workspace with a team
+  team create --folder <shared folder> --encrypt|--no-encrypt [--readable-copy] [--signed]   share this workspace with a team (--signed: you admit each machine)
   team join <invite code|-> --folder <shared folder> --name <you>   join a team here (- reads the code from stdin)
   team join <invite code|-> --folder <shared folder> --as <your name>   join from another machine of yours
   team members               who is on the team, their agents and machines
+  team admit [<name> <code>]  signed team: list machines asking to join, or admit one
   team take-numbering --yes   number the team's cards here, when the machine that did is gone for good
   team readable-copy on|off   keep a plain Markdown copy of the board in the team folder (never encrypted)
   sync                       sync with the team folder now (every command also does)
@@ -92,8 +93,17 @@ const STRING_OPTIONS: &[&str] = &[
     "folder",
     "as",
 ];
-const BOOL_OPTIONS: &[&str] =
-    &["no-open", "version", "help", "encrypt", "no-encrypt", "show-invite", "yes", "readable-copy"];
+const BOOL_OPTIONS: &[&str] = &[
+    "no-open",
+    "version",
+    "help",
+    "encrypt",
+    "no-encrypt",
+    "show-invite",
+    "yes",
+    "readable-copy",
+    "signed",
+];
 
 #[derive(Debug, Default)]
 struct Args {
@@ -348,12 +358,13 @@ async fn command_result(
             Some("create") => team::create(io, args).map(|()| 0),
             Some("join") => team::join(io, args, rest.get(1)).map(|()| 0),
             Some("members") => team::members(io).map(|()| 0),
+            Some("admit") => team::admit(io, rest.get(1), rest.get(2)).map(|()| 0),
             Some("take-numbering") => team::take_numbering(io, args).map(|()| 0),
             Some("readable-copy") => team::readable_copy(io, rest.get(1)).map(|()| 0),
             Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
                 .with_hint(
                     "rodu team, rodu team create, rodu team join, rodu team members, \
-                     rodu team take-numbering, rodu team readable-copy",
+                     rodu team admit, rodu team take-numbering, rodu team readable-copy",
                 )),
         },
         "sync" => team::sync(io).map(|()| 0),

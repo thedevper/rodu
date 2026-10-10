@@ -8,8 +8,11 @@
 //!
 //! An encrypted team's team file is format 2 and adds `"encryption": "xchacha20poly1305"` and
 //! `"keyCheck"`; its files are framed as `RODU-SEALED1` and their payload is sealed (see
-//! [`crate::seal`]). Which kind a workspace syncs is its own setting, never the folder's: a folder
-//! that does not match it is refused, so a changed team file cannot make it write plain files.
+//! [`crate::seal`]). A signed team's team file is format 3: `"signing": "ed25519"` and `"root"`,
+//! the root public key, plus the encryption fields when it is also encrypted; each payload is
+//! signed before it is sealed (see [`crate::sign`]). Which kind a workspace syncs is its own
+//! setting, never the folder's: a folder that does not match it is refused, so a changed team file
+//! cannot make it write plain or unsigned files, or trust another root key.
 //!
 //! Each replica writes only under its own peer folder, and each file holds only that replica's
 //! own operations, framed as `RODU-UPDATE1`, the payload's length (u64 LE), its SHA-256, then the
@@ -18,6 +21,7 @@
 //! untrusted: names are parsed, never joined into paths, links and dotfiles are skipped, and the
 //! payloads go through [`LoroStore::import_batch`].
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::seal::{self, TeamKey};
+use crate::sign::{self, MachineKey, PublicKey};
 use crate::{BatchReport, Checker, Incoming, LoroStore, MAX_IMPORT_BYTES};
 
 pub const TEAM_FILE: &str = "rodu-team.json";
@@ -34,9 +39,14 @@ pub const SYNC_DIR: &str = "sync";
 const MAGIC: &[u8; 12] = b"RODU-UPDATE1";
 const SEALED_MAGIC: &[u8; 12] = b"RODU-SEALED1";
 const HEADER: usize = MAGIC.len() + 8 + 32;
-/// What sealing adds to a payload: the nonce and the tag.
-const SEAL_OVERHEAD: usize = seal::NONCE_LEN + 16;
+/// What sealing and signing add to a payload: the nonce and the tag, the key and the signature.
+const SEAL_OVERHEAD: usize = seal::NONCE_LEN + 16 + sign::OVERHEAD;
 const SUFFIX: &str = ".update";
+/// A signed team: a machine's request to join, in its replica folder; sealed for an encrypted team.
+const REQUEST_PLAIN: &str = "request.json";
+const REQUEST_SEALED: &str = "request.sealed";
+/// The largest request read.
+const MAX_REQUEST: u64 = 4096;
 /// A replica compacts its own files once it wrote this many since it last did.
 const COMPACT_AT: usize = 32;
 
@@ -52,11 +62,22 @@ pub struct TeamInfo {
     /// Format 2: [`TeamKey::check`] of the team key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_check: Option<String>,
+    /// Format 3: [`sign::ALGORITHM`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing: Option<String>,
+    /// Format 3: the root public key, 64 hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 impl TeamInfo {
     pub fn encrypted(&self) -> bool {
-        self.format == 2
+        self.key_check.is_some()
+    }
+
+    /// The root key of a signed team (format 3).
+    pub fn root(&self) -> Option<PublicKey> {
+        self.root.as_deref().and_then(PublicKey::from_hex)
     }
 }
 
@@ -133,12 +154,76 @@ pub struct Pushed {
 pub struct PullReport {
     /// Files still arriving, left for next time.
     pub incomplete: Vec<String>,
-    /// Files that are not sync files or are damaged.
+    /// Files that are not sync files or are damaged, including, in a signed team, files whose
+    /// signature does not verify or is not the key admitted for their replica.
     pub damaged: Vec<String>,
+    /// Signed team: replica folders holding files from a machine not admitted yet, with how many
+    /// files wait. They are read again on every pull.
+    pub awaiting: Vec<(u64, usize)>,
     /// Replicas whose files this machine dealt with are gone, with no newer file in their place
     /// yet: a compacted file still arriving. Said on every pull until it arrives.
     pub missing: Vec<String>,
     pub batch: BatchReport,
+}
+
+/// What a request file holds.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestFile {
+    format: u32,
+    name: String,
+    public_key: String,
+    signature: String,
+}
+
+/// A machine asking to join a signed team, as its own key signed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinRequest {
+    pub peer: u64,
+    pub name: String,
+    pub key: PublicKey,
+}
+
+/// A name a person can have: what `rodu_core` accepts for a principal.
+fn is_person_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.len() <= 40
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// What a signed team does with a file.
+enum Verdict<'a> {
+    Accept(&'a [u8]),
+    /// From a machine not admitted yet.
+    Await,
+    Damaged(&'static str),
+}
+
+impl PullReport {
+    /// A pull that read the folder twice: what either pass took in or reported once, and what
+    /// is still pending as the second pass found it.
+    fn then(self, second: PullReport) -> PullReport {
+        let mut batch = second.batch;
+        let mut imported = self.batch.imported;
+        for key in batch.imported {
+            if !imported.contains(&key) {
+                imported.push(key);
+            }
+        }
+        batch.imported = imported;
+        batch.refused.splice(0..0, self.batch.refused);
+        batch.notes.splice(0..0, self.batch.notes);
+        let (index, first) = (&mut batch.index, self.batch.index);
+        index.items.splice(0..0, first.items);
+        index.comments.splice(0..0, first.comments);
+        index.links.splice(0..0, first.links);
+        index.problems.splice(0..0, first.problems);
+        index.conflicts.splice(0..0, first.conflicts);
+        let mut damaged = self.damaged;
+        damaged.extend(second.damaged);
+        PullReport { damaged, batch, ..second }
+    }
 }
 
 pub struct TeamFolder {
@@ -151,6 +236,8 @@ pub struct TeamFolder {
     /// Compaction: after how many files, and the largest payload a compacted file may hold.
     compact_at: usize,
     compact_max: usize,
+    /// A signed team: this machine's key, and the team's root key.
+    signing: Option<(MachineKey, PublicKey)>,
 }
 
 /// The path holds untrusted names from the folder and ends up in a terminal: control
@@ -220,7 +307,15 @@ impl TeamFolder {
             workspace_id: None,
             compact_at: COMPACT_AT,
             compact_max: MAX_IMPORT_BYTES,
+            signing: None,
         }
+    }
+
+    /// Signs every file with `key`, and accepts only files signed by `root` or by a machine
+    /// `root` admitted for the replica folder they are in.
+    pub fn signed(mut self, key: MachineKey, root: PublicKey) -> Self {
+        self.signing = Some((key, root));
+        self
     }
 
     /// The folder of an encrypted team with key `key`.
@@ -257,16 +352,22 @@ impl TeamFolder {
         let text = fs::read_to_string(&path).map_err(|e| folder_error(&path, e))?;
         let info: TeamInfo = serde_json::from_str(&text)
             .map_err(|_| folder_error(&path, "is not a Rodu team file"))?;
+        let sealed = info.encryption.as_deref() == Some(seal::ALGORITHM)
+            && info.key_check.as_ref().is_some_and(|c| {
+                c.len() == 64 && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            });
+        let plain = info.encryption.is_none() && info.key_check.is_none();
+        let unsigned = info.signing.is_none() && info.root.is_none();
         let well_formed = match info.format {
-            1 => info.encryption.is_none() && info.key_check.is_none(),
-            2 => {
-                info.encryption.as_deref() == Some(seal::ALGORITHM)
-                    && info.key_check.as_ref().is_some_and(|c| {
-                        c.len() == 64 && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-                    })
+            1 => plain && unsigned,
+            2 => sealed && unsigned,
+            3 => {
+                (plain || sealed)
+                    && info.signing.as_deref() == Some(sign::ALGORITHM)
+                    && info.root().is_some()
             }
             format => {
-                return Err(folder_error(&path, format!("has format {format}, not 1 or 2"))
+                return Err(folder_error(&path, format!("has format {format}, not 1, 2 or 3"))
                     .with_hint("Update rodu"));
             }
         };
@@ -283,6 +384,27 @@ impl TeamFolder {
         let path = self.root.join(TEAM_FILE);
         if self.workspace_id.as_ref().is_some_and(|id| *id != info.workspace_id) {
             return Err(folder_error(&path, "names another team than this workspace's"));
+        }
+        match (&self.signing, info.root()) {
+            (None, None) => {}
+            (Some((_, root)), Some(named)) if *root == named => {}
+            (Some(_), Some(_)) => {
+                return Err(folder_error(&path, "names another root key than this workspace's")
+                    .with_hint("Join again with the team's invite code"));
+            }
+            (Some(_), None) => {
+                return Err(folder_error(
+                    &path,
+                    "is not a signed team, and this workspace is: nothing is synced unsigned",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(folder_error(
+                    &path,
+                    "is a signed team, and this workspace has no key for it",
+                )
+                .with_hint("Join again with the team's invite code"));
+            }
         }
         match (&self.key, info.key_check.as_deref()) {
             (None, None) => Ok(info),
@@ -322,10 +444,16 @@ impl TeamFolder {
         let own = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
         fs::create_dir_all(&own).map_err(|e| folder_error(&self.root, e))?;
         let info = TeamInfo {
-            format: if self.key.is_some() { 2 } else { 1 },
+            format: match (&self.signing, &self.key) {
+                (Some(_), _) => 3,
+                (None, Some(_)) => 2,
+                (None, None) => 1,
+            },
             workspace_id: workspace_id.to_owned(),
             encryption: self.key.as_ref().map(|_| seal::ALGORITHM.to_owned()),
             key_check: self.key.as_ref().map(TeamKey::check),
+            signing: self.signing.as_ref().map(|_| sign::ALGORITHM.to_owned()),
+            root: self.signing.as_ref().map(|(_, root)| root.to_hex()),
         };
         let text = serde_json::to_string_pretty(&info).expect("team info serializes");
         write_new(&self.root, &path, format!("{text}\n").as_bytes())
@@ -355,8 +483,16 @@ impl TeamFolder {
         Ok(Pushed { written, warnings })
     }
 
-    /// A payload framed, and sealed first for an encrypted team.
+    /// A payload framed: signed first for a signed team, then sealed for an encrypted one.
     fn framed(&self, info: &TeamInfo, peer: u64, payload: &[u8]) -> Result<Vec<u8>> {
+        let signed;
+        let payload = match &self.signing {
+            Some((key, _)) => {
+                signed = key.sign_file(self.team_id(info), peer, payload);
+                &signed[..]
+            }
+            None => payload,
+        };
         Ok(match &self.key {
             Some(key) => {
                 frame_as(SEALED_MAGIC, &seal::seal(key, self.team_id(info), peer, payload)?)
@@ -413,9 +549,154 @@ impl TeamFolder {
         }
     }
 
-    /// Imports every complete file other replicas wrote that this one has not dealt with yet.
+    /// Signed team: writes this machine's request to join under `name` into its replica folder.
+    pub fn write_request(&self, peer: u64, name: &str) -> Result<()> {
+        let info = self.checked_info()?;
+        let Some((key, _)) = &self.signing else {
+            return Err(RoduError::internal("only a signed team takes requests to join"));
+        };
+        let request = RequestFile {
+            format: 1,
+            name: name.to_owned(),
+            public_key: key.public().to_hex(),
+            signature: key.sign_request(self.team_id(&info), peer, name),
+        };
+        let json = serde_json::to_vec(&request).expect("a request serializes");
+        let (file, bytes) = match &self.key {
+            Some(team) => (REQUEST_SEALED, seal::seal(team, self.team_id(&info), peer, &json)?),
+            None => (REQUEST_PLAIN, json),
+        };
+        let dir = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
+        fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
+        write_new(&dir, &dir.join(file), &bytes)
+    }
+
+    /// Signed team: the requests to join in the folder whose signature verifies. Anything else
+    /// (a link, an oversize, damaged or unsigned file, a bad name) is skipped.
+    pub fn requests(&self) -> Result<Vec<JoinRequest>> {
+        let info = self.checked_info()?;
+        let file = if self.key.is_some() { REQUEST_SEALED } else { REQUEST_PLAIN };
+        let sync = self.root.join(SYNC_DIR);
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&sync).map_err(|e| folder_error(&sync, e))? {
+            let entry = entry.map_err(|e| folder_error(&sync, e))?;
+            let Some(peer) = entry.file_name().to_str().and_then(parse_peer_dir) else { continue };
+            let path = entry.path().join(file);
+            let plain_file = fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+            let Some(bytes) =
+                plain_file.then(|| read_at_most(&path, MAX_REQUEST).ok()).flatten().flatten()
+            else {
+                continue;
+            };
+            let json = match &self.key {
+                Some(team) => match seal::open(team, self.team_id(&info), peer, &bytes) {
+                    Some(json) => json,
+                    None => continue,
+                },
+                None => bytes,
+            };
+            let Ok(request) = serde_json::from_slice::<RequestFile>(&json) else { continue };
+            let Some(key) = PublicKey::from_hex(&request.public_key) else { continue };
+            if request.format == 1
+                && is_person_name(&request.name)
+                && sign::check_request(
+                    &key,
+                    self.team_id(&info),
+                    peer,
+                    &request.name,
+                    &request.signature,
+                )
+            {
+                found.push(JoinRequest { peer, name: request.name, key });
+            }
+        }
+        found.sort_by(|a, b| (&a.name, a.peer).cmp(&(&b.name, b.peer)));
+        Ok(found)
+    }
+
+    /// Signed team: the machines the team document admits, by peer.
+    pub fn admissions(&self, store: &LoroStore) -> Result<BTreeMap<u64, PublicKey>> {
+        let info = self.checked_info()?;
+        self.admitted(store, &info)
+    }
+
+    /// Signed team, on the root machine: admits `request` by writing the root's signed record into
+    /// the team document; the next push sends it.
+    pub fn admit(&self, store: &LoroStore, request: &JoinRequest) -> Result<()> {
+        let info = self.checked_info()?;
+        match &self.signing {
+            Some((key, root)) if key.public() == *root => store.set_admission(
+                request.peer,
+                &key.admit(self.team_id(&info), request.peer, &request.key),
+            ),
+            _ => {
+                Err(RoduError::invalid("Only the machine that created the team can admit machines"))
+            }
+        }
+    }
+
+    /// Imports every complete file other replicas wrote that this one has not dealt with yet. In
+    /// a signed team, a pull that brings in an admission for a machine whose files were waiting
+    /// reads the folder once more, so they land now rather than on the next command.
     pub fn pull(&self, store: &LoroStore, checker: &Checker) -> Result<PullReport> {
         let info = self.checked_info()?;
+        let admitted = self.admitted(store, &info)?;
+        let first = self.pull_once(store, checker, &info, &admitted)?;
+        if first.awaiting.is_empty() {
+            return Ok(first);
+        }
+        let now = self.admitted(store, &info)?;
+        if !first.awaiting.iter().any(|(peer, _)| now.contains_key(peer)) {
+            return Ok(first);
+        }
+        let second = self.pull_once(store, checker, &info, &now)?;
+        Ok(first.then(second))
+    }
+
+    /// The machines the team document admits, by peer: only records the root key signed for this
+    /// team. Empty for a team that does not sign.
+    fn admitted(&self, store: &LoroStore, info: &TeamInfo) -> Result<BTreeMap<u64, PublicKey>> {
+        let Some((_, root)) = &self.signing else { return Ok(BTreeMap::new()) };
+        let team = self.team_id(info);
+        Ok(store
+            .admissions()?
+            .into_iter()
+            .filter_map(|(peer, record)| {
+                sign::check_admission(root, team, peer, &record).map(|key| (peer, key))
+            })
+            .collect())
+    }
+
+    /// What a signed team does with a file's payload once it is unframed and opened: its Loro
+    /// update when the root key, or the key admitted for `peer`, signed it.
+    fn verify<'a>(
+        &self,
+        info: &TeamInfo,
+        admitted: &BTreeMap<u64, PublicKey>,
+        peer: u64,
+        payload: &'a [u8],
+    ) -> Verdict<'a> {
+        let Some((_, root)) = &self.signing else { return Verdict::Accept(payload) };
+        let Some((signer, update)) = sign::open_file(self.team_id(info), peer, payload) else {
+            return Verdict::Damaged("is not signed, or its signature does not verify");
+        };
+        match admitted.get(&peer) {
+            _ if signer == *root => Verdict::Accept(update),
+            Some(key) if *key == signer => Verdict::Accept(update),
+            Some(_) => Verdict::Damaged("is signed by another key than the one admitted for it"),
+            None => Verdict::Await,
+        }
+    }
+
+    fn pull_once(
+        &self,
+        store: &LoroStore,
+        checker: &Checker,
+        info: &TeamInfo,
+        admitted: &BTreeMap<u64, PublicKey>,
+    ) -> Result<PullReport> {
+        let info = info.clone();
+        let mut awaiting: BTreeMap<u64, usize> = BTreeMap::new();
         let magic = if self.key.is_some() { SEALED_MAGIC } else { MAGIC };
         let sync = self.root.join(SYNC_DIR);
         let mut report = PullReport::default();
@@ -480,28 +761,39 @@ impl TeamFolder {
                 };
                 let key = format!("{shown}/{}", hex::encode(Sha256::digest(&bytes)));
                 read.push((key.clone(), stat, peer, own_seq(&name)));
-                // A sealed payload is opened, and so authenticated, here; the plaintext then goes
-                // through the import check like a plain one.
+                // A sealed payload is opened, and so authenticated, here, and a signed one has its
+                // signature checked; the Loro update then goes through the import check like a
+                // plain one.
+                let sealed;
                 let opened = match unframe_as(magic, &bytes) {
                     Frame::Complete(payload) => match &self.key {
-                        None => Frame::Complete(payload),
+                        None => Ok(payload),
                         Some(team) => match seal::open(team, self.team_id(&info), peer, payload) {
                             Some(plain) => {
-                                incoming.push(Incoming { peer, key, bytes: plain });
-                                continue;
+                                sealed = plain;
+                                Ok(&sealed[..])
                             }
-                            None => Frame::Damaged("does not open with the team key"),
+                            None => Err("does not open with the team key"),
                         },
                     },
-                    other => other,
-                };
-                match opened {
-                    Frame::Complete(payload) => {
-                        incoming.push(Incoming { peer, key, bytes: payload.to_vec() })
+                    Frame::Incomplete => {
+                        report.incomplete.push(shown);
+                        continue;
                     }
-                    Frame::Incomplete => report.incomplete.push(shown),
+                    Frame::Damaged(why) => Err(why),
+                };
+                let verdict = match opened {
+                    Ok(payload) => self.verify(&info, admitted, peer, payload),
+                    Err(why) => Verdict::Damaged(why),
+                };
+                match verdict {
+                    Verdict::Accept(update) => {
+                        incoming.push(Incoming { peer, key, bytes: update.to_vec() })
+                    }
+                    // Not remembered as done: read again until the machine is admitted.
+                    Verdict::Await => *awaiting.entry(peer).or_default() += 1,
                     // Reported once; the same name with other bytes is a new file.
-                    Frame::Damaged(why) => {
+                    Verdict::Damaged(why) => {
                         if !store.sync_seen(&key)? {
                             store.mark_sync_seen(&key)?;
                             report.damaged.push(format!("{shown}: {why}"));
@@ -510,6 +802,7 @@ impl TeamFolder {
                 }
             }
         }
+        report.awaiting = awaiting.into_iter().collect();
         report.batch = store.import_batch(&incoming, checker)?;
         // Landed, refused or reported: never read again while its name, size and time hold.
         // A file still waiting for other operations is not, so it is read again next time.
@@ -610,7 +903,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn team_files_of_format_1_and_2_are_read_only_when_well_formed() {
+    fn team_files_of_formats_1_to_3_are_read_only_when_well_formed() {
         let dir = tempfile::tempdir().unwrap();
         let folder = TeamFolder::new(dir.path());
         let ws = r#""workspaceId":"0190aaaa-0000-7000-8000-00000000000a""#;
@@ -628,7 +921,7 @@ mod tests {
             std::fs::write(dir.path().join(TEAM_FILE), &text).unwrap();
             assert_eq!(folder.info().is_ok(), ok, "{text}");
         }
-        std::fs::write(dir.path().join(TEAM_FILE), format!("{{\"format\":3,{ws}}}")).unwrap();
+        std::fs::write(dir.path().join(TEAM_FILE), format!("{{\"format\":4,{ws}}}")).unwrap();
         assert_eq!(folder.info().unwrap_err().hint.as_deref(), Some("Update rodu"));
     }
 
