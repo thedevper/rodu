@@ -48,6 +48,7 @@ const FILE_DOMAIN: &[u8] = b"rodu-sync-sign-1\0";
 const ADMIT_DOMAIN: &[u8] = b"rodu-admit-1\0";
 const REQUEST_DOMAIN: &[u8] = b"rodu-request-1\0";
 const AUTHORITY_DOMAIN: &[u8] = b"rodu-authority-1\0";
+const SEEN_DOMAIN: &[u8] = b"rodu-seen-1\0";
 
 /// Exactly `2 * N` lowercase hex digits.
 fn from_hex<const N: usize>(text: &str) -> Option<Zeroizing<[u8; N]>> {
@@ -86,6 +87,13 @@ fn authority_message(workspace_id: &str, text: &str) -> Vec<u8> {
     message.extend(AUTHORITY_DOMAIN);
     message.extend((workspace_id.len() as u64).to_le_bytes());
     message.extend(workspace_id.as_bytes());
+    message.extend((text.len() as u64).to_le_bytes());
+    message.extend(text.as_bytes());
+    message
+}
+
+fn seen_message(workspace_id: &str, peer: u64, text: &str) -> Vec<u8> {
+    let mut message = with_team(SEEN_DOMAIN, workspace_id, peer);
     message.extend((text.len() as u64).to_le_bytes());
     message.extend(text.as_bytes());
     message
@@ -200,6 +208,12 @@ impl MachineKey {
         )
     }
 
+    /// This key's signature, 128 hex, on what the machine writing as `peer` says it holds of
+    /// removed machines (`text`, in its replica folder's seen file).
+    pub fn sign_seen(&self, workspace_id: &str, peer: u64, text: &str) -> String {
+        hex::encode(self.0.sign(&seen_message(workspace_id, peer, text)).to_bytes())
+    }
+
     /// This key's signature, 128 hex, on an authority record's text up to its signer key.
     pub fn sign_authority(&self, workspace_id: &str, text: &str) -> String {
         hex::encode(self.0.sign(&authority_message(workspace_id, text)).to_bytes())
@@ -255,6 +269,18 @@ pub fn check_authority(
 ) -> bool {
     from_hex::<SIGNATURE_LEN>(signature)
         .is_some_and(|sig| signer.verifies(&authority_message(workspace_id, text), &sig))
+}
+
+/// Whether `key` signed `text` as what the machine writing as `peer` holds of removed machines.
+pub fn check_seen(
+    key: &PublicKey,
+    workspace_id: &str,
+    peer: u64,
+    text: &str,
+    signature: &str,
+) -> bool {
+    from_hex::<SIGNATURE_LEN>(signature)
+        .is_some_and(|sig| key.verifies(&seen_message(workspace_id, peer, text), &sig))
 }
 
 /// Whether `key` signed a request to join as `peer` under `name`.
