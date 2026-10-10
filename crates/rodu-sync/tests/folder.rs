@@ -1836,3 +1836,20 @@ fn a_machine_catching_up_knows_every_admission_before_it_reads_an_update() {
         assert!(e.titles().contains(&title.to_owned()), "{title}: {:?}", e.titles());
     }
 }
+
+#[test]
+fn a_damaged_authority_file_is_written_again_whole_from_what_this_machine_checked() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, c, .. } = with_cat(root.path());
+    let file =
+        root.path().join(format!("Shared/Team/sync/{:016x}/authority.json", a.store().peer()));
+    let before = std::fs::read_to_string(&file).unwrap();
+    let cat = format!("{:016x}.", c.store().peer());
+    assert!(before.contains(&cat), "{before}");
+    std::fs::write(&file, "not json").unwrap();
+    ann_folder.remove(a.store(), c.store().peer()).unwrap();
+    let after = std::fs::read_to_string(&file).unwrap();
+    // cat's admission is still there, besides the removal.
+    assert!(after.contains(&cat), "{after}");
+    assert!(after.contains(&format!("remove.{:016x}.", c.store().peer())), "{after}");
+}
