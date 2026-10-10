@@ -166,7 +166,7 @@ fn peer_dir_name(peer: u64) -> String {
 
 /// A replica folder's peer id; never 0, which no replica has (and the import check reads as
 /// "any peer").
-fn parse_peer_dir(name: &str) -> Option<u64> {
+pub fn parse_peer_dir(name: &str) -> Option<u64> {
     (name.len() == 16 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
         .then(|| u64::from_str_radix(name, 16).ok())
         .flatten()

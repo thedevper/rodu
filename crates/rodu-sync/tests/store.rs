@@ -933,6 +933,39 @@ fn the_numbering_peer_is_shared_and_a_malformed_one_is_none() {
 }
 
 #[test]
+fn members_are_shared_and_malformed_entries_are_ignored() {
+    let a = Peer::first();
+    assert!(a.store().members().unwrap().is_empty());
+    let ann = a.me.principal_id.clone();
+    a.store().set_member(a.store().peer(), &ann).unwrap();
+    let b = Peer::join(&a, "bob");
+    let members = b.store().members().unwrap();
+    assert_eq!(members.get(&a.store().peer()), Some(&ann), "it reached another machine");
+    let reopened = LoroStore::open(a.dir.path()).unwrap();
+    assert_eq!(reopened.members().unwrap().get(&a.store().peer()), Some(&ann));
+
+    // A key that is not a peer id, or a value that is not the id of a principal in the document,
+    // is no member.
+    let raw = LoroDoc::new();
+    raw.set_peer_id(99).unwrap();
+    let empty = LoroDoc::new().oplog_vv().encode();
+    raw.import(&b.store().updates_since(&empty).unwrap()).unwrap();
+    let start = raw.oplog_vv();
+    let map = raw.get_map("members");
+    map.insert("12", ann.as_str()).unwrap();
+    map.insert("00000000000000AB", ann.as_str()).unwrap();
+    map.insert("0000000000000063", "not-an-id").unwrap();
+    map.insert("0000000000000064", 7_i64).unwrap();
+    map.insert("0000000000000065", "0190f0c4-0000-7000-8000-000000000000").unwrap();
+    raw.commit();
+    let update = raw.export(loro::ExportMode::updates(&start)).unwrap();
+    b.store().import_untrusted(&update, &checker()).unwrap();
+    let members = b.store().members().unwrap();
+    assert_eq!(members.len(), 1, "{members:?}");
+    assert_eq!(members.get(&a.store().peer()), Some(&ann));
+}
+
+#[test]
 fn the_readable_copy_setting_is_shared_and_only_true_turns_it_on() {
     let a = Peer::first();
     assert!(!a.store().readable_copy().unwrap());
