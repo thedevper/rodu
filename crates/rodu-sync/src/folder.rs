@@ -769,7 +769,8 @@ impl TeamFolder {
     }
 
     /// Every authority record this replica checked: the local note's, and the document's whose
-    /// key is its hash and whose signature verifies, whether it counts now or not. An entry that
+    /// key is its hash and whose signature verifies, whether it counts now or not, as long as its
+    /// signer could own the team ([`authority::worth_keeping`]). An entry that
     /// fails the check is noted too (by the hash of its key and text), so it is not checked again.
     /// Saves the notes when the document added something.
     fn authority_records(&self, store: &LoroStore, info: &TeamInfo) -> Result<Vec<Record>> {
@@ -801,15 +802,17 @@ impl TeamFolder {
                 None => {}
             }
         }
-        if records.len() != before {
-            let lines: Vec<&str> = records.values().map(Record::text).collect();
+        let Some((_, root)) = &self.signing else { return Ok(Vec::new()) };
+        let kept = authority::worth_keeping(*root, records.into_values().collect());
+        if kept.len() != before {
+            let lines: Vec<&str> = kept.iter().map(Record::text).collect();
             store.set_local_note(NOTE_AUTHORITY, &lines.join("\n"))?;
         }
         if refused.len() != refused_before {
             let lines: Vec<&str> = refused.iter().map(String::as_str).collect();
             store.set_local_note(NOTE_AUTHORITY_REFUSED, &lines.join("\n"))?;
         }
-        Ok(records.into_values().collect())
+        Ok(kept)
     }
 
     /// The team's authority from `records`, following the transfers this replica followed before

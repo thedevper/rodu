@@ -822,14 +822,22 @@ fn signed_team<'a>(io: &mut Io<'_>, ws: &'a Workspace) -> Result<(&'a LoroStore,
     Ok((store, team_folder(&ws.dir, team)?))
 }
 
+/// The hex digits of a machine code, read out with or without its dashes.
+fn code_digits(code: &str) -> String {
+    code.chars().filter(char::is_ascii_hexdigit).map(|c| c.to_ascii_lowercase()).collect()
+}
+
 /// The admitted machine of the person called `name`: their only one, or the one `machine` (its
-/// peer id, or the start of it) names.
+/// peer id, or the start of it) names, or the one whose key has `code`. Which person a machine
+/// belongs to is only what it says, so a step that hands over power asks for the code, which the
+/// person reads out from their own machine.
 fn person_machine(
     ws: &Workspace,
     store: &LoroStore,
     folder: &TeamFolder,
     name: &str,
     machine: Option<&str>,
+    code: Option<&str>,
 ) -> Result<(u64, PublicKey)> {
     let person = ws
         .service
@@ -850,14 +858,24 @@ fn person_machine(
             admitted.get(&peer).into_iter().flatten().map(move |key| (peer, *key))
         })
         .filter(|(peer, _)| machine.is_none_or(|m| format!("{peer:016x}").starts_with(m)))
+        .filter(|(_, key)| {
+            code.is_none_or(|c| {
+                !code_digits(c).is_empty() && code_digits(&key.code()) == code_digits(c)
+            })
+        })
         .collect();
     match machines.as_slice() {
         [one] => Ok(*one),
-        [] => Err(RoduError::not_found(match machine {
-            Some(m) => {
+        [] => Err(RoduError::not_found(match (machine, code) {
+            (_, Some(c)) => format!(
+                "{} has no admitted machine with code {}",
+                name.escape_debug(),
+                c.escape_debug()
+            ),
+            (Some(m), None) => {
                 format!("{} has no admitted machine {}", name.escape_debug(), m.escape_debug())
             }
-            None => format!("{} has no admitted machine", name.escape_debug()),
+            (None, None) => format!("{} has no admitted machine", name.escape_debug()),
         })
         .with_hint("rodu team members shows each person's machines")),
         _ => Err(RoduError::conflict(format!(
@@ -868,23 +886,33 @@ fn person_machine(
     }
 }
 
-/// `rodu team admin <name> on|off [--machine <id>]`: on the owner's machine, lets a person's
-/// machine admit others, or stops it. Machines it admitted before stay in.
+/// `rodu team admin <name> on <code>` or `rodu team admin <name> off [--machine <id>]`: on the
+/// owner's machine, lets a person's machine admit others, or stops it. Machines it admitted
+/// before stay in. Granting asks for the machine's code, as admitting does.
 pub(crate) fn admin(
     io: &mut Io<'_>,
     args: &Args,
     name: Option<&String>,
     state: Option<&String>,
+    code: Option<&String>,
 ) -> Result<()> {
+    const USAGE: &str = "Usage: rodu team admin <name> on <code>, or rodu team admin <name> off";
     let on = match state.map(String::as_str) {
         Some("on") => true,
         Some("off") => false,
-        _ => return Err(RoduError::invalid("Usage: rodu team admin <name> on|off")),
+        _ => return Err(RoduError::invalid(USAGE)),
     };
-    let name = name.ok_or_else(|| RoduError::invalid("Usage: rodu team admin <name> on|off"))?;
+    let name = name.ok_or_else(|| RoduError::invalid(USAGE))?;
+    if on && code.is_none() {
+        return Err(RoduError::invalid(
+            "Give the machine's code too: rodu team admin <name> on <code>",
+        )
+        .with_hint("The person reads it out from their machine: rodu team"));
+    }
     let ws = open(io, false)?;
     let (store, folder) = signed_team(io, &ws)?;
-    let (peer, key) = person_machine(&ws, store, &folder, name, args.value("machine"))?;
+    let code = code.map(String::as_str).filter(|_| on);
+    let (peer, key) = person_machine(&ws, store, &folder, name, args.value("machine"), code)?;
     let authority = folder.authority(store)?;
     if authority.is_admin(&key) == on {
         (io.out)(&format!(
@@ -904,19 +932,27 @@ pub(crate) fn admin(
     Ok(())
 }
 
-/// `rodu team transfer-owner <name> --yes [--machine <id>]`: on the owner's machine, hands the
-/// team to a person's machine. This machine stays an admin until the new owner says otherwise.
-pub(crate) fn transfer_owner(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Result<()> {
-    let name =
-        name.ok_or_else(|| RoduError::invalid("Usage: rodu team transfer-owner <name> --yes"))?;
+/// `rodu team transfer-owner <name> <code> --yes`: on the owner's machine, hands the team to the
+/// person's machine with that code. This machine stays an admin until the new owner says
+/// otherwise.
+pub(crate) fn transfer_owner(
+    io: &mut Io<'_>,
+    args: &Args,
+    name: Option<&String>,
+    code: Option<&String>,
+) -> Result<()> {
+    let (Some(name), Some(code)) = (name, code) else {
+        return Err(RoduError::invalid("Usage: rodu team transfer-owner <name> <code> --yes")
+            .with_hint("The person reads the code out from their machine: rodu team"));
+    };
     let ws = open(io, false)?;
     let (store, folder) = signed_team(io, &ws)?;
-    let (peer, key) = person_machine(&ws, store, &folder, name, args.value("machine"))?;
+    let (peer, key) = person_machine(&ws, store, &folder, name, None, Some(code))?;
     if !args.flag("yes") {
         return Err(RoduError::invalid("Handing over the team needs --yes").with_hint(format!(
             "The new owner alone then chooses admins and can hand it on; this machine stays an \
              admin until they say otherwise, and cannot take the team back. Then run: rodu team \
-             transfer-owner {name} --yes"
+             transfer-owner {name} {code} --yes"
         )));
     }
     folder.transfer(store, &key)?;
@@ -1150,7 +1186,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
             "Signing is on: each teammate's machine asks to join, and the team takes in its \
              changes only once this machine (the team owner) or an admin admits it with: rodu \
              team admit <name> <code>. Check the code with the teammate yourself, not through the \
-             folder. Choose admins with: rodu team admin <name> on",
+             folder. Choose admins with: rodu team admin <name> on <code>",
         );
     }
     if readable_copy {

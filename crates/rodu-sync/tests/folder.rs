@@ -1561,4 +1561,14 @@ fn authority_entries_that_fail_their_check_are_noted_and_ignored() {
     assert_eq!(auth.owner(), root_public());
     assert!(!auth.is_admin(&public(&bob_key)));
     assert_eq!(a.store().local_note("authority-refused").unwrap().unwrap().lines().count(), 1);
+    // Records signed by keys that could never own the team are not kept, however many.
+    for _ in 0..3 {
+        let stranger = MachineKey::generate().unwrap();
+        let own = Record::grant(TEAM_ID, &stranger, 0, 1, &stranger.public());
+        b.store().set_authority(&rodu_sync::authority::key_of(own.text()), own.text()).unwrap();
+    }
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    assert_eq!(a.store().authority().unwrap().len(), 4, "in the document");
+    assert!(a.store().local_note("authority").unwrap().unwrap_or_default().is_empty());
 }
