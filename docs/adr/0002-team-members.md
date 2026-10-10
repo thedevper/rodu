@@ -231,7 +231,7 @@ Where 2b differs from Roles below, 2b is what holds.
   files can land before the revocation counts. Work already taken in is never taken out again;
   later work from that machine waits. Step 3's removal covers what such a machine wrote.
 
-### Step 3: removing someone (3a built 2026-10-10; re-keying is 3b)
+### Step 3: removing someone (3a built 2026-10-10; 3b, re-keying, built 2026-10-11)
 
 - `rodu team remove <name>` (owner or admin, within the limits under Roles) signs a removal
   record. For each of that person's peers, it names the last file sequence this replica had
@@ -300,8 +300,7 @@ Where 3a differs from the text above, 3a is what holds.
   writes nor compacts work nobody takes in. `rodu team` says so, and `rodu team members` marks the
   machine "removed".
 - **Left for later.**
-  - Re-keying an encrypted team (3b). Until then a removed person keeps the team key, and `team
-    remove` on an encrypted team says so before `--yes`.
+  - Re-keying an encrypted team: built in 3b, below.
   - Anyone who can write to the folder can delete files there (ADR 0001), including a removed
     person whose access to the shared folder was not taken away. That includes their own files
     from before the cut, which a replica joining later then never gets, and anything built on
@@ -319,6 +318,80 @@ Where 3a differs from the text above, 3a is what holds.
   - Records and admissions in a stranger's authority file are checked again on every read, as
     those in the document are. A file of 1 MiB of validly signed records costs every read their
     signature checks.
+
+#### Step 3b as built (re-keying an encrypted signed team)
+
+Where 3b differs from the text above, 3b is what holds.
+
+- **An exchange key per machine, with no file of its own.** Each machine of an encrypted signed
+  team has an X25519 key besides its Ed25519 signing key, as `ed25519-dalek` advises (a signing
+  key is not reused for Diffie-Hellman). Its secret is the SHA-256 of `"rodu-exchange-key-1" 0x00
+  || the signing key's seed`, so it needs no second secret file and every machine of a team made
+  before 3b has one already. The machine publishes the public half in `exchange.sealed` in its
+  replica folder: `{"format": 1, "publicKey", "exchangeKey", "signature"}`, signed over
+  `"rodu-exchange-1" 0x00 || workspace id length (u64 LE) || workspace id || peer id (u64 LE) ||
+  exchange key`. It writes the file with its join request and again on any pull that finds it
+  missing or not its own. A key is wrapped for a machine only when the signer of its exchange
+  file is a key admitted for that very replica folder.
+- **Key generations and key records.** The invite code's key is generation 0. `rodu team rekey
+  --yes` (owner or admin) makes a random key of the next generation (one more than the highest a
+  key record that counts names, or than this machine holds; a record that does not count, such as
+  one a revoked admin signs afterwards, never uses up the generations) and names it in a signed
+  authority record, `key.<generation>.<key check>.<signer key>.<signature>`, where the key check
+  is the team file's `keyCheck` computed for the new key. The record goes in the `authority` map
+  and the authority file like the others, counts while its signer is the owner or an admin, and is
+  kept when a kept grant names its signer, as removals are. When the owner revokes an admin, it
+  signs again each key record that admin made, so a machine joining later still takes those keys.
+  `rodu team remove` on an encrypted team re-keys after the removals, so the new key is wrapped
+  for nobody removed.
+- **Wrapped keys.** An owner's or admin's machine keeps a plain `keys.json` in its replica folder:
+  `{"format": 1, "keys": ["<recipient peer>.<generation>.<key check>.<wrapped, hex>", ...]}`, read
+  up to 1 MiB. `wrapped` is an ephemeral X25519 public key (32 bytes), a nonce (24) and the key
+  sealed with XChaCha20-Poly1305 (48). The key-encryption key is the SHA-256 of `"rodu-key-wrap-1"
+  0x00 || shared secret || ephemeral public key || recipient public key`, and the associated data
+  is `"rodu-key-wrap-1" 0x00 || workspace id length (u64 LE) || workspace id || recipient peer id
+  (u64 LE) || generation (u64 LE)`. A shared secret of all zeros (a low-order point) is refused.
+  On every pull, on `team admit` and on `team rekey`, the machine wraps every key after the first
+  that it holds for every machine admitted and not removed that published an exchange key. It
+  keeps the wraps already in its file only when it wrote them itself (local note `wrapped`, their
+  hashes), so a wrap someone changed is made afresh. The file is plain because a machine needs no
+  team key to read it. It shows the folder's provider the recipients' peer ids (already the
+  replica folders' names) and how often the key changed.
+- **Taking a key.** A pull first unwraps what is wrapped for this machine. It tries at most 64
+  new entries per file, so a planted file cannot make it run X25519 without end. It keeps a key
+  only when the key matches the entry's check and a key record that counts names that generation
+  and check. Until then the key only opens the folder's small files (authority, seen and exchange
+  files, whose content counts by its own signatures). That way a record sealed with the new key
+  is read, and the key itself never seals anything. Kept keys go in `.rodu/team-keys` (one
+  `<generation>.<check>.<key>` per line, mode 0600, zeroized in memory, never in `config.json`);
+  `team.key` keeps the invite code's key. A machine seals with the newest key it holds (the
+  lowest check first when two records name one generation, so every machine picks the same) and
+  opens a file with whichever key it holds that opens it.
+- **A file no key opens yet waits.** A sealed file that does not open with any key this machine
+  holds is said once ("does not open with any team key this machine holds") and read again once
+  the machine holds another key. Before 3b it was refused for good. Now a file sealed with a key
+  still on its way, which a folder app may deliver first, is not lost.
+- **The removed machine still hears of it.** The re-key also re-seals the remover's authority
+  file with the new key, so a removed machine could no longer read its removal there. It would
+  keep writing work nobody takes in. So each machine's removals also go, alone, in
+  `removed.sealed` in its replica folder, sealed with the invite code's key, read like an
+  authority file (only removal records count from it).
+- **Seeing it.** `rodu team` says how often the team key changed and whether this machine holds
+  the newest, or waits for it from the owner's or an admin's machine.
+- **Left for later.**
+  - A machine that has not synced since the re-key keeps sealing with the older key, which the
+    removed person holds, until it next syncs with a machine that wraps the new key for it.
+  - The invite code still carries the first key. What a machine writes before it is admitted
+    (its request, its exchange file, its first files) is sealed with that key. A removed person
+    who kept the invite code can read those, and can still read the names in later requests.
+  - Anyone who can write to the folder can swap a machine's exchange file for one signed by a
+    key not admitted there. It is then not used, so that machine gets no new key until its own
+    next pull puts its file back: a delay, not a way in. Deleting an owner's or admin's
+    `keys.json` delays the same way, until that machine's next pull writes it again.
+  - What the folder held before the re-key stays readable to whoever holds the older key. A new
+    key protects what comes after it, not what came before.
+  - `removed.sealed` shows anyone holding the invite code's key which machines were removed, and
+    by whose key.
 
 ### Roles
 
@@ -349,9 +422,11 @@ id wins on every replica.
 
 ## Dependencies
 
-`ed25519-dalek` (BSD-3-Clause) for step 2 and `x25519-dalek` (BSD-3-Clause) for step 3, both
-RustCrypto/dalek crates already common in the ecosystem. Each must pass `about.toml`, `cargo
-audit` and `cargo xtask notices` before it ships, including its full dependency tree.
+`ed25519-dalek` (BSD-3-Clause) for step 2. Step 3b uses X25519 from `curve25519-dalek`
+(BSD-3-Clause) directly, a crate `ed25519-dalek` already brings in, so it adds no crate to the
+tree; `x25519-dalek` was not needed. Both are RustCrypto/dalek crates already common in the
+ecosystem. Each must pass `about.toml`, `cargo audit` and `cargo xtask notices` before it ships,
+including its full dependency tree.
 
 ## Open questions
 

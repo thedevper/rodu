@@ -1088,9 +1088,10 @@ fn the_owner_or_an_admin_removes_a_member_whose_later_work_stays_out() {
     // It asks for --yes, and says an encrypted team's key stays with them.
     let unsure = rodu(&team.ann, &["team", "remove", "cat"]);
     assert!(unsure.err.contains("needs --yes"), "{}", unsure.err);
-    assert!(unsure.err.contains("still read the board"), "{}", unsure.err);
+    assert!(unsure.err.contains("The team key is changed too"), "{}", unsure.err);
     let out = ok(&team.ann, &["team", "remove", "cat", "--yes"]);
     assert!(out.contains("Removed cat's machine"), "{out}");
+    assert!(out.contains("Changed the team key"), "{out}");
     assert!(ok(&team.ann, &["team", "members"]).contains("(removed)"));
     let again = rodu(&team.ann, &["team", "remove", "cat", "--yes"]);
     assert!(again.err.contains("cat has no machine on the team"), "{}", again.err);
@@ -1103,6 +1104,48 @@ fn the_owner_or_an_admin_removes_a_member_whose_later_work_stays_out() {
         let list = ok(machine, &["ls"]);
         assert!(list.contains("Before") && !list.contains("After"), "{list}");
     }
+
+    // bob has the new key and seals with it: cat's old one opens nothing bob writes now.
+    assert!(ok(&bob, &["team"]).contains("Team key: changed once; this machine has the newest"));
+    ok(&bob, &["add", "Bob after"]);
+    assert!(ok(&team.ann, &["ls"]).contains("Bob after"));
+    let key = std::fs::read_to_string(cat.join(".rodu/team.key")).unwrap();
+    let key = rodu_sync::seal::TeamKey::from_hex(key.trim()).unwrap();
+    let info: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(team.folder.join("rodu-team.json")).unwrap())
+            .unwrap();
+    let id = info["workspaceId"].as_str().unwrap();
+    let opened = sealed_files(&team.folder)
+        .iter()
+        .filter(|(peer, body)| rodu_sync::seal::open(&key, id, *peer, body).is_some())
+        .count();
+    let all = sealed_files(&team.folder).len();
+    assert!(opened < all, "files written since the re-key stay closed to cat ({opened} of {all})");
+
+    // Changing the key again takes the owner or an admin, an encrypted team, and --yes.
+    let member = rodu(&bob, &["team", "rekey", "--yes"]);
+    assert!(member.err.contains("or an admin's, can change the team key"), "{}", member.err);
+    let unsure = rodu(&team.ann, &["team", "rekey"]);
+    assert!(unsure.err.contains("needs --yes"), "{}", unsure.err);
+    assert!(ok(&team.ann, &["team", "rekey", "--yes"]).contains("Changed the team key"));
+    ok(&bob, &["sync"]);
+    assert!(ok(&bob, &["team"]).contains("Team key: changed 2 times"));
+}
+
+/// Each numbered sync file's writer and sealed payload (past the 52-byte frame header).
+fn sealed_files(folder: &Path) -> Vec<(u64, Vec<u8>)> {
+    let mut files = Vec::new();
+    for dir in std::fs::read_dir(folder.join("sync")).unwrap() {
+        let dir = dir.unwrap().path();
+        let peer = u64::from_str_radix(dir.file_name().unwrap().to_str().unwrap(), 16).unwrap();
+        for file in std::fs::read_dir(&dir).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_some_and(|e| e == "update") {
+                files.push((peer, std::fs::read(path).unwrap()[52..].to_vec()));
+            }
+        }
+    }
+    files
 }
 
 #[test]
