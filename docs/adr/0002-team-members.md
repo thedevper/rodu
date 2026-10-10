@@ -158,7 +158,11 @@ Where 2b differs from Roles below, 2b is what holds.
 
 - **Rights belong to machine keys.** Owner and admin are recorded per machine key. The commands
   take a person's name and act on that person's admitted machine (found through the `members`
-  entry of each admitted peer). When the person has more than one, `--machine <id>` names it.
+  entry of each admitted peer). Which person a machine belongs to is only what it says, so
+  granting admin and handing the team over also take the machine's code, which the person reads
+  out from their own machine, as admitting does: `rodu team admin <name> on <code>`,
+  `rodu team transfer-owner <name> <code> --yes`. Revoking (`rodu team admin <name> off`) takes
+  `--machine <id>` when the person has more than one.
 - **Authority records.** These live in the team document's root map `authority`. Each key is the
   hex SHA-256 of its value, so a value that was changed no longer matches its key and is ignored.
   Every record is signed, and its signer is named in it:
@@ -189,8 +193,7 @@ Where 2b differs from Roles below, 2b is what holds.
     a former owner signs for its own epoch after handing over counts (it cannot name admins).
   - For each target key, the counting grant or revocation with the highest `(epoch, n)` decides.
     A revocation wins a tie.
-  - `rodu team admin <name> on|off [--machine <id>]` (current owner only) writes one record for
-    that machine key. `n` is one more than the highest `n` for that target in the current epoch.
+  - `rodu team admin` (current owner only) writes one record for that machine key. `n` is one more than the highest `n` for that target in the current epoch.
 - **Who can admit.**
   - An admission record is now `<member key>.<signer key>.<signature>`. The 2a form, without a
     signer, means the root signed it.
@@ -210,7 +213,11 @@ Where 2b differs from Roles below, 2b is what holds.
   keeps every authority record it checked, and it notes the signer of each admission it keeps, so
   a revocation still takes effect locally. An entry that fails its check (a key that is not its
   hash, a bad signature, a malformed text) is noted by the hash of its key and text (up to 4096),
-  so it is not checked again; its text is not kept.
+  so it is not checked again; its text is not kept. A valid record is kept only when its signer
+  is the root or a key that some kept transfer hands the team to: a record signed by any other key
+  can never count, and keeping it would let anyone who can write to the folder grow the notes
+  without end. (An owner, or a former owner, can still sign as many records as it likes; that is
+  bounded only by the document.)
 - **Left for later.** A member who deletes an authority record before some replica has read it
   can keep that replica from seeing it. For a revocation, that replica would still accept
   admissions the revoked admin signs. Only a replica that has never seen the revocation (such as

@@ -207,6 +207,29 @@ impl Record {
     }
 }
 
+/// The records worth keeping: those signed by `root`, or by a key some kept transfer hands the
+/// team to. A record signed by any other key can never count, and keeping it would let anyone who
+/// can write to the folder make a replica's notes grow without end.
+pub fn worth_keeping(root: PublicKey, records: Vec<Record>) -> Vec<Record> {
+    let mut keys = BTreeSet::from([root]);
+    loop {
+        let more: Vec<PublicKey> = records
+            .iter()
+            .filter(|r| keys.contains(&r.signer))
+            .filter_map(|r| match r.kind {
+                Kind::Owner { new, .. } => Some(new),
+                _ => None,
+            })
+            .filter(|new| !keys.contains(new))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        keys.extend(more);
+    }
+    records.into_iter().filter(|r| keys.contains(&r.signer)).collect()
+}
+
 /// What a key's latest admin record says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AdminState {
@@ -468,6 +491,18 @@ mod tests {
         let fire_root = Record::revoke(TEAM, &bob, 1, 1, &root.public(), &BTreeSet::new());
         let auth = resolve(root.public(), &[to_bob, fire_root]);
         assert!(auth.may_admit(&bob.public()) && !auth.may_admit(&root.public()));
+    }
+
+    #[test]
+    fn only_records_of_keys_that_could_own_the_team_are_kept() {
+        let (root, bob, cat, eve) = (key(), key(), key(), key());
+        let to_bob = transfer(&root, 1, &bob.public());
+        let by_bob = Record::grant(TEAM, &bob, 1, 1, &cat.public());
+        let by_eve = Record::grant(TEAM, &eve, 0, 1, &eve.public());
+        let eve_to_cat = transfer(&eve, 1, &cat.public());
+        let by_cat = Record::grant(TEAM, &cat, 0, 1, &cat.public());
+        let all = vec![by_bob.clone(), by_eve, eve_to_cat, by_cat, to_bob.clone()];
+        assert_eq!(worth_keeping(root.public(), all), vec![by_bob, to_bob]);
     }
 
     #[test]
