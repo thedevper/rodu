@@ -266,7 +266,8 @@ Where 3a differs from the text above, 3a is what holds.
   revokes an admin, it signs again each removal that admin made, so those machines stay out, as a
   revocation keeps that admin's admissions. `rodu team remove <name> [--machine <id>] --yes`
   removes the person's machines (their `members` entries), and refuses before writing anything if
-  one of them is the owner's or an admin's. A removed machine cannot be admitted again: it joins
+  one of them is the owner's or an admin's. A removed machine cannot be admitted again, nor its
+  key made an admin (an admin's machine is never cut, so that would undo the removal): it joins
   again as a new machine, from a new workspace.
 - **Work a member built on is never cut.** In Loro every change depends on everything its
   machine held. If a member took in some of the removed machine's later work before it heard of
@@ -289,7 +290,11 @@ Where 3a differs from the text above, 3a is what holds.
   operation. Without it, a replica catching up learns of a removal only once the operations the
   record depends on have landed, and by then it has read the removed machine's later files with
   no cut in place. It also narrows the 2b residuals: a revocation or an admission in a file is
-  seen before any update is read, and deleting it from the document no longer hides it.
+  seen before any update is read, and deleting it from the document no longer hides it. Since a
+  stranger's file can hold any number of self-signed admissions, an admission is noted only when
+  its signer could ever admit (the root, a key a transfer hands the team to, or a key such a key
+  granted admin). A machine writes its file afresh each time, from its notes, so a damaged file
+  loses nothing.
 - **A removed machine stops.** Once it hears of its removal (from a file, before it reads any
   update), its push is refused with "This machine was removed from the team", so it neither
   writes nor compacts work nobody takes in. `rodu team` says so, and `rodu team members` marks the
@@ -309,6 +314,8 @@ Where 3a differs from the text above, 3a is what holds.
   - A dishonest member can claim to hold more of a removed peer than it does, and so let that
     peer's later work in, as it could write that work itself. Removing that member too ends it;
     what came in before stays.
+  - An owner who signs a grant of admin to a removed machine's key by hand, rather than through
+    `rodu team admin`, undoes that removal: an owner's choice, not a way in for anyone else.
   - Records and admissions in a stranger's authority file are checked again on every read, as
     those in the document are. A file of 1 MiB of validly signed records costs every read their
     signature checks.
