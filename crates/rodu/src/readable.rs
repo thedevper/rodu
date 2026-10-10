@@ -33,6 +33,9 @@ const INDEX: &str = "index.md";
 const PAGE: u32 = 500;
 /// The largest record read back. A card file is never loaded whole: it is hashed as it is read.
 const MAX_READ: u64 = 16 * 1024 * 1024;
+/// The largest card file hashed. Far more than any card Rodu renders, so a bigger file is not
+/// Rodu's, and a huge file planted under a card's name is never read through.
+const MAX_HASH: u64 = 64 * 1024 * 1024;
 
 /// What Rodu wrote, so it never deletes or overwrites anything else. In the workspace, `folder`
 /// says which team folder it is about.
@@ -186,7 +189,8 @@ fn save(dir: &Path, name: &str, manifest: &Manifest, warnings: &mut Vec<String>)
 fn digest(dir: &Path, name: &str) -> Option<(String, bool)> {
     use std::io::Read;
     let path = dir.join(name);
-    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_HASH {
         return None;
     }
     let heading = heading(name);
@@ -269,7 +273,9 @@ fn write(
     for (name, text) in &files {
         let path = dir.join(name);
         let hash = sha256(text);
-        if digest(dir, name).is_some_and(|(found, _)| found == hash) {
+        // Same size first, so a file that cannot match is never read.
+        let same_size = fs::symlink_metadata(&path).is_ok_and(|m| m.len() == text.len() as u64);
+        if same_size && digest(dir, name).is_some_and(|(found, _)| found == hash) {
             if mine.files.contains_key(name) {
                 own.insert(name.clone(), hash.clone());
             }
