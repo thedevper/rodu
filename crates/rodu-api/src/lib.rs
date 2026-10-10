@@ -70,6 +70,12 @@ pub struct MeView {
     pub name: Option<String>,
 }
 
+/// Rises whenever the board may have changed: a teammate's change came in, or a write here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionView {
+    pub revision: u64,
+}
+
 /// Every failure: domain errors and HTTP-level ones alike.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {

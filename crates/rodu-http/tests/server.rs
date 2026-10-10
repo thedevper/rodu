@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::body::Bytes;
 use rodu_core::{Actor, PrincipalKind, RoduService};
-use rodu_http::{RunningServer, WebServerOptions, start_web_server};
+use rodu_http::{LiveOptions, RunningServer, WebServerOptions, start_web_server};
 use rodu_store::SqliteStore;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -152,6 +152,7 @@ async fn fixture() -> Fixture {
         dist_dir: Some(dist.path().to_path_buf()),
         files: None,
         token: Some(TOKEN.into()),
+        live: None,
     })
     .await
     .unwrap();
@@ -431,6 +432,7 @@ async fn serves_files_held_in_memory_as_the_single_binary_does() {
         dist_dir: None,
         files: Some(files),
         token: Some(TOKEN.into()),
+        live: None,
     })
     .await
     .unwrap();
@@ -462,6 +464,7 @@ async fn without_a_ui_serves_only_the_api() {
         dist_dir: None,
         files: None,
         token: None,
+        live: None,
     })
     .await
     .unwrap();
@@ -485,4 +488,107 @@ async fn closes_even_when_a_client_stalls_mid_body() {
     let started = std::time::Instant::now();
     f.server.close().await.unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(8), "{:?}", started.elapsed());
+}
+
+// --- live sync ---
+
+/// Counts its calls; reports a change while `changed` is set.
+#[derive(Default)]
+struct FakeSync {
+    pulls: std::sync::atomic::AtomicUsize,
+    pushes: std::sync::atomic::AtomicUsize,
+    changed: std::sync::atomic::AtomicBool,
+}
+
+impl rodu_core::LiveSync<SqliteStore> for FakeSync {
+    fn pull(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<rodu_core::Pulled> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.pulls.fetch_add(1, SeqCst);
+        Ok(rodu_core::Pulled { changed: self.changed.load(SeqCst), warnings: Vec::new() })
+    }
+
+    fn push(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<Vec<String>> {
+        self.pushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+}
+
+async fn live_server(sync: std::sync::Arc<FakeSync>) -> RunningServer {
+    let service = RoduService::new(SqliteStore::memory().unwrap());
+    let human = service.create_principal("alice", PrincipalKind::Human, None).unwrap();
+    let actor = Actor { principal_id: human.id, via_agent_id: None };
+    service.create_collection(&actor, "DEMO", "Demo project").unwrap();
+    start_web_server(WebServerOptions {
+        service,
+        actor,
+        port: 0,
+        dist_dir: None,
+        files: None,
+        token: Some(TOKEN.into()),
+        live: Some(LiveOptions { sync, every: std::time::Duration::from_millis(40) }),
+    })
+    .await
+    .unwrap()
+}
+
+async fn revision(s: &RunningServer) -> u64 {
+    let reply = send(s, "GET", "/api/revision", none()).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    reply.json()["revision"].as_u64().unwrap()
+}
+
+/// Waits up to two seconds for `done`.
+async fn eventually(mut done: impl AsyncFnMut() -> bool) {
+    for _ in 0..100 {
+        if done().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("not within two seconds");
+}
+
+#[tokio::test]
+async fn a_live_server_syncs_on_a_timer_and_after_writes_and_counts_revisions() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let sync = std::sync::Arc::new(FakeSync::default());
+    let s = live_server(sync.clone()).await;
+    eventually(async || sync.pulls.load(SeqCst) >= 2 && sync.pushes.load(SeqCst) >= 2).await;
+    // Pulls that change nothing leave the revision alone.
+    let quiet = revision(&s).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(revision(&s).await, quiet);
+    // A pull that took something in raises it.
+    sync.changed.store(true, SeqCst);
+    eventually(async || revision(&s).await > quiet).await;
+    sync.changed.store(false, SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let before = revision(&s).await;
+    let pushes = sync.pushes.load(SeqCst);
+    // A write raises it and is pushed at once.
+    let made = send(
+        &s,
+        "POST",
+        "/api/items",
+        body(json!({ "collection": "DEMO", "item": { "title": "Live" }, "status": "Todo" })),
+    )
+    .await;
+    assert_eq!(made.status, 201, "{}", made.body);
+    assert!(revision(&s).await > before);
+    assert!(sync.pushes.load(SeqCst) > pushes);
+    // The revision asks for the token like every other route.
+    let refused = send(&s, "GET", "/api/revision", with(vec![("Authorization", "")])).await;
+    assert_eq!(refused.status, 401);
+    // Closing stops the timer.
+    s.close().await.unwrap();
+    let after = sync.pulls.load(SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(sync.pulls.load(SeqCst), after);
+}
+
+#[tokio::test]
+async fn a_server_without_live_sync_still_answers_the_revision() {
+    let f = fixture().await;
+    assert_eq!(revision(&f.server).await, 0);
+    f.server.close().await.unwrap();
 }

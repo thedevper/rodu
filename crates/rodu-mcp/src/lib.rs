@@ -14,8 +14,8 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use rodu_core::service::CategoryCounts;
 use rodu_core::{
-    Actor, Cycle, ErrorCode, Item, ItemType, LinkKind, Priority, RoduError, RoduService, Rule,
-    Store, TxMode,
+    Actor, Cycle, ErrorCode, Item, ItemType, LinkKind, Live, LiveSync, Priority, RoduError,
+    RoduService, Rule, Store, TxMode,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -48,7 +48,21 @@ pub async fn serve_stdio<S: Store + Send + 'static>(
     service: RoduService<S>,
     actor: Actor,
 ) -> Result<(), ServeError> {
-    let running = RoduMcp::new(service, actor).serve(rmcp::transport::stdio()).await?;
+    serve_stdio_live(service, actor, None).await
+}
+
+/// [`serve_stdio`], taking in teammates' changes before each tool call and sending this
+/// replica's after it when `live` is given.
+pub async fn serve_stdio_live<S: Store + Send + 'static>(
+    service: RoduService<S>,
+    actor: Actor,
+    live: Option<Arc<dyn LiveSync<S>>>,
+) -> Result<(), ServeError> {
+    let mut server = RoduMcp::new(service, actor);
+    if let Some(live) = live {
+        server = server.with_live(live);
+    }
+    let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
 }
@@ -58,11 +72,16 @@ pub async fn serve_stdio<S: Store + Send + 'static>(
 pub struct RoduMcp<S: Store> {
     service: Arc<Mutex<RoduService<S>>>,
     actor: Actor,
+    live: Option<Arc<Live<S>>>,
 }
 
 impl<S: Store> Clone for RoduMcp<S> {
     fn clone(&self) -> Self {
-        Self { service: Arc::clone(&self.service), actor: self.actor.clone() }
+        Self {
+            service: Arc::clone(&self.service),
+            actor: self.actor.clone(),
+            live: self.live.clone(),
+        }
     }
 }
 
@@ -74,7 +93,13 @@ enum Output {
 
 impl<S: Store + Send + 'static> RoduMcp<S> {
     pub fn new(service: RoduService<S>, actor: Actor) -> Self {
-        Self { service: Arc::new(Mutex::new(service)), actor }
+        Self { service: Arc::new(Mutex::new(service)), actor, live: None }
+    }
+
+    /// Pulls before each tool call and pushes after it, each under the service lock.
+    pub fn with_live(mut self, sync: Arc<dyn LiveSync<S>>) -> Self {
+        self.live = Some(Arc::new(Live::new(sync)));
+        self
     }
 
     fn with_service<T>(
@@ -101,10 +126,30 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
         self.with_service(|s| Ok(s.max_batch)).unwrap_or(rodu_core::service::DEFAULT_MAX_BATCH)
     }
 
-    fn run(&self, name: &str, args: &JsonObject) -> Result<Output, RoduError> {
+    /// Runs a tool under one hold of the service lock: with live sync, a pull before it and a push
+    /// after it, so no other tool call or sync step lands in between.
+    fn call(&self, name: &str, args: &JsonObject) -> Result<Output, RoduError> {
+        self.with_service(|service| {
+            if let Some(live) = &self.live {
+                live.pull(service);
+            }
+            let outcome = self.run(service, name, args);
+            if let Some(live) = &self.live {
+                live.push(service);
+            }
+            outcome
+        })
+    }
+
+    fn run(
+        &self,
+        service: &RoduService<S>,
+        name: &str,
+        args: &JsonObject,
+    ) -> Result<Output, RoduError> {
         let args = Args { tool: name, map: args };
         let actor = &self.actor;
-        self.with_service(|service| match name {
+        match name {
             "search" => {
                 let query = args.string_or("query", 0, 2000, "")?;
                 let limit = args.int_or("limit", 1, 100, 20)?;
@@ -197,7 +242,7 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
                 pretty(&plan_cycle(service, actor, &collection, &cycle, &refs, create_if_missing)?)
             }
             other => Err(RoduError::invalid(format!("Unknown tool \"{other}\""))),
-        })
+        }
     }
 }
 
@@ -705,7 +750,7 @@ impl<S: Store + Send + 'static> ServerHandler for RoduMcp<S> {
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
-        let outcome = self.blocking(move |server| server.run(&name, &args)).await;
+        let outcome = self.blocking(move |server| server.call(&name, &args)).await;
         Ok(tool_result(outcome).into())
     }
 
