@@ -1,6 +1,7 @@
 //! Team workspaces (ADR 0001): `rodu team create`, `rodu team join`, `rodu sync`, and the sync
 //! every command does around its work in a team workspace.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -145,6 +146,9 @@ pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
         Ok(moved) => moved.iter().for_each(|line| warn(io, line)),
         Err(e) => warn(io, &format!("numbering new cards: {}", e.message)),
     }
+    if let Err(e) = settle_member(&ws.config, &ws.service) {
+        warn(io, &format!("recording this machine as a member: {}", e.message));
+    }
     if ws.service.numbering()
         && let Err(e) = ws.service.assign_numbers(&user_actor(&ws.config))
     {
@@ -232,6 +236,18 @@ fn settle_numbering(
     })
 }
 
+/// Records in the team document that this machine writes for the config's person, when it does
+/// not say so already: a team made before the document listed members, or an entry another
+/// machine overwrote. A person the document does not hold yet is left for a later sync.
+fn settle_member(config: &Config, service: &RoduService<AnyStore>) -> Result<()> {
+    let Some(store) = service.store.team() else { return Ok(()) };
+    let mine = store.members()?.get(&store.peer()) == Some(&config.user_id);
+    if !mine && service.store.list_principals()?.iter().any(|p| p.id == config.user_id) {
+        store.set_member(store.peer(), &config.user_id)?;
+    }
+    Ok(())
+}
+
 /// After a command in a team workspace: writes this machine's new changes to the folder.
 pub(crate) fn after(io: &mut Io<'_>, ws: &Workspace) {
     let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else { return };
@@ -296,6 +312,9 @@ impl LiveSync<AnyStore> for FolderLive {
             Ok(moved) => pulled.warnings.extend(moved),
             Err(e) => pulled.warnings.push(format!("numbering new cards: {}", e.message)),
         }
+        if let Err(e) = settle_member(&self.config, service) {
+            pulled.warnings.push(format!("recording this machine as a member: {}", e.message));
+        }
         if service.numbering() {
             match service.assign_numbers(&self.user) {
                 Ok(numbered) => pulled.changed |= !numbered.is_empty(),
@@ -346,6 +365,7 @@ pub(crate) fn sync(io: &mut Io<'_>) -> Result<()> {
     if let Some(moved) = settle_numbering(&ws.dir, &ws.config, &ws.service, true)? {
         warn(io, &moved);
     }
+    settle_member(&ws.config, &ws.service)?;
     let numbered = if ws.service.numbering() {
         ws.service.assign_numbers(&user_actor(&ws.config))?.len()
     } else {
@@ -468,6 +488,91 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// `rodu team members`: who is on the team, the agents acting for each person, and the machines
+/// each one writes from, as the team document records them. Until sync files are signed (ADR
+/// 0002, step 2) that is only what each machine says.
+pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
+    let ws = open(io, false)?;
+    let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else {
+        return Err(RoduError::invalid("This is not a team workspace")
+            .with_hint("Make it one: rodu team create --folder <shared folder>"));
+    };
+    // The same pull every command does first, which also records this machine if it is missing.
+    before(io, &ws);
+    let members = store.members()?;
+    let numbering = match store.numbering_peer()? {
+        Some(peer) => Some(peer),
+        None if team.numbering => Some(store.peer()),
+        None => None,
+    };
+    let mut principals = ws.service.store.list_principals()?;
+    principals.sort_by(|a, b| a.name.cmp(&b.name));
+    // Replica folders are named by peer id; anything else in sync/ is not a machine.
+    let folders: BTreeSet<u64> = std::fs::read_dir(Path::new(&team.folder).join(SYNC_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(rodu_sync::folder::parse_peer_dir))
+        .collect();
+    let all: BTreeSet<u64> = members.keys().chain(&folders).copied().collect();
+    let short = |peer: u64| short_peer(peer, &all);
+    let mut claimed = BTreeSet::new();
+    for person in principals.iter().filter(|p| p.kind == PrincipalKind::Human) {
+        (io.out)(&person.name);
+        let agents: Vec<&str> = principals
+            .iter()
+            .filter(|p| p.owner_id.as_deref() == Some(person.id.as_str()))
+            .map(|p| p.name.as_str())
+            .collect();
+        if !agents.is_empty() {
+            (io.out)(&format!("  agents: {}", agents.join(", ")));
+        }
+        let machines: Vec<u64> =
+            members.iter().filter(|(_, id)| **id == person.id).map(|(peer, _)| *peer).collect();
+        if machines.is_empty() {
+            (io.out)("  no machine recorded yet");
+        }
+        for peer in machines {
+            claimed.insert(peer);
+            let marks: Vec<&str> = [
+                (peer == store.peer()).then_some("this machine"),
+                (Some(peer) == numbering).then_some("numbers cards"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            (io.out)(&if marks.is_empty() {
+                format!("  machine {}", short(peer))
+            } else {
+                format!("  machine {} ({})", short(peer), marks.join(", "))
+            });
+        }
+    }
+    let unknown: Vec<u64> = folders.difference(&claimed).copied().collect();
+    if !unknown.is_empty() {
+        (io.out)(
+            "Unknown machines (writing to the folder, but no person on the team claims them):",
+        );
+        for peer in unknown {
+            (io.out)(&format!("  machine {}", short(peer)));
+        }
+    }
+    (io.out)(
+        "This list is what each machine says about itself; nothing proves it yet. Anyone who can \
+         write to the team folder can add to it.",
+    );
+    after(io, &ws);
+    Ok(())
+}
+
+/// A machine as `rodu team members` shows it: the first 8 hex digits of its peer id, which its
+/// replica folder's name starts with, or all 16 when another machine listed shares those 8.
+fn short_peer(peer: u64, all: &BTreeSet<u64>) -> String {
+    let full = format!("{peer:016x}");
+    let shared = all.iter().any(|other| *other != peer && other >> 32 == peer >> 32);
+    if shared { full } else { full[..8].to_owned() }
+}
+
 fn folder_arg(io: &Io<'_>, args: &Args) -> Result<PathBuf> {
     let folder = args.value("folder").ok_or_else(|| {
         RoduError::invalid("--folder is required")
@@ -570,6 +675,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     .expecting(&workspace_id);
     folder.create(&workspace_id, store.peer())?;
     store.set_numbering_peer(store.peer())?;
+    store.set_member(store.peer(), &config.user_id)?;
     let readable_copy = args.flag("readable-copy");
     if readable_copy {
         store.set_readable_copy(true)?;
@@ -690,8 +796,20 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
         RoduError::invalid("team join needs an invite code such as rodu1-0190…")
             .with_hint("The teammate who created the team sees it in: rodu team --show-invite")
     })?;
-    let name =
-        args.value("name").ok_or_else(|| RoduError::invalid("team join needs --name <you>"))?;
+    let who = match (args.value("name"), args.value("as")) {
+        (Some(name), None) => Joining::New(name),
+        (None, Some(name)) => Joining::As(name),
+        (Some(_), Some(_)) => {
+            return Err(RoduError::invalid(
+                "Give --name for someone new to the team, or --as for someone already on it, \
+                 not both",
+            ));
+        }
+        (None, None) => {
+            return Err(RoduError::invalid("team join needs --name <you>")
+                .with_hint("Joining from a second machine? Use --as <your name on the team>"));
+        }
+    };
     let folder_path = folder_arg(io, args)?;
     let info = TeamFolder::new(&folder_path).info()?;
     if info.workspace_id != workspace_id {
@@ -747,7 +865,7 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
     let existed = dir.exists();
     create_private_dir(&dir)
         .map_err(|e| RoduError::invalid(format!("Cannot create {}: {e}", dir.display())))?;
-    let result = join_into(io, &dir, &folder, &folder_path, name, workspace_id, key_hex);
+    let result = join_into(io, &dir, &folder, &folder_path, who, workspace_id, key_hex);
     if result.is_err() {
         // Only what this join made, so it can simply be run again.
         let made =
@@ -762,12 +880,59 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
     result
 }
 
+/// Who a join is for.
+#[derive(Clone, Copy)]
+enum Joining<'a> {
+    /// Someone new to the team, under this name.
+    New(&'a str),
+    /// Someone already on the team, joining from another machine.
+    As(&'a str),
+}
+
+/// The person and agent a join writes for: new ones, or those of someone already on the team.
+fn join_principals(service: &RoduService<AnyStore>, who: Joining<'_>) -> Result<(String, String)> {
+    let name = match who {
+        Joining::New(name) => {
+            let user = service.create_principal(name, PrincipalKind::Human, None)?;
+            let agent = service.create_principal(
+                &format!("{name}-agent"),
+                PrincipalKind::Agent,
+                Some(&user.id),
+            )?;
+            return Ok((user.id, agent.id));
+        }
+        Joining::As(name) => name,
+    };
+    let mut principals = service.store.list_principals()?;
+    principals.sort_by(|a, b| a.name.cmp(&b.name));
+    let Some(found) = principals.iter().find(|p| p.name == name) else {
+        return Err(RoduError::not_found(format!("No one called {name} is on this team"))
+            .with_hint("To join as someone new: --name <you>"));
+    };
+    if found.kind != PrincipalKind::Human {
+        return Err(RoduError::invalid(format!("{name} is an agent, not a person"))
+            .with_hint("Join as the person it acts for"));
+    }
+    let agent = principals
+        .iter()
+        .find(|p| p.kind == PrincipalKind::Agent && p.owner_id.as_deref() == Some(&found.id));
+    let agent = match agent {
+        Some(agent) => agent.id.clone(),
+        None => {
+            service
+                .create_principal(&format!("{name}-agent"), PrincipalKind::Agent, Some(&found.id))?
+                .id
+        }
+    };
+    Ok((found.id.clone(), agent))
+}
+
 fn join_into(
     io: &mut Io<'_>,
     dir: &Path,
     folder: &TeamFolder,
     folder_path: &Path,
-    name: &str,
+    who: Joining<'_>,
     workspace_id: String,
     key_hex: Option<zeroize::Zeroizing<String>>,
 ) -> Result<()> {
@@ -791,15 +956,11 @@ fn join_into(
         ));
     };
     let config = service.store.transaction(TxMode::Write, || {
-        let user = service.create_principal(name, PrincipalKind::Human, None)?;
-        let agent = service.create_principal(
-            &format!("{name}-agent"),
-            PrincipalKind::Agent,
-            Some(&user.id),
-        )?;
+        let (user_id, agent_id) = join_principals(&service, who)?;
+        store.set_member(store.peer(), &user_id)?;
         Ok(Config {
-            user_id: user.id,
-            agent_id: agent.id,
+            user_id,
+            agent_id,
             collection: collection.key.clone(),
             team: Some(TeamConfig {
                 folder: folder_path.display().to_string(),
@@ -811,6 +972,7 @@ fn join_into(
     })?;
     folder.push(store)?;
     save_config(dir, &config)?;
+    let (Joining::New(name) | Joining::As(name)) = who;
     (io.out)(&format!("Joined the team at {} as {name}", dir.display()));
     Ok(())
 }
@@ -833,6 +995,35 @@ mod tests {
         };
         let store = AnyStore::Team(Box::new(LoroStore::open(dir).unwrap()));
         (config, RoduService::new(store).with_numbering(numbering))
+    }
+
+    #[test]
+    fn a_machine_is_shown_by_8_hex_digits_unless_another_shares_them() {
+        let all =
+            BTreeSet::from([0x3f9a_12bc_0000_0001, 0x3f9a_12bc_0000_0002, 0x0000_00ab_0000_0000]);
+        assert_eq!(short_peer(0x0000_00ab_0000_0000, &all), "000000ab");
+        assert_eq!(short_peer(0x3f9a_12bc_0000_0001, &all), "3f9a12bc00000001");
+    }
+
+    #[test]
+    fn a_machine_missing_from_the_members_records_itself_once_its_person_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, service) = legacy(dir.path(), true);
+        let store = service.store.team().unwrap();
+        // The config's person is not in the document yet: nothing to record.
+        settle_member(&config, &service).unwrap();
+        assert!(store.members().unwrap().is_empty());
+
+        let ann = service.create_principal("ann", PrincipalKind::Human, None).unwrap();
+        config.user_id = ann.id.clone();
+        settle_member(&config, &service).unwrap();
+        assert_eq!(store.members().unwrap().get(&store.peer()), Some(&ann.id));
+
+        // An entry another machine overwrote is put back.
+        let eve = service.create_principal("eve", PrincipalKind::Human, None).unwrap();
+        store.set_member(store.peer(), &eve.id).unwrap();
+        settle_member(&config, &service).unwrap();
+        assert_eq!(store.members().unwrap().get(&store.peer()), Some(&ann.id));
     }
 
     #[test]

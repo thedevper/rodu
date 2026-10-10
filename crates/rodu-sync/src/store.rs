@@ -20,7 +20,7 @@
 //! from a stale copy under the same peer id.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -41,7 +41,7 @@ use rodu_store::index::Parked;
 use sha2::{Digest, Sha256};
 
 use crate::layout::{
-    self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, NUMBERING_PEER, PRINCIPALS,
+    self, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS, NUMBERING_PEER, PRINCIPALS,
     READABLE_COPY, TEAM,
 };
 use crate::names::{self, Entry};
@@ -136,6 +136,7 @@ enum Change {
     Link(Link),
     NumberingPeer(u64),
     ReadableCopy(bool),
+    Member(u64, String),
 }
 
 /// Which entities a document change touched.
@@ -372,6 +373,37 @@ impl LoroStore {
     pub fn set_readable_copy(&self, on: bool) -> Result<()> {
         self.transaction(TxMode::Write, || {
             self.pending.borrow_mut().push(Change::ReadableCopy(on));
+            Ok(())
+        })
+    }
+
+    /// Which person each machine says it writes for: peer id to principal id. An entry whose key
+    /// is not a peer id, or whose value is not the id of a principal in the document, is left
+    /// out.
+    pub fn members(&self) -> Result<BTreeMap<u64, String>> {
+        self.transaction(TxMode::Write, || {
+            let doc = self.doc.borrow();
+            let principals = doc.get_map(PRINCIPALS);
+            let mut members = BTreeMap::new();
+            doc.get_map(MEMBERS).for_each(|key, value| {
+                let (Some(peer), ValueOrContainer::Value(LoroValue::String(id))) =
+                    (layout::parse_peer(key), value)
+                else {
+                    return;
+                };
+                if is_uuid(&id) && principals.get(&id).is_some() {
+                    members.insert(peer, id.to_string());
+                }
+            });
+            Ok(members)
+        })
+    }
+
+    /// Records that `peer` writes for the principal `principal_id`, for every machine once they
+    /// sync.
+    pub fn set_member(&self, peer: u64, principal_id: &str) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            self.pending.borrow_mut().push(Change::Member(peer, principal_id.to_string()));
             Ok(())
         })
     }
@@ -877,6 +909,14 @@ impl LoroStore {
             }
             Change::ReadableCopy(on) => {
                 doc.get_map(TEAM).insert(READABLE_COPY, *on).map_err(internal)
+            }
+            Change::Member(peer, id) => {
+                if !is_uuid(id) {
+                    return Err(internal(format!("{id:?} is not an id")));
+                }
+                doc.get_map(MEMBERS)
+                    .insert(&layout::peer_text(*peer), id.as_str())
+                    .map_err(internal)
             }
             Change::Item(change) => {
                 let (old, i) = &**change;

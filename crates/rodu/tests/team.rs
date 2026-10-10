@@ -815,3 +815,109 @@ fn symlinks_in_the_copy_are_never_followed() {
     let _ = rodu(&team.ann, &["team", "readable-copy", "off"]);
     assert_eq!(std::fs::read_to_string(&secret).unwrap(), "keep");
 }
+
+#[test]
+fn members_lists_each_person_with_their_agents_and_machines() {
+    let team = team();
+    let bob = join(&team, "bob");
+    let (ann_id, bob_id) = (&machine(&team.ann)[..8], &machine(&bob)[..8]);
+    ok(&team.ann, &["sync"]);
+    let list = ok(&team.ann, &["team", "members"]);
+    let ann_at = list.find("ann\n").expect(&list);
+    let bob_at = list.find("bob\n").expect(&list);
+    assert!(ann_at < bob_at, "sorted by name: {list}");
+    assert!(list.contains("agents: ann-agent"), "{list}");
+    assert!(list.contains("agents: bob-agent"), "{list}");
+    assert!(list.contains(&format!("machine {ann_id} (this machine, numbers cards)")), "{list}");
+    assert!(list.contains(&format!("machine {bob_id}\n")), "{list}");
+    assert!(!list.contains("Unknown"), "{list}");
+    assert!(list.contains("nothing proves it yet"), "{list}");
+    // bob sees the same people, with his own machine marked.
+    let seen = ok(&bob, &["team", "members"]);
+    assert!(seen.contains(&format!("machine {bob_id} (this machine)")), "{seen}");
+    assert!(seen.contains(&format!("machine {ann_id} (numbers cards)")), "{seen}");
+}
+
+#[test]
+fn a_replica_folder_nobody_claims_is_an_unknown_machine() {
+    let team = team();
+    std::fs::create_dir_all(team.folder.join("sync/00000000000000ab")).unwrap();
+    std::fs::create_dir_all(team.folder.join("sync/not-a-machine")).unwrap();
+    let list = ok(&team.ann, &["team", "members"]);
+    assert!(list.contains("Unknown machines"), "{list}");
+    assert!(list.contains("machine 00000000\n"), "shown by its folder's first 8 digits: {list}");
+    assert!(!list.contains("not-a-machine"), "only replica folders are machines: {list}");
+}
+
+#[test]
+fn join_as_adds_a_second_machine_for_someone_already_on_the_team() {
+    let team = team();
+    let bob = join(&team, "bob");
+    let laptop = team.ann.parent().unwrap().join("bob-laptop");
+    std::fs::create_dir_all(&laptop).unwrap();
+    let folder = team.folder.to_str().unwrap();
+    let joined = ok(&laptop, &["team", "join", &team.code, "--folder", folder, "--as", "bob"]);
+    assert!(joined.contains("as bob"), "{joined}");
+    ok(&bob, &["sync"]);
+    let list = ok(&bob, &["team", "members"]);
+    assert!(!list.contains("bob2"), "no second bob: {list}");
+    let bob_section = &list[list.find("bob\n").expect(&list)..];
+    assert!(bob_section.contains(&machine(&bob)[..8]), "{list}");
+    assert!(bob_section.contains(&machine(&laptop)[..8]), "{list}");
+    // Cards made on the laptop are bob's.
+    ok(&laptop, &["add", "From the laptop", "--assignee", "me"]);
+    ok(&bob, &["sync"]);
+    let shown = ok(&bob, &["ls"]);
+    let line = shown.lines().find(|l| l.contains("From the laptop")).expect(&shown);
+    let key = line.split_whitespace().next().unwrap();
+    let card = ok(&bob, &["show", key]);
+    assert!(card.lines().any(|l| l.contains("ssignee") && l.contains("bob")), "{card}");
+}
+
+#[test]
+fn join_as_someone_not_on_the_team_or_an_agent_is_refused_and_writes_nothing() {
+    let team = team();
+    let dir = team.ann.parent().unwrap().join("eve");
+    std::fs::create_dir_all(&dir).unwrap();
+    let folder = team.folder.to_str().unwrap();
+    let before = std::fs::read_dir(team.folder.join("sync")).unwrap().count();
+    let nobody = rodu(&dir, &["team", "join", &team.code, "--folder", folder, "--as", "eve"]);
+    assert_ne!(nobody.code, 0);
+    assert!(nobody.err.contains("No one called eve"), "{}", nobody.err);
+    let agent = rodu(&dir, &["team", "join", &team.code, "--folder", folder, "--as", "ann-agent"]);
+    assert_ne!(agent.code, 0);
+    assert!(agent.err.contains("is an agent"), "{}", agent.err);
+    let both = rodu(
+        &dir,
+        &["team", "join", &team.code, "--folder", folder, "--as", "ann", "--name", "eve"],
+    );
+    assert_ne!(both.code, 0);
+    assert!(both.err.contains("not both"), "{}", both.err);
+    assert!(!dir.join(".rodu").exists());
+    assert_eq!(std::fs::read_dir(team.folder.join("sync")).unwrap().count(), before);
+}
+
+#[test]
+fn a_machine_whose_entry_is_missing_or_wrong_records_itself_on_its_next_command() {
+    use rodu_core::store::Store;
+    let team = team();
+    let bob = join(&team, "bob");
+    let bob_id = machine(&bob);
+    // As a team made before the document listed members, or a machine that overwrote the
+    // entry, would leave it: bob's machine is recorded as someone else's.
+    {
+        let store = rodu_sync::LoroStore::open(&bob.join(".rodu")).unwrap();
+        let ann = store.list_principals().unwrap().into_iter().find(|p| p.name == "ann").unwrap();
+        let peer = u64::from_str_radix(&bob_id, 16).unwrap();
+        store.set_member(peer, &ann.id).unwrap();
+        assert_eq!(store.members().unwrap().get(&peer), Some(&ann.id));
+    }
+    // Any command puts it right, and it reaches ann.
+    ok(&bob, &["ls"]);
+    ok(&team.ann, &["sync"]);
+    let list = ok(&team.ann, &["team", "members"]);
+    let bob_section = &list[list.find("bob\n").expect(&list)..];
+    assert!(bob_section.contains(&format!("machine {}", &bob_id[..8])), "{list}");
+    let ann_section = &list[..list.find("bob\n").unwrap()];
+    assert!(!ann_section.contains(&bob_id[..8]), "{list}");
+}
