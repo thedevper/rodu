@@ -249,7 +249,9 @@ struct ExchangeFile {
     signature: String,
 }
 
-/// What a keys file holds: `<recipient peer, 16 hex>.<generation>.<key check>.<wrapped, hex>`.
+/// What a keys file holds, format 2: `<recipient peer, 16 hex>.<generation>.<key check>.<wrapped,
+/// hex>.<signer key, 64 hex>.<signature, 128 hex>`. The signature ([`sign::check_wrapped`]) lets a
+/// machine take a key only from one allowed to share keys, whoever wrote the file.
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct KeysFile {
@@ -257,11 +259,24 @@ struct KeysFile {
     keys: Vec<String>,
 }
 
-/// A wrapped key's entry in a keys file: recipient peer, generation, key check and the key as
-/// [`seal::wrap`] wrapped it; `None` unless every part is well formed.
-fn parse_wrapped(entry: &str) -> Option<(u64, u64, &str, Vec<u8>)> {
+/// A wrapped key's entry in a keys file, as [`parse_wrapped`] reads it.
+struct Wrapped<'a> {
+    to: u64,
+    generation: u64,
+    check: &'a str,
+    wrapped: Vec<u8>,
+    signer: PublicKey,
+    signature: &'a str,
+}
+
+/// A wrapped key's entry in a keys file: recipient peer, generation, key check, the key as
+/// [`seal::wrap`] wrapped it, and who signed it with what; `None` unless every part is well
+/// formed. Whether the signature verifies is the caller's to check.
+fn parse_wrapped(entry: &str) -> Option<Wrapped<'_>> {
     let parts: Vec<&str> = entry.split('.').collect();
-    let [peer, generation, check, wrapped] = parts.as_slice() else { return None };
+    let [peer, generation, check, wrapped, signer, signature] = parts.as_slice() else {
+        return None;
+    };
     let check_ok =
         check.len() == 64 && check.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let wrapped_ok = wrapped.len() == seal::WRAPPED_LEN * 2
@@ -269,12 +284,14 @@ fn parse_wrapped(entry: &str) -> Option<(u64, u64, &str, Vec<u8>)> {
     if !check_ok || !wrapped_ok {
         return None;
     }
-    Some((
-        parse_peer_dir(peer)?,
-        authority::generation(generation)?,
+    Some(Wrapped {
+        to: parse_peer_dir(peer)?,
+        generation: authority::generation(generation)?,
         check,
-        hex::decode(wrapped).ok()?,
-    ))
+        wrapped: hex::decode(wrapped).ok()?,
+        signer: PublicKey::from_hex(signer)?,
+        signature,
+    })
 }
 
 /// A team key this machine holds: the first one (generation 0, from the invite code), or one it
@@ -1564,46 +1581,75 @@ impl TeamFolder {
             return Ok(());
         }
         let secret = key.exchange_secret();
+        let team = self.team_id(info);
         let held = self.held(false)?;
-        let mut found: Vec<Held> = Vec::new();
+        // Each key unwrapped once, with every machine whose signature on a wrap of it verifies:
+        // which of them may share keys is known only once the records are read, so a wrap one
+        // with no right to signed first never hides the same key wrapped by one with that right.
+        let mut found: Vec<(Held, BTreeSet<PublicKey>)> = Vec::new();
         for peer in self.replica_folders()? {
             let Some(file) = self.keys_file(peer) else { continue };
             let mut tried = 0;
             for entry in &file.keys {
-                let Some((to, generation, check, wrapped)) = parse_wrapped(entry) else { continue };
-                let known = |h: &Held| h.generation == generation && h.check == check;
-                if to != store.peer() || held.iter().any(known) || found.iter().any(known) {
+                let Some(w) = parse_wrapped(entry) else { continue };
+                if w.to != store.peer()
+                    || held.iter().any(|h| h.generation == w.generation && h.check == w.check)
+                    || !sign::check_wrapped(
+                        &w.signer,
+                        team,
+                        w.to,
+                        w.generation,
+                        w.check,
+                        &w.wrapped,
+                        w.signature,
+                    )
+                {
+                    continue;
+                }
+                if let Some((_, signers)) = found
+                    .iter_mut()
+                    .find(|(h, _)| h.generation == w.generation && h.check == w.check)
+                {
+                    signers.insert(w.signer);
                     continue;
                 }
                 if tried == MAX_UNWRAP {
                     break;
                 }
                 tried += 1;
-                let team = self.team_id(info);
-                if let Some(opened) = seal::unwrap(&secret, &wrapped, team, to, generation)
-                    && opened.check() == check
+                if let Some(opened) = seal::unwrap(&secret, &w.wrapped, team, w.to, w.generation)
+                    && opened.check() == w.check
                 {
-                    found.push(Held { generation, check: check.to_owned(), key: opened });
+                    let held =
+                        Held { generation: w.generation, check: w.check.to_owned(), key: opened };
+                    found.push((held, BTreeSet::from([w.signer])));
                 }
             }
         }
         if found.is_empty() {
             return Ok(());
         }
-        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = found.clone();
-        let counting = self
-            .authority_records(store, info)
-            .and_then(|records| Ok(self.resolve(store, &records)?.team_keys(&records)));
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) =
+            found.iter().map(|(h, _)| h.clone()).collect();
+        let resolved = self.authority_records(store, info).and_then(|records| {
+            let authority = self.resolve(store, &records)?;
+            Ok((authority.team_keys(&records), authority))
+        });
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        let counting = counting?;
+        let (counting, authority) = resolved?;
+        // Only a key the owner's machine or an admin's wrapped: anyone else holding an older key,
+        // a removed machine among them, could otherwise hand it to a machine that joins later.
+        found.retain(|(_, signers)| signers.iter().any(|s| authority.may_admit(s)));
         // Taken as a chain: a key is kept only when every generation before it is held here or
         // named by a counting record, so no single record, however high its generation, becomes
         // the newest key on its own (an admin cannot use up the generations, nor stay the writing
         // key for good).
-        found.sort_by(|a, b| a.generation.cmp(&b.generation).then_with(|| a.check.cmp(&b.check)));
+        found.sort_by(|(a, _), (b, _)| {
+            a.generation.cmp(&b.generation).then_with(|| a.check.cmp(&b.check))
+        });
         let mut top = held.first().map_or(0, |h| h.generation);
         let mut kept: Vec<Held> = Vec::new();
-        for candidate in found {
+        for (candidate, _) in found {
             if candidate.generation <= Self::chain(top, &counting) + 1
                 && counting.contains(&(candidate.generation, candidate.check.clone()))
             {
@@ -1631,7 +1677,7 @@ impl TeamFolder {
             return None;
         }
         let bytes = read_at_most(&path, MAX_KEYS_FILE).ok().flatten()?;
-        serde_json::from_slice::<KeysFile>(&bytes).ok().filter(|file| file.format == 1)
+        serde_json::from_slice::<KeysFile>(&bytes).ok().filter(|file| file.format == 2)
     }
 
     /// Encrypted signed team, on the owner's or an admin's machine: wraps every key after the
@@ -1648,12 +1694,12 @@ impl TeamFolder {
         if held.is_empty() && existing.is_none() {
             return Ok(());
         }
-        let existing = existing.unwrap_or(KeysFile { format: 1, keys: Vec::new() });
+        let existing = existing.unwrap_or(KeysFile { format: 2, keys: Vec::new() });
         let noted = store.local_note(NOTE_WRAPPED)?.unwrap_or_default();
         let wrote: BTreeSet<&str> = noted.lines().collect();
         let trusted = self.trusted(store, info)?;
         let team = self.team_id(info);
-        let mut file = KeysFile { format: 1, keys: Vec::new() };
+        let mut file = KeysFile { format: 2, keys: Vec::new() };
         for (peer, keys) in &trusted.admitted {
             if *peer == store.peer() || trusted.cut.contains_key(peer) {
                 continue;
@@ -1672,7 +1718,17 @@ impl TeamFolder {
                     Some(entry) => entry.clone(),
                     // One machine whose key cannot take a wrap never holds up the others.
                     None => match seal::wrap(&held.key, &exchange, team, *peer, held.generation) {
-                        Ok(wrapped) => format!("{prefix}{}", hex::encode(wrapped)),
+                        Ok(wrapped) => {
+                            let signature = key.sign_wrapped(
+                                team,
+                                *peer,
+                                held.generation,
+                                &held.check,
+                                &wrapped,
+                            );
+                            let signer = key.public().to_hex();
+                            format!("{prefix}{}.{signer}.{signature}", hex::encode(wrapped))
+                        }
                         Err(_) => continue,
                     },
                 });

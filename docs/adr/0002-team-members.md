@@ -349,8 +349,11 @@ Where 3b differs from the text above, 3b is what holds.
   `rodu team remove` on an encrypted team re-keys after the removals, so the new key is wrapped
   for nobody removed.
 - **Wrapped keys.** An owner's or admin's machine keeps a plain `keys.json` in its replica folder:
-  `{"format": 1, "keys": ["<recipient peer>.<generation>.<key check>.<wrapped, hex>", ...]}`, read
-  up to 1 MiB. `wrapped` is an ephemeral X25519 public key (32 bytes), a nonce (24) and the key
+  `{"format": 2, "keys": ["<recipient peer>.<generation>.<key check>.<wrapped, hex>.<signer key>.
+  <signature>", ...]}`, read up to 1 MiB. The signature is the wrapping machine's, over
+  `"rodu-wrapped-key-1" 0x00 || workspace id length (u64 LE) || workspace id || recipient peer id
+  (u64 LE) || generation (u64 LE) || check length (u64 LE) || check || wrapped length (u64 LE) ||
+  wrapped`. `wrapped` is an ephemeral X25519 public key (32 bytes), a nonce (24) and the key
   sealed with XChaCha20-Poly1305 (48). The key-encryption key is the SHA-256 of `"rodu-key-wrap-1"
   0x00 || shared secret || ephemeral public key || recipient public key`, and the associated data
   is `"rodu-key-wrap-1" 0x00 || workspace id length (u64 LE) || workspace id || recipient peer id
@@ -363,17 +366,24 @@ Where 3b differs from the text above, 3b is what holds.
   replica folders' names) and how often the key changed.
 - **Taking a key.** A pull first unwraps what is wrapped for this machine. It tries at most 64 new
   entries per file, so a planted file cannot make it run X25519 without end. It keeps a key only
-  when the key matches the entry's check and a key record that counts names that generation and
-  check, and only as a chain: every generation before it is held here or named by a counting
-  record, taken oldest first. So no record, however high its generation, becomes the newest key
-  without the ones before it: an admin cannot use up the generations, or stay the key everyone
-  seals with after it is revoked and removed. Until then the key only opens the folder's small
-  files (authority, seen and exchange files, whose content counts by its own signatures). That way
-  a record sealed with the new key is read, and the key itself never seals anything. Kept keys go
-  in `.rodu/team-keys` (one `<generation>.<check>.<key>` per line, mode 0600, zeroized in memory,
-  never in `config.json`); `team.key` keeps the invite code's key. A machine seals with the newest
-  key it holds (the lowest check first when two records name one generation, so every machine
-  picks the same) and opens a file with whichever key it holds that opens it.
+  when an entry wrapping it is signed by a key that may admit (the owner's or an admin's machine, as
+  the records read in that pull say), the key matches the entry's check, a key record that counts
+  names that generation and check, and only as a chain. The signer is checked because a keys file,
+  like every file in the folder, can be written by anyone who can write the folder: a removed
+  machine still holds the keys before its removal, and without the signature it could wrap one for a
+  machine that joins later, delete the owner's keys file, and so make that machine seal with a key
+  it can open. A wrap is unwrapped once, with every signer whose signature on a wrap of that key
+  verifies, so a wrap from a machine with no right to share keys never hides the owner's wrap of the
+  same key. The chain: every generation before it is held here or named by a counting record, taken
+  oldest first. So no record, however high its generation, becomes the newest key without the ones
+  before it: an admin cannot use up the generations, or stay the key everyone seals with after it is
+  revoked and removed. Until then the key only opens the folder's small files (authority, seen and
+  exchange files, whose content counts by its own signatures). That way a record sealed with the new
+  key is read, and the key itself never seals anything. Kept keys go in `.rodu/team-keys` (one
+  `<generation>.<check>.<key>` per line, mode 0600, zeroized in memory, never in `config.json`);
+  `team.key` keeps the invite code's key. A machine seals with the newest key it holds (the lowest
+  check first when two records name one generation, so every machine picks the same) and opens a
+  file with whichever key it holds that opens it.
 - **A file no key opens yet waits.** A sealed file that does not open with any key this machine
   holds is said once ("does not open with any team key this machine holds") and read again once
   the machine holds another key. Before 3b it was refused for good. Now a file sealed with a key
@@ -394,7 +404,9 @@ Where 3b differs from the text above, 3b is what holds.
   - Anyone who can write to the folder can swap a machine's exchange file for one signed by a
     key not admitted there. It is then not used, so that machine gets no new key until its own
     next pull puts its file back: a delay, not a way in. Deleting an owner's or admin's
-    `keys.json` delays the same way, until that machine's next pull writes it again.
+    `keys.json` delays the same way, until that machine's next pull writes it again. Meanwhile a
+    machine that joined since the re-key holds only the invite code's key and seals with it, as
+    in the point above.
   - What the folder held before the re-key stays readable to whoever holds the older key. A new
     key protects what comes after it, not what came before.
   - `removed.sealed` shows anyone holding the invite code's key which machines were removed, and
