@@ -27,6 +27,16 @@ static PRINCIPAL_NAME: LazyLock<Regex> =
 static COLLECTION_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Z][A-Z0-9]{1,9}$").unwrap());
 
+/// Whether `name` is a valid principal name.
+pub fn valid_principal_name(name: &str) -> bool {
+    PRINCIPAL_NAME.is_match(name)
+}
+
+/// Whether `key` (in any case) is a valid collection key.
+pub fn valid_collection_key(key: &str) -> bool {
+    COLLECTION_KEY.is_match(&key.to_uppercase())
+}
+
 pub const DEFAULT_CONTEXT_TOKENS: u32 = 4000;
 pub const DEFAULT_MAX_BATCH: usize = 25;
 const MAX_COMMENT: usize = 20_000;

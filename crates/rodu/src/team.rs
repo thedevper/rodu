@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
-use rodu_core::{Actor, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService};
+use rodu_core::{
+    Actor, ErrorCode, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService,
+};
 use rodu_sync::folder::{Admitted, JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::seal::TeamKey;
 use rodu_sync::sign::{MachineKey, PublicKey};
@@ -1223,29 +1225,36 @@ fn join_folder(io: &Io<'_>, args: &Args, workspace_id: &str) -> Result<PathBuf> 
         return Ok(resolve(&io.cwd, folder));
     }
     let locations = drive::locations(&io.env);
-    let mut found = drive::find_team(&locations, workspace_id);
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        0 if locations.is_empty() => {
+    let drive::Search { mut found, complete } = drive::find_team(&locations, workspace_id);
+    let list = |found: &[PathBuf]| {
+        found.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    };
+    match (found.len(), complete) {
+        (1, true) => Ok(found.remove(0)),
+        (0, _) if locations.is_empty() => {
             Err(RoduError::invalid("No Google Drive folder found on this machine").with_hint(
                 "Install Google Drive for desktop and sign in, or give the team's folder: \
                  rodu team join --folder <path>",
             ))
         }
-        0 => Err(RoduError::not_found("The team's folder is not in this machine's Google Drive yet")
-            .with_hint(
-                "Ask to be added to the team's shared drive, or open the shared folder in Google \
-                 Drive and add a shortcut to it in My Drive. Once Drive has synced it, run the join \
-                 again, or give the folder: --folder <path>",
-            )),
-        _ => {
-            let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
-            Err(RoduError::invalid(format!(
-                "This team's folder is in more than one place: {}",
-                list.join(", ")
-            ))
-            .with_hint("Choose one: rodu team join --folder <path>"))
-        }
+        (0, true) => Err(RoduError::not_found(
+            "The team's folder is not in this machine's Google Drive yet",
+        )
+        .with_hint(
+            "Ask to be added to the team's shared drive, or open the shared folder in Google \
+             Drive and add a shortcut to it in My Drive. Once Drive has synced it, run the join \
+             again, or give the folder: --folder <path>",
+        )),
+        (_, false) => Err(RoduError::invalid(format!(
+            "Google Drive holds too many folders to be sure where the team's is{}",
+            if found.is_empty() { String::new() } else { format!(" (found: {})", list(&found)) }
+        ))
+        .with_hint("Give the team's folder: rodu team join --folder <path>")),
+        _ => Err(RoduError::invalid(format!(
+            "This team's folder is in more than one place: {}",
+            list(&found)
+        ))
+        .with_hint("Choose one: rodu team join --folder <path>")),
     }
 }
 
@@ -1257,7 +1266,8 @@ fn system_user(io: &Io<'_>) -> Option<String> {
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         .collect();
     let name = name.trim_start_matches(['.', '_', '-']);
-    (!name.is_empty()).then(|| name.chars().take(40).collect())
+    // Room for the agent's name, `<name>-agent`, within a name's 40 characters.
+    (!name.is_empty()).then(|| name.chars().take(34).collect())
 }
 
 /// A collection key from a folder's name: its letters and digits in capitals, starting with a
@@ -1314,6 +1324,18 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
                 team.folder
             )));
         }
+        // A workspace found above this folder is shared whole: only when meant.
+        let here = var(io, "RODU_DIR").is_some() || ws.dir == io.cwd.join(".rodu");
+        if !here && !args.flag("yes") {
+            return Err(RoduError::invalid(format!(
+                "This folder is inside the workspace at {}: team create would share all of it",
+                ws.dir.display()
+            ))
+            .with_hint(
+                "To share that workspace, run it there or add --yes. For a board of this folder \
+                 alone: rodu init here first",
+            ));
+        }
         create_folder(io, args, &ws.config.collection)?
     } else {
         let name = match args.value("name") {
@@ -1324,11 +1346,33 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
             })?,
         };
         let key = args.value("key").map_or_else(|| key_from(&io.cwd), str::to_uppercase);
-        let folder_path = create_folder(io, args, &key)?;
         let title = args
             .value("title")
             .map(str::to_owned)
             .or_else(|| io.cwd.file_name().map(|n| n.to_string_lossy().into_owned()));
+        // Checked before anything is written, so a bad one leaves no workspace behind.
+        if name.len() > 34 || !rodu_core::service::valid_principal_name(&name) {
+            return Err(RoduError::invalid(format!("Invalid name \"{name}\""))
+                .with_hint("Use 1-34 letters, digits, dots, dashes or underscores: --name <you>"));
+        }
+        if !rodu_core::service::valid_collection_key(&key) {
+            return Err(RoduError::invalid(format!("Invalid collection key \"{key}\""))
+                .with_hint("Use 2-10 letters or digits starting with a letter: --key DEMO"));
+        }
+        if let Some(title) = &title {
+            rodu_core::input::check_name(title, 80)
+                .map_err(|e| e.with_hint("Give the board a title: --title \"<project>\""))?;
+        }
+        let folder_path = create_folder(io, args, &key)?;
+        if folder_path.join(TEAM_FILE).exists() {
+            return Err(RoduError::conflict(format!(
+                "{} already holds another team",
+                folder_path.display()
+            ))
+            .with_hint(
+                "Give this board another key (--key <KEY>), or join that team: rodu team join",
+            ));
+        }
         init_workspace(io, &name, &key, title.as_deref())?;
         (io.out)(&format!(
             "You are {name} on this board (another name: --name), and its cards are {key}-1, \
@@ -1351,7 +1395,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
         (false, None) => None,
         (false, Some(_)) => {
             return Err(RoduError::conflict(
-                "An encrypted team create stopped half way here: run it again with --encrypt",
+                "An encrypted team create stopped half way here: run it again without --no-encrypt",
             ));
         }
     };
@@ -1446,8 +1490,8 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     if encrypted {
         // The code is printed once: the join reads it from stdin, out of shell history.
         (io.out)(
-            "A teammate joins with: rodu team join - --folder <the same folder on their machine> \
-             --name <their name>, then pastes the invite code",
+            "A teammate joins with: rodu team join, then pastes the invite code (it finds the \
+             folder in their Google Drive; --folder <path> for another folder app)",
         );
         (io.out)(
             "Keep the invite code secret: it holds the team key. The sync files are encrypted; \
@@ -1457,7 +1501,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
         (io.out)(&secret_line(&[
             "A teammate joins with: rodu team join ",
             code.as_str(),
-            " --folder <the same folder on their machine> --name <their name>",
+            " (it finds the folder in their Google Drive; --folder <path> for another folder app)",
         ]));
         (io.out)(
             "The sync files are not encrypted: anyone with access to the folder can read them.",
@@ -1690,7 +1734,16 @@ enum Joining<'a> {
 fn join_principals(service: &RoduService<AnyStore>, who: Joining<'_>) -> Result<(String, String)> {
     let name = match who {
         Joining::New(name) => {
-            let user = service.create_principal(name, PrincipalKind::Human, None)?;
+            let user = service.create_principal(name, PrincipalKind::Human, None).map_err(|e| {
+                if e.code == ErrorCode::Conflict {
+                    e.with_hint(format!(
+                        "Already on the team, joining from another machine? Use --as {name}. \
+                             Someone else? Choose another name: --name <you>"
+                    ))
+                } else {
+                    e
+                }
+            })?;
             let agent = service.create_principal(
                 &format!("{name}-agent"),
                 PrincipalKind::Agent,
@@ -1784,7 +1837,11 @@ fn join_into(
         folder.write_request(store.peer(), name)?;
     }
     save_config(dir, &config)?;
-    (io.out)(&format!("Joined the team at {} as {name}", dir.display()));
+    (io.out)(&format!(
+        "Joined the team at {} as {name}, through {}",
+        dir.display(),
+        folder_path.display()
+    ));
     if let Some((_, code)) = signed {
         (io.out)(&format!("This machine's code: {code}"));
         (io.out)(&format!(
@@ -1894,5 +1951,34 @@ mod tests {
         let store = LoroStore::open(&dir).unwrap();
         assert_eq!(store.numbering_peer().unwrap(), None);
         assert_eq!(store.version(), before, "the document is unchanged");
+    }
+
+    #[test]
+    fn a_key_comes_from_the_folder_name_and_a_user_name_is_cut_to_fit() {
+        assert_eq!(key_from(Path::new("/x/my-board 2")), "MYBOARD2");
+        assert_eq!(key_from(Path::new("/x/2024 plans")), "PLANS");
+        assert_eq!(key_from(Path::new("/x/a-very-long-project-name")), "AVERYLONGP");
+        assert_eq!(key_from(Path::new("/x/ข้อมูล")), "TEAM", "no letters it can use");
+        assert_eq!(key_from(Path::new("/x/q")), "TEAM", "too short");
+        assert_eq!(key_from(Path::new("/")), "TEAM");
+
+        let user = |name: &str| {
+            let (mut out, mut err) = (|_: &str| {}, |_: &str| {});
+            let io = Io {
+                cwd: PathBuf::new(),
+                env: [("USER".to_owned(), name.to_owned())].into(),
+                out: &mut out,
+                err: &mut err,
+                open_url: None,
+                on_web_server: None,
+            };
+            system_user(&io)
+        };
+        assert_eq!(user("Ann Lee").as_deref(), Some("AnnLee"));
+        assert_eq!(user("_svc.ann").as_deref(), Some("svc.ann"));
+        assert_eq!(user("สมชาย"), None);
+        let long = user(&"a".repeat(60)).unwrap();
+        assert_eq!(long.len(), 34);
+        assert!(rodu_core::service::valid_principal_name(&format!("{long}-agent")));
     }
 }

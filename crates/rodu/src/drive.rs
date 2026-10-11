@@ -14,6 +14,10 @@ const MY_DRIVE: &str = "My Drive";
 const SHARED_DRIVES: &str = "Shared drives";
 /// Folders under an account that hold no team: other computers' backups and Drive's own.
 const SKIPPED: [&str; 2] = ["Other computers", ".shortcut-targets-by-id"];
+/// A hidden folder Drive for desktop keeps at an account's root, whatever its language.
+const SHORTCUT_TARGETS: &str = ".shortcut-targets-by-id";
+/// The folder `rodu team create` puts teams in, looked at first.
+const TEAMS_DIR: &str = "Rodu";
 /// How deep below a location [`find_team`] looks for a team's folder.
 const MAX_DEPTH: usize = 4;
 /// How many folders [`find_team`] looks in at most, across every location.
@@ -48,13 +52,17 @@ pub fn locations_in(home: Option<&Path>, drives: &[PathBuf]) -> Vec<Location> {
             }
         }
     }
+    // A drive's root, or a folder of it, is an account when it holds My Drive, or Drive's own
+    // hidden folder when My Drive goes by a name in another language.
+    let is_account =
+        |dir: &Path| dir.join(MY_DRIVE).is_dir() || dir.join(SHORTCUT_TARGETS).is_dir();
     for drive in drives {
-        if drive.join(MY_DRIVE).is_dir() {
+        if is_account(drive) {
             accounts.push((drive.display().to_string(), drive.clone()));
         } else {
             // An account in a folder of its own on the drive.
             for (name, path) in subfolders(drive) {
-                if path.join(MY_DRIVE).is_dir() {
+                if is_account(&path) {
                     accounts.push((format!("{name}, {}", drive.display()), path));
                 }
             }
@@ -108,36 +116,70 @@ pub fn locations_in(home: Option<&Path>, drives: &[PathBuf]) -> Vec<Location> {
     shared
 }
 
-/// The folder under `locations` holding the team with `workspace_id`, looking [`MAX_DEPTH`] deep
-/// and in at most [`MAX_FOLDERS`] folders. Every folder holding it, when there is more than one.
-pub fn find_team(locations: &[Location], workspace_id: &str) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut queue: VecDeque<(PathBuf, usize)> =
-        locations.iter().map(|l| (l.path.clone(), 0)).collect();
-    let mut looked = 0;
-    while let Some((dir, depth)) = queue.pop_front() {
-        if looked == MAX_FOLDERS {
-            break;
+/// What [`find_team`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Search {
+    /// Every folder holding the team, each once however many ways it was reached.
+    pub found: Vec<PathBuf>,
+    /// Whether every folder within reach was looked in. When not, a single match is no proof
+    /// that it is the only one, and is not taken on its own.
+    pub complete: bool,
+}
+
+/// The folders under `locations` holding the team with `workspace_id`. `Rodu/*` in each location,
+/// where `rodu team create` puts teams, is looked in first, and settles it when the team is
+/// there. Otherwise every folder is looked in, [`MAX_DEPTH`] deep and in at most [`MAX_FOLDERS`]
+/// folders. A match counts only inside a location, once links are followed.
+pub fn find_team(locations: &[Location], workspace_id: &str) -> Search {
+    let roots: Vec<PathBuf> =
+        locations.iter().filter_map(|l| fs::canonicalize(&l.path).ok()).collect();
+    let mut found: Vec<PathBuf> = Vec::new();
+    let take = |found: &mut Vec<PathBuf>, dir: &Path| -> bool {
+        let Ok(info) = TeamFolder::new(dir).info() else { return false };
+        if info.workspace_id == workspace_id
+            && let Ok(real) = fs::canonicalize(dir)
+            && roots.iter().any(|root| real.starts_with(root))
+            && !found.iter().any(|f| fs::canonicalize(f).is_ok_and(|f| f == real))
+        {
+            found.push(dir.to_owned());
         }
-        looked += 1;
-        if dir.join(TEAM_FILE).is_file() {
-            if TeamFolder::new(&dir).info().is_ok_and(|info| info.workspace_id == workspace_id)
-                && !found.contains(&dir)
-            {
-                found.push(dir);
-            }
-            // A team's folder holds no other team.
-            continue;
-        }
-        if depth < MAX_DEPTH {
-            for (name, path) in subfolders(&dir) {
-                if !SKIPPED.contains(&name.as_str()) {
-                    queue.push_back((path, depth + 1));
-                }
+        true
+    };
+    for location in locations {
+        for (_, dir) in subfolders(&location.path.join(TEAMS_DIR)) {
+            if dir.join(TEAM_FILE).is_file() {
+                take(&mut found, &dir);
             }
         }
     }
-    found
+    if !found.is_empty() {
+        return Search { found, complete: true };
+    }
+    let mut queue: VecDeque<(PathBuf, usize)> =
+        locations.iter().map(|l| (l.path.clone(), 0)).collect();
+    let mut looked = 0;
+    let mut complete = true;
+    while let Some((dir, depth)) = queue.pop_front() {
+        looked += 1;
+        // A team's folder holds no other team; a team file that does not read hides nothing.
+        if dir.join(TEAM_FILE).is_file() && take(&mut found, &dir) {
+            continue;
+        }
+        if depth == MAX_DEPTH {
+            continue;
+        }
+        for (name, path) in subfolders(&dir) {
+            if SKIPPED.contains(&name.as_str()) {
+                continue;
+            }
+            if looked + queue.len() >= MAX_FOLDERS {
+                complete = false;
+                break;
+            }
+            queue.push_back((path, depth + 1));
+        }
+    }
+    Search { found, complete }
 }
 
 /// The folders directly in `dir`, by name, leaving out hidden ones; empty if it does not read.
@@ -203,6 +245,57 @@ mod tests {
     }
 
     #[test]
+    fn rodu_folders_are_looked_in_first_and_a_search_cut_short_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let drive = root.path().join("Shared drives/Product");
+        let id = "0190aaaa-0000-7000-8000-00000000000a";
+        let write_team = |dir: &Path| {
+            mkdir(dir);
+            let team = format!(r#"{{"format":1,"workspaceId":"{id}"}}"#);
+            fs::write(dir.join(TEAM_FILE), team).unwrap();
+        };
+        // Enough folders to use up the search before it reaches either copy, a decoy among them.
+        for i in 0..MAX_FOLDERS {
+            mkdir(&drive.join(format!("f{i:05}")));
+        }
+        write_team(&drive.join("zz/Decoy"));
+        let at = [Location { label: String::new(), path: drive.clone(), shared: true }];
+        let cut = find_team(&at, id);
+        assert!(!cut.complete && cut.found.is_empty(), "{cut:?}");
+        // Where create puts it, it is found whatever else the drive holds.
+        write_team(&drive.join("Rodu/DEMO"));
+        assert_eq!(
+            find_team(&at, id),
+            Search { found: vec![drive.join("Rodu/DEMO")], complete: true }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_team_reached_two_ways_counts_once_and_one_outside_every_location_not_at_all() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "0190aaaa-0000-7000-8000-00000000000a";
+        let team = root.path().join("Shared drives/Product/Rodu/DEMO");
+        mkdir(&team);
+        fs::write(team.join(TEAM_FILE), format!(r#"{{"format":1,"workspaceId":"{id}"}}"#)).unwrap();
+        let mine = root.path().join("My Drive");
+        mkdir(&mine);
+        std::os::unix::fs::symlink(&team, mine.join("Shortcut")).unwrap();
+        let both = [
+            Location {
+                label: String::new(),
+                path: root.path().join("Shared drives/Product"),
+                shared: true,
+            },
+            Location { label: String::new(), path: mine.clone(), shared: false },
+        ];
+        assert_eq!(find_team(&both, id).found.len(), 1);
+        // Through a link out of the only location searched: not taken.
+        let only_mine = [Location { label: String::new(), path: mine, shared: false }];
+        assert!(find_team(&only_mine, id).found.is_empty());
+    }
+
+    #[test]
     fn finds_accounts_on_a_drive_letter_alone_or_in_a_folder_each() {
         let g = tempfile::tempdir().unwrap();
         mkdir(&g.path().join("My Drive"));
@@ -211,7 +304,14 @@ mod tests {
         mkdir(&h.path().join("bob@example.com/My Drive"));
         mkdir(&h.path().join("not an account"));
         let empty = tempfile::tempdir().unwrap();
+        // A drive whose My Drive goes by another name, known by Drive's own hidden folder.
+        let k = tempfile::tempdir().unwrap();
+        mkdir(&k.path().join(".shortcut-targets-by-id"));
+        mkdir(&k.path().join("ไดรฟ์ของฉัน"));
         let found = locations_in(None, &[g.path().into(), h.path().into(), empty.path().into()]);
+        let other = locations_in(None, &[k.path().into()]);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].path, k.path().join("ไดรฟ์ของฉัน"));
         let paths: Vec<&Path> = found.iter().map(|l| l.path.as_path()).collect();
         assert_eq!(
             paths,
@@ -252,11 +352,20 @@ mod tests {
         write_team(&mine.join("Rodu/OTHER"), other);
         write_team(&mine.join("a/b/c/d/e/DEEP"), id);
         let at = [Location { label: String::new(), path: mine.clone(), shared: false }];
-        assert_eq!(find_team(&at, id), [mine.join("Shared with me shortcut/Rodu/DEMO")]);
-        assert_eq!(find_team(&at, other), [mine.join("Rodu/OTHER")]);
-        assert!(find_team(&at, "0190aaaa-0000-7000-8000-00000000000c").is_empty());
+        let found = |id| find_team(&at, id).found;
+        assert_eq!(found(id), [mine.join("Shared with me shortcut/Rodu/DEMO")]);
+        assert_eq!(found(other), [mine.join("Rodu/OTHER")]);
+        assert!(found("0190aaaa-0000-7000-8000-00000000000c").is_empty());
+        assert!(find_team(&at, id).complete);
         // The same team twice, as when a folder was copied: both are named.
         write_team(&mine.join("Copy/DEMO"), id);
-        assert_eq!(find_team(&at, id).len(), 2);
+        assert_eq!(found(id).len(), 2);
+        // A team file that does not read hides nothing below it.
+        let junk = root.path().join("Shared");
+        mkdir(&junk);
+        fs::write(junk.join(TEAM_FILE), "not a team").unwrap();
+        write_team(&junk.join("Rodu2/DEMO"), other);
+        let shared = [Location { label: String::new(), path: junk, shared: true }];
+        assert_eq!(find_team(&shared, other).found.len(), 1);
     }
 }

@@ -38,7 +38,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
   team [--show-invite]       where this workspace syncs, and its invite code
-  team create [--drive <n> | --folder <shared folder>] [--no-encrypt] [--unsigned] [--readable-copy]   share this workspace with a team through Google Drive (encrypted, and you admit each machine, unless told otherwise; makes a workspace here if there is none)
+  team create [--drive <n> | --folder <shared folder>] [--no-encrypt] [--unsigned] [--readable-copy] [--yes]   share this workspace with a team through Google Drive (encrypted, and you admit each machine, unless told otherwise; makes a workspace here if there is none; --yes to share a workspace found above this folder)
   team join [<invite code|->] [--folder <shared folder>] [--name <you>]   join a team here, finding its folder in Google Drive (asks for the code when none is given)
   team join <invite code|-> [--folder <shared folder>] --as <your name>   join from another machine of yours
   team members               who is on the team, their agents and machines
