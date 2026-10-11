@@ -1302,7 +1302,7 @@ fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
 fn key_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> Option<String> {
     let state = team_folder(dir, team).and_then(|folder| folder.key_state(store)).ok()??;
     Some(match (state.held, state.newest) {
-        (0, 0) => return None,
+        (0, 0) => "Team key: the first, never changed; this machine has it".to_owned(),
         (held, newest) if held >= newest => format!(
             "Team key: changed {}; this machine has the newest",
             if held == 1 { "once".to_owned() } else { format!("{held} times") }
@@ -1990,7 +1990,11 @@ fn join_into(
     if signed.is_some() {
         folder.write_invited_request(store.peer(), name, secret.as_deref())?;
     }
-    save_config(dir, &config)?;
+    if let Err(e) = save_config(dir, &config) {
+        // Run again, the join makes a new machine: this one's request would only be in its way.
+        let _ = folder.remove_request(store.peer());
+        return Err(e);
+    }
     (io.out)(&format!(
         "Joined the team at {} as {name}, through {}",
         dir.display(),

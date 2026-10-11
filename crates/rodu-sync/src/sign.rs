@@ -405,7 +405,12 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     } else {
         block[..key.len()].copy_from_slice(key);
     }
-    let pad = |with: u8| Zeroizing::new(block.map(|b| b ^ with));
+    // Built in place, so no copy of a pad is left behind by a move.
+    let pad = |with: u8| {
+        let mut pad = Zeroizing::new([with; BLOCK]);
+        pad.iter_mut().zip(block.iter()).for_each(|(p, b)| *p ^= b);
+        pad
+    };
     let mut inner = Sha256::new();
     inner.update(pad(0x36).as_slice());
     inner.update(message);

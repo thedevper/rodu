@@ -379,9 +379,9 @@ struct HeldInvite {
     expires: u64,
 }
 
-/// The machines a pull admitted through invites, as (name, peer), and the first admission that
-/// failed.
-type Invited = (Vec<(String, u64)>, Option<RoduError>);
+/// The machines a pull admitted through invites, as (name, peer), and what went wrong with the
+/// others, one line each.
+type Invited = (Vec<(String, u64)>, Vec<String>);
 
 /// The most pending invites kept.
 const MAX_INVITES: usize = 256;
@@ -902,6 +902,22 @@ impl TeamFolder {
         write_new(&dir, &dir.join(file), &bytes)
     }
 
+    /// Takes back this machine's request to join, as a join that failed after writing it does,
+    /// so that a personal invite's proof is not left behind for a machine that is gone.
+    pub fn remove_request(&self, peer: u64) -> Result<()> {
+        let dir = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
+        for file in [REQUEST_PLAIN, REQUEST_SEALED] {
+            let path = dir.join(file);
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(folder_error(&path, e));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Signed team: the requests to join in the folder whose signature verifies. Anything else
     /// (a link, an oversize, damaged or unsigned file, a bad name) is skipped.
     pub fn requests(&self) -> Result<Vec<JoinRequest>> {
@@ -1076,11 +1092,11 @@ impl TeamFolder {
     /// proof of a personal invite this machine holds, for the name it asks under, before the
     /// invite expires. The invite is used up first, under the workspace's write lock, so it admits
     /// one machine at most even with several processes pulling at once. Returns the machines
-    /// admitted, and the first admission that failed, whose invite is used up all the same.
+    /// admitted, and a line for each invite used up without admitting anyone.
     fn admit_invited(&self, store: &LoroStore, info: &TeamInfo) -> Result<Invited> {
-        let Some((key, _)) = &self.signing else { return Ok((Vec::new(), None)) };
+        let Some((key, _)) = &self.signing else { return Ok((Vec::new(), Vec::new())) };
         if self.invites.is_none() || self.read_invites()?.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), Vec::new()));
         }
         if !self.authority_of(store, info)?.may_admit(&key.public()) {
             // No longer an owner or admin: its invites end with that, rather than coming back
@@ -1089,7 +1105,7 @@ impl TeamFolder {
                 held.clear();
                 Ok(((), true))
             })?;
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), Vec::new()));
         }
         let trusted = self.trusted(store, info)?;
         let team = self.team_id(info);
@@ -1103,7 +1119,7 @@ impl TeamFolder {
             })
             .collect();
         if asking.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), Vec::new()));
         }
         let now = unix_now();
         let (claimed, doubled) = self.change_invites(store, |held| {
@@ -1144,17 +1160,25 @@ impl TeamFolder {
             Ok(((claimed, doubled), changed))
         })?;
         let mut admitted = Vec::new();
-        let mut failed = doubled.into_iter().next().map(|name| {
-            RoduError::invalid(format!(
-                "more than one machine joined with the invite for {name}, so none was let in"
-            ))
-        });
+        // Each invite is used up by now, so a later pull would not say it again.
+        let mut failed: Vec<String> = doubled
+            .into_iter()
+            .map(|name| {
+                format!(
+                    "more than one machine joined with the invite for {name} (shared, or a join \
+                     run twice), so none was let in; check each with {name} and run rodu team \
+                     admit"
+                )
+            })
+            .collect();
         for request in claimed {
             match self.admit(store, &request) {
                 Ok(()) => admitted.push((request.name, request.peer)),
-                Err(e) => {
-                    failed.get_or_insert(e);
-                }
+                Err(e) => failed.push(format!(
+                    "{}'s machine joined with its invite but could not be let in: {}; run rodu \
+                     team admit",
+                    request.name, e.message
+                )),
             }
         }
         Ok((admitted, failed))
@@ -1228,13 +1252,7 @@ impl TeamFolder {
         match invited {
             Ok((invited, failed)) => {
                 report.invited = invited;
-                if let Some(e) = failed {
-                    report.batch.notes.push(format!(
-                        "admitting a machine through its invite: {}; the invite is used up, so \
-                         check the machine with its person and run rodu team admit",
-                        e.message
-                    ));
-                }
+                report.batch.notes.extend(failed);
             }
             Err(e) => report.batch.notes.push(format!(
                 "admitting a machine through its invite: {}; tried again next time",
