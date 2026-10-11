@@ -893,7 +893,7 @@ pub(crate) fn invite(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
         if name.is_some() || args.value("days").is_some() {
             return Err(RoduError::invalid("Give only the name to cancel: --revoke <name>"));
         }
-        if !folder.revoke_invite(revoke)? {
+        if !folder.revoke_invite(store, revoke)? {
             return Err(RoduError::not_found(format!(
                 "No invite for {} is waiting",
                 revoke.escape_debug()
@@ -931,8 +931,9 @@ pub(crate) fn invite(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
     ));
     (io.out)(&personal_code(&code, &secret, name));
     (io.out)(&format!(
-        "Send it to {name} only, not through the team folder: whoever joins with it first is \
-         admitted when this machine next syncs.{} They run: rodu team join, then paste it",
+        "Send it to {name} only, not through the team folder: the machine that joins with it is \
+         admitted when this machine next syncs, and if two do, neither is.{} They run: rodu team \
+         join, then paste it",
         if key.is_some() { " It holds the team key." } else { "" }
     ));
     Ok(())

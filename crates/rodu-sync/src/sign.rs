@@ -405,11 +405,12 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     } else {
         block[..key.len()].copy_from_slice(key);
     }
+    let pad = |with: u8| Zeroizing::new(block.map(|b| b ^ with));
     let mut inner = Sha256::new();
-    inner.update(block.map(|b| b ^ 0x36));
+    inner.update(pad(0x36).as_slice());
     inner.update(message);
     let mut outer = Sha256::new();
-    outer.update(block.map(|b| b ^ 0x5c));
+    outer.update(pad(0x5c).as_slice());
     outer.update(inner.finalize());
     outer.finalize().into()
 }
@@ -445,7 +446,8 @@ pub fn check_join_proof(
 ) -> bool {
     let Some(given) = from_hex::<32>(proof) else { return false };
     let expected = hmac_sha256(secret, &join_message(workspace_id, peer, key, name));
-    given.iter().zip(expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    // black_box keeps the compiler from turning the fold into an early exit.
+    std::hint::black_box(given.iter().zip(expected).fold(0u8, |acc, (a, b)| acc | (a ^ b))) == 0
 }
 
 /// A join secret from its hex, if it is one.
