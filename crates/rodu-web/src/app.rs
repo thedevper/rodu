@@ -10,6 +10,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use crate::api::{Api, ApiError, take_token};
 use crate::board::{drop_neighbours, group_by_state, initials, insertion_index};
 use crate::panel::ItemPanel;
+use crate::team::TeamPanel;
 
 const LAST_COLLECTION: &str = "rodu.collection";
 const DRAG_TYPE: &str = "application/x-rodu-item";
@@ -61,6 +62,7 @@ fn Workspace(api: Api) -> impl IntoView {
     let filter_error = RwSignal::new(None::<ApiError>);
     let notice = RwSignal::new(None::<ApiError>);
     let selected = RwSignal::new(None::<String>);
+    let team_open = RwSignal::new(false);
 
     spawn_local(async move {
         let loaded = async {
@@ -196,7 +198,11 @@ fn Workspace(api: Api) -> impl IntoView {
         });
     };
 
-    let on_open = Callback::new(move |key: String| selected.set(Some(key)));
+    let on_open = Callback::new(move |key: String| {
+        team_open.set(false);
+        selected.set(Some(key));
+    });
+    let on_team_close = Callback::new(move |()| team_open.set(false));
     let on_error = Callback::new(move |e: ApiError| notice.set(Some(e)));
     let on_changed = Callback::new(move |()| spawn_local(reload()));
     let on_close = Callback::new(move |()| selected.set(None));
@@ -249,6 +255,17 @@ fn Workspace(api: Api) -> impl IntoView {
                         </button>
                     </Show>
                 </form>
+                <button
+                    type="button"
+                    class="ghost team-button"
+                    aria-pressed=move || team_open.get().to_string()
+                    on:click=move |_| {
+                        selected.set(None);
+                        team_open.update(|open| *open = !*open);
+                    }
+                >
+                    "Team"
+                </button>
                 <span class="me">{move || me.get()}</span>
             </header>
 
@@ -354,6 +371,12 @@ fn Workspace(api: Api) -> impl IntoView {
                             })
                     })
                     .map(|text| view! { <p class="truncated">{text}</p> })
+            }}
+
+            {move || {
+                team_open
+                    .get()
+                    .then(|| view! { <TeamPanel api=api on_close=on_team_close on_error=on_error /> })
             }}
 
             {move || {

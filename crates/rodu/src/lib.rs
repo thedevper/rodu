@@ -535,6 +535,7 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
     };
     let dir = ws.dir.clone();
     let live = team::live(&ws).map(|sync| LiveOptions { sync, every: LIVE_EVERY });
+    let team = team::panel(&ws);
     let server = start_web_server(WebServerOptions {
         service: ws.service,
         actor: ws.actor,
@@ -543,6 +544,7 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
         files,
         token: None,
         live,
+        team,
     })
     .await
     .map_err(|e| {

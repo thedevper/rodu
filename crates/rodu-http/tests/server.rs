@@ -153,6 +153,7 @@ async fn fixture() -> Fixture {
         files: None,
         token: Some(TOKEN.into()),
         live: None,
+        team: None,
     })
     .await
     .unwrap();
@@ -433,6 +434,7 @@ async fn serves_files_held_in_memory_as_the_single_binary_does() {
         files: Some(files),
         token: Some(TOKEN.into()),
         live: None,
+        team: None,
     })
     .await
     .unwrap();
@@ -465,6 +467,7 @@ async fn without_a_ui_serves_only_the_api() {
         files: None,
         token: None,
         live: None,
+        team: None,
     })
     .await
     .unwrap();
@@ -526,6 +529,7 @@ async fn live_server(sync: std::sync::Arc<FakeSync>) -> RunningServer {
         files: None,
         token: Some(TOKEN.into()),
         live: Some(LiveOptions { sync, every: std::time::Duration::from_millis(40) }),
+        team: None,
     })
     .await
     .unwrap()
@@ -591,4 +595,166 @@ async fn a_server_without_live_sync_still_answers_the_revision() {
     let f = fixture().await;
     assert_eq!(revision(&f.server).await, 0);
     f.server.close().await.unwrap();
+}
+
+// --- the team panel ---
+
+/// Answers every team call, recording each as `<call> <args>`.
+#[derive(Default)]
+struct FakeTeam {
+    calls: Mutex<Vec<String>>,
+}
+
+use std::sync::Mutex;
+
+impl rodu_http::TeamPanel<SqliteStore> for FakeTeam {
+    fn view(&self, _: &RoduService<SqliteStore>) -> rodu_core::Result<rodu_api::TeamView> {
+        self.calls.lock().unwrap().push("view".into());
+        Ok(rodu_api::TeamView {
+            folder: "/shared/team".into(),
+            encrypted: true,
+            signed: true,
+            may_admit: true,
+            people: Vec::new(),
+            unknown: Vec::new(),
+            asking: Vec::new(),
+            invites: Vec::new(),
+            trust: "signed".into(),
+        })
+    }
+
+    fn invite(
+        &self,
+        _: &RoduService<SqliteStore>,
+        name: &str,
+        days: Option<u64>,
+    ) -> rodu_core::Result<rodu_api::InviteCreated> {
+        self.calls.lock().unwrap().push(format!("invite {name} {days:?}"));
+        if name == "nobody" {
+            return Err(rodu_core::RoduError::invalid("Only the team owner's machine can invite"));
+        }
+        Ok(rodu_api::InviteCreated {
+            name: name.into(),
+            code: "rodu2-x+y.bob".into(),
+            until: "2026-01-31".into(),
+        })
+    }
+
+    fn revoke(
+        &self,
+        _: &RoduService<SqliteStore>,
+        name: &str,
+    ) -> rodu_core::Result<rodu_api::TeamDone> {
+        self.calls.lock().unwrap().push(format!("revoke {name}"));
+        Ok(rodu_api::TeamDone { message: "cancelled".into() })
+    }
+
+    fn admit(
+        &self,
+        _: &RoduService<SqliteStore>,
+        name: &str,
+        code: &str,
+    ) -> rodu_core::Result<rodu_api::TeamDone> {
+        self.calls.lock().unwrap().push(format!("admit {name} {code}"));
+        Ok(rodu_api::TeamDone { message: "admitted".into() })
+    }
+
+    fn remove(
+        &self,
+        _: &RoduService<SqliteStore>,
+        name: &str,
+        machine: Option<&str>,
+    ) -> rodu_core::Result<rodu_api::TeamDone> {
+        self.calls.lock().unwrap().push(format!("remove {name} {machine:?}"));
+        Ok(rodu_api::TeamDone { message: "removed".into() })
+    }
+}
+
+async fn team_server(
+    team: Option<std::sync::Arc<FakeTeam>>,
+    sync: std::sync::Arc<FakeSync>,
+) -> RunningServer {
+    let service = RoduService::new(SqliteStore::memory().unwrap());
+    let human = service.create_principal("alice", PrincipalKind::Human, None).unwrap();
+    let actor = Actor { principal_id: human.id, via_agent_id: None };
+    start_web_server(WebServerOptions {
+        service,
+        actor,
+        port: 0,
+        dist_dir: None,
+        files: None,
+        token: Some(TOKEN.into()),
+        // The timer stays out of the way: only the requests sync.
+        live: Some(LiveOptions { sync, every: std::time::Duration::from_secs(3600) }),
+        team: team.map(|t| t as std::sync::Arc<dyn rodu_http::TeamPanel<SqliteStore>>),
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_team_routes_reach_the_panel_and_a_change_pulls_first_and_pushes_after() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let team = std::sync::Arc::new(FakeTeam::default());
+    let sync = std::sync::Arc::new(FakeSync::default());
+    let s = team_server(Some(team.clone()), sync.clone()).await;
+    // The timer's first tick runs at once; wait for it, then count from there.
+    eventually(async || sync.pushes.load(SeqCst) >= 1).await;
+    let (pulls, pushes) = (sync.pulls.load(SeqCst), sync.pushes.load(SeqCst));
+
+    let reply = send(&s, "GET", "/api/team", none()).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.json()["mayAdmit"], true);
+    assert_eq!((sync.pulls.load(SeqCst), sync.pushes.load(SeqCst)), (pulls, pushes), "a look");
+
+    let body = |v: Value| Opts { body: Some(v), ..Opts::default() };
+    let reply = send(&s, "POST", "/api/team/invites", body(json!({"name": "bob"}))).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    assert_eq!(reply.json()["code"], "rodu2-x+y.bob");
+    assert_eq!((sync.pulls.load(SeqCst), sync.pushes.load(SeqCst)), (pulls + 1, pushes + 1));
+    for (path, payload) in [
+        ("/api/team/invites/revoke", json!({"name": "bob"})),
+        ("/api/team/admit", json!({"name": "cat", "code": "1234"})),
+        ("/api/team/remove", json!({"name": "cat", "machine": "0f19"})),
+    ] {
+        let reply = send(&s, "POST", path, body(payload)).await;
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+    }
+    assert_eq!(
+        *team.calls.lock().unwrap(),
+        ["view", "invite bob None", "revoke bob", "admit cat 1234", "remove cat Some(\"0f19\")"]
+    );
+    // A refused change is the panel's error. It is pushed all the same, since a team change can
+    // write before it fails.
+    let pushes = sync.pushes.load(SeqCst);
+    let reply = send(&s, "POST", "/api/team/invites", body(json!({"name": "nobody"}))).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(reply.json()["message"].as_str().unwrap().contains("Only the team owner"));
+    assert_eq!(sync.pushes.load(SeqCst), pushes + 1);
+}
+
+#[tokio::test]
+async fn the_team_routes_need_the_token_the_right_method_and_a_known_body() {
+    let team = std::sync::Arc::new(FakeTeam::default());
+    let s = team_server(Some(team.clone()), std::sync::Arc::default()).await;
+    let no_token = Opts { headers: vec![("Authorization", "")], ..Opts::default() };
+    assert_eq!(send(&s, "GET", "/api/team", no_token).await.status, 401);
+    assert_eq!(send(&s, "GET", "/api/team/invites", none()).await.status, 405);
+    assert_eq!(send(&s, "POST", "/api/team", none()).await.status, 405);
+    assert_eq!(send(&s, "POST", "/api/team/other", none()).await.status, 404);
+    let extra = Opts { body: Some(json!({"name": "bob", "admin": true})), ..Opts::default() };
+    assert_eq!(send(&s, "POST", "/api/team/invites", extra).await.status, 400);
+    let wrong = Opts { body: Some(json!({"name": 7})), ..Opts::default() };
+    assert_eq!(send(&s, "POST", "/api/team/remove", wrong).await.status, 400);
+    assert!(team.calls.lock().unwrap().is_empty(), "nothing reached the panel");
+}
+
+#[tokio::test]
+async fn a_workspace_with_no_team_says_so() {
+    let s = team_server(None, std::sync::Arc::default()).await;
+    let reply = send(&s, "GET", "/api/team", none()).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    assert!(reply.json()["hint"].as_str().unwrap().contains("rodu team create"));
+    let body = Opts { body: Some(json!({"name": "bob"})), ..Opts::default() };
+    assert_eq!(send(&s, "POST", "/api/team/invites", body).await.status, 404);
 }
