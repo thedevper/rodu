@@ -77,8 +77,9 @@ rodu team members               # who is on the team
 rodu team remove bob --yes      # refuse what bob's machines write from now on
 ```
 
-On an encrypted signed team, `team remove` also changes the team key, so the removed machine
-cannot read what is written after it. A team made without `--signed` cannot be switched to it
+On an encrypted signed team, `team remove` also changes the team key. What each machine writes
+once it has the new key is closed to the removed machine. What the folder held before stays
+readable to it, and so does what a machine writes before it next syncs. A team made without `--signed` cannot be switched to it
 later. `rodu team admin` lets another person admit machines, and `rodu team transfer-owner`
 hands the team over.
 
