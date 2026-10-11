@@ -2731,6 +2731,10 @@ fn an_invite_two_machines_joined_with_in_the_same_pull_admits_neither() {
     assert!(report.invited.is_empty(), "{report:?}");
     let note = report.batch.notes.iter().find(|n| n.contains("more than one machine joined"));
     assert!(note.is_some_and(|n| n.contains("invite for bob")), "{report:?}");
+    // A machine taking its request back leaves the folder as before it asked.
+    b2_folder.remove_request(b2.peer()).unwrap();
+    assert!(!b2_folder.requests().unwrap().iter().any(|r| r.peer == b2.peer()));
+    b2_folder.remove_request(b2.peer()).unwrap();
     assert!(ann_folder.admissions(a.store()).unwrap().is_empty());
     // bob's invite is used up; cat's is untouched.
     let pending = ann_folder.pending_invites().unwrap();

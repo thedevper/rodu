@@ -1020,6 +1020,8 @@ fn a_personal_invite_admits_a_teammate_with_no_code_sent_back() {
     let invite = personal_invite(&team, "bob");
     assert!(invite.starts_with(&format!("{}+", team.code)), "{invite}");
     assert!(ok(&team.ann, &["team", "invites"]).contains("bob  until "));
+    let status = ok(&team.ann, &["team"]);
+    assert!(status.contains("Team key: the first, never changed; this machine has it"), "{status}");
     let bob = team.ann.parent().unwrap().join("bob");
     std::fs::create_dir_all(&bob).unwrap();
     let folder = team.folder.to_str().unwrap();
