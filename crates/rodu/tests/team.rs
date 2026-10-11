@@ -1003,6 +1003,105 @@ fn a_signed_team_takes_in_a_teammate_once_the_creator_admits_them() {
     assert!(list.contains("(this machine, numbers cards, team owner)"), "{list}");
 }
 
+// --- personal invites (ADR 0004, step 2) ------------------------------------------------------
+
+/// The personal invite `rodu team invite <name>` printed on ann's machine.
+fn personal_invite(team: &Team, name: &str) -> String {
+    let out = ok(&team.ann, &["team", "invite", name]);
+    assert!(out.contains(&format!("Invite for {name}, until ")), "{out}");
+    let code = out.lines().find(|l| l.starts_with("rodu2-")).expect("an invite").to_owned();
+    assert!(code.ends_with(&format!(".{name}")) && code.contains('+'), "{code}");
+    code
+}
+
+#[test]
+fn a_personal_invite_admits_a_teammate_with_no_code_sent_back() {
+    let team = signed_team(true);
+    let invite = personal_invite(&team, "bob");
+    assert!(invite.starts_with(&format!("{}+", team.code)), "{invite}");
+    assert!(ok(&team.ann, &["team", "invites"]).contains("bob  until "));
+    let status = ok(&team.ann, &["team"]);
+    assert!(status.contains("Team key: the first, never changed; this machine has it"), "{status}");
+    let bob = team.ann.parent().unwrap().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    let folder = team.folder.to_str().unwrap();
+    // No --name: the invite says who it is for.
+    let out = ok(&bob, &["team", "join", &invite, "--folder", folder]);
+    assert!(out.contains("as bob, through"), "{out}");
+    assert!(out.contains("Nothing else to do"), "{out}");
+    assert!(!out.contains("rodu team admit"), "{out}");
+    ok(&bob, &["add", "From bob"]);
+
+    // ann's next command admits bob's machine and takes in his card.
+    let run = rodu(&team.ann, &["ls"]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(run.err.contains("note: sync: admitted bob's machine"), "{}", run.err);
+    assert!(!run.err.contains("warning"), "{}", run.err);
+    assert!(run.out.contains("From bob"), "{}", run.out);
+    assert!(ok(&team.ann, &["team", "invites"]).contains("No invite is waiting"));
+    assert!(ok(&bob, &["team"]).contains("this machine is admitted"));
+    ok(&team.ann, &["add", "From ann"]);
+    assert!(ok(&bob, &["ls"]).contains("From ann"));
+}
+
+#[test]
+fn a_personal_invite_is_for_its_name_only_and_can_be_cancelled() {
+    let team = signed_team(false);
+    let invite = personal_invite(&team, "bob");
+    let eve = team.ann.parent().unwrap().join("eve");
+    std::fs::create_dir_all(&eve).unwrap();
+    let folder = team.folder.to_str().unwrap();
+    let other = rodu(&eve, &["team", "join", &invite, "--folder", folder, "--name", "eve"]);
+    assert_ne!(other.code, 0);
+    assert!(other.err.contains("This invite is for bob, not eve"), "{}", other.err);
+    assert!(!eve.join(".rodu").exists(), "nothing written");
+
+    // Cancelled, it admits no one: the join still works, and waits for admit.
+    let again = personal_invite(&team, "bob");
+    assert_ne!(again, invite, "a new invite has a new secret");
+    assert!(ok(&team.ann, &["team", "invite", "--revoke", "bob"]).contains("Cancelled"));
+    let gone = rodu(&team.ann, &["team", "invite", "--revoke", "bob"]);
+    assert!(gone.err.contains("No invite for bob is waiting"), "{}", gone.err);
+    let bob = team.ann.parent().unwrap().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    ok(&bob, &["team", "join", &again, "--folder", folder]);
+    ok(&bob, &["add", "From bob"]);
+    let run = rodu(&team.ann, &["ls"]);
+    assert!(!run.err.contains("admitted"), "{}", run.err);
+    assert!(!run.out.contains("From bob"), "{}", run.out);
+    assert!(ok(&team.ann, &["team", "admit"]).contains("bob  code "));
+}
+
+#[test]
+fn only_a_signed_teams_owner_or_admin_invites() {
+    let plain = team();
+    let run = rodu(&plain.ann, &["team", "invite", "bob"]);
+    assert_ne!(run.code, 0);
+    assert!(run.err.contains("does not sign its files"), "{}", run.err);
+
+    let team = signed_team(false);
+    let (bob, code) = join_signed(&team, "bob");
+    ok(&team.ann, &["team", "admit", "bob", &code]);
+    let run = rodu(&bob, &["team", "invite", "cat"]);
+    assert_ne!(run.code, 0);
+    assert!(run.err.contains("Only the team owner's machine, or an admin's"), "{}", run.err);
+    for args in [
+        &["team", "invite"][..],
+        &["team", "invite", "cat", "--days", "0"],
+        &["team", "invite", "cat", "--days", "soon"],
+        &["team", "invite", "bad name!"],
+        &["team", "invite", "cat", "--revoke", "cat"],
+    ] {
+        let run = rodu(&team.ann, args);
+        assert_ne!(run.code, 0, "{args:?}: {}", run.out);
+    }
+    assert!(ok(&team.ann, &["team", "invites"]).contains("No invite is waiting"));
+    let invite = personal_invite(&team, "cat");
+    // On a plain team the invite holds no team key.
+    assert!(invite.starts_with(&format!("{}+", team.code)), "{invite}");
+    assert!(!ok(&team.ann, &["team", "invite", "dan", "--days", "90"]).contains("team key"));
+}
+
 // --- admins and ownership (ADR 0002, step 2b) -------------------------------------------------
 
 #[test]

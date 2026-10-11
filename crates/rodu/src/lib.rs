@@ -42,6 +42,9 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   team join [<invite code|->] [--folder <shared folder>] [--name <you>]   join a team here, finding its folder in Google Drive (asks for the code when none is given)
   team join <invite code|-> [--folder <shared folder>] --as <your name>   join from another machine of yours
   team members               who is on the team, their agents and machines
+  team invite <name> [--days 7]   signed team, owner or admin: an invite for one person, which admits their machine on its own
+  team invite --revoke <name>   cancel an invite not used yet
+  team invites               the invites not used yet
   team admit [<name> <code>]  signed team: list machines asking to join, or admit one
   team admin <name> on <code> | off [--machine <id>]   signed team, owner: let a person's machine admit others, or stop it
   team transfer-owner <name> <code> --yes   signed team, owner: hand the team to the person's machine with that code
@@ -99,6 +102,8 @@ const STRING_OPTIONS: &[&str] = &[
     "as",
     "machine",
     "drive",
+    "days",
+    "revoke",
 ];
 const BOOL_OPTIONS: &[&str] = &[
     "no-open",
@@ -377,6 +382,8 @@ async fn command_result(
             Some("join") => team::join(io, args, rest.get(1)).map(|()| 0),
             Some("members") => team::members(io).map(|()| 0),
             Some("admit") => team::admit(io, rest.get(1), rest.get(2)).map(|()| 0),
+            Some("invite") => team::invite(io, args, rest.get(1)).map(|()| 0),
+            Some("invites") => team::invites(io).map(|()| 0),
             Some("admin") => {
                 team::admin(io, args, rest.get(1), rest.get(2), rest.get(3)).map(|()| 0)
             }
@@ -390,7 +397,7 @@ async fn command_result(
             Some(other) => Err(RoduError::invalid(format!("Unknown team command \"{other}\""))
                 .with_hint(
                     "rodu team, rodu team create, rodu team join, rodu team members, \
-                     rodu team admit, rodu team admin, rodu team transfer-owner, rodu team remove, \
+                     rodu team invite, rodu team invites, rodu team admit, rodu team admin, rodu team transfer-owner, rodu team remove, \
                      rodu team rekey, rodu team take-numbering, rodu team readable-copy",
                 )),
         },

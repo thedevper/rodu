@@ -62,6 +62,9 @@ const SEEN_DOMAIN: &[u8] = b"rodu-seen-1\0";
 const EXCHANGE_DOMAIN: &[u8] = b"rodu-exchange-1\0";
 const EXCHANGE_KEY_DOMAIN: &[u8] = b"rodu-exchange-key-1\0";
 const WRAPPED_DOMAIN: &[u8] = b"rodu-wrapped-key-1\0";
+const JOIN_DOMAIN: &[u8] = b"rodu-join-1\0";
+/// The length of a personal invite's join secret (ADR 0004, step 2).
+pub const JOIN_SECRET_LEN: usize = 16;
 
 /// Exactly `2 * N` lowercase hex digits.
 fn from_hex<const N: usize>(text: &str) -> Option<Zeroizing<[u8; N]>> {
@@ -393,9 +396,105 @@ pub fn check_request(
         .is_some_and(|sig| key.verifies(&request_message(workspace_id, peer, name), &sig))
 }
 
+/// HMAC-SHA256 (RFC 2104) of `message` under `key`, with `sha2`, which Rodu already ships.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block = Zeroizing::new([0u8; BLOCK]);
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    // Built in place, so no copy of a pad is left behind by a move.
+    let pad = |with: u8| {
+        let mut pad = Zeroizing::new([with; BLOCK]);
+        pad.iter_mut().zip(block.iter()).for_each(|(p, b)| *p ^= b);
+        pad
+    };
+    let mut inner = Sha256::new();
+    inner.update(pad(0x36).as_slice());
+    inner.update(message);
+    let mut outer = Sha256::new();
+    outer.update(pad(0x5c).as_slice());
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+fn join_message(workspace_id: &str, peer: u64, key: &PublicKey, name: &str) -> Vec<u8> {
+    let mut message = with_team(JOIN_DOMAIN, workspace_id, peer);
+    message.extend(key.0);
+    message.extend((name.len() as u64).to_le_bytes());
+    message.extend(name.as_bytes());
+    message
+}
+
+/// A personal invite's proof that the machine with `key`, joining team `workspace_id` as `peer`
+/// under `name`, holds the invite's join secret: HMAC-SHA256 under the secret, hex.
+pub fn join_proof(
+    secret: &[u8; JOIN_SECRET_LEN],
+    workspace_id: &str,
+    peer: u64,
+    key: &PublicKey,
+    name: &str,
+) -> String {
+    hex::encode(hmac_sha256(secret, &join_message(workspace_id, peer, key, name)))
+}
+
+/// Whether `proof` is [`join_proof`] for these, compared in constant time.
+pub fn check_join_proof(
+    secret: &[u8; JOIN_SECRET_LEN],
+    workspace_id: &str,
+    peer: u64,
+    key: &PublicKey,
+    name: &str,
+    proof: &str,
+) -> bool {
+    let Some(given) = from_hex::<32>(proof) else { return false };
+    let expected = hmac_sha256(secret, &join_message(workspace_id, peer, key, name));
+    // black_box keeps the compiler from turning the fold into an early exit.
+    std::hint::black_box(given.iter().zip(expected).fold(0u8, |acc, (a, b)| acc | (a ^ b))) == 0
+}
+
+/// A join secret from its hex, if it is one.
+pub fn join_secret_from_hex(text: &str) -> Option<Zeroizing<[u8; JOIN_SECRET_LEN]>> {
+    from_hex::<JOIN_SECRET_LEN>(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        // Test cases 1 and 6 (a key longer than a block).
+        let one = hmac_sha256(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            hex::encode(one),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        let six =
+            hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First");
+        assert_eq!(
+            hex::encode(six),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn a_join_proof_holds_only_for_its_secret_team_machine_key_and_name() {
+        let secret = [7u8; JOIN_SECRET_LEN];
+        let key = MachineKey::generate().unwrap().public();
+        let proof = join_proof(&secret, "w", 1, &key, "bob");
+        assert!(check_join_proof(&secret, "w", 1, &key, "bob", &proof));
+        let other_key = MachineKey::generate().unwrap().public();
+        assert!(!check_join_proof(&[8u8; JOIN_SECRET_LEN], "w", 1, &key, "bob", &proof));
+        assert!(!check_join_proof(&secret, "v", 1, &key, "bob", &proof));
+        assert!(!check_join_proof(&secret, "w", 2, &key, "bob", &proof));
+        assert!(!check_join_proof(&secret, "w", 1, &other_key, "bob", &proof));
+        assert!(!check_join_proof(&secret, "w", 1, &key, "bo", &proof));
+        assert!(!check_join_proof(&secret, "w", 1, &key, "bob", "00"));
+        assert!(!check_join_proof(&secret, "w", 1, &key, "bob", &proof.to_uppercase()));
+    }
 
     const TEAM: &str = "0190f0c4-0000-7000-8000-000000000001";
 
