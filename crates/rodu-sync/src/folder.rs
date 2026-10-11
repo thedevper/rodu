@@ -902,8 +902,8 @@ impl TeamFolder {
     pub fn admit(&self, store: &LoroStore, request: &JoinRequest) -> Result<()> {
         let info = self.checked_info()?;
         // Sealed with the key the team has now, even in a process that settled it long ago; an
-        // error leaves it to the next push, which refuses to seal.
-        let _ = self.settle_seal_key(store, &info);
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let authority = self.authority_of(store, &info)?;
         if self.trusted(store, &info)?.cut.contains_key(&request.peer) {
             return Err(RoduError::invalid("That machine was removed from the team")
@@ -1416,8 +1416,8 @@ impl TeamFolder {
     pub fn remove(&self, store: &LoroStore, peer: u64) -> Result<bool> {
         let info = self.checked_info()?;
         // Sealed with the key the team has now, even in a process that settled it long ago; an
-        // error leaves it to the next push, which refuses to seal.
-        let _ = self.settle_seal_key(store, &info);
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
         let key = match &self.signing {
@@ -1457,8 +1457,8 @@ impl TeamFolder {
     pub fn set_admin(&self, store: &LoroStore, target: &PublicKey, on: bool) -> Result<()> {
         let info = self.checked_info()?;
         // Sealed with the key the team has now, even in a process that settled it long ago; an
-        // error leaves it to the next push, which refuses to seal.
-        let _ = self.settle_seal_key(store, &info);
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let team = self.team_id(&info);
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
@@ -1511,8 +1511,8 @@ impl TeamFolder {
     pub fn transfer(&self, store: &LoroStore, new: &PublicKey) -> Result<()> {
         let info = self.checked_info()?;
         // Sealed with the key the team has now, even in a process that settled it long ago; an
-        // error leaves it to the next push, which refuses to seal.
-        let _ = self.settle_seal_key(store, &info);
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
         let key = self.owner_key(&authority, "hand over the team")?;
@@ -1931,11 +1931,22 @@ impl TeamFolder {
         // leaves a key nobody holds, and the next sync finishes publishing it.
         store.set_local_note(NOTE_MADE_KEY, &format!("{generation}.{check}"))?;
         self.keep_keys(&[Held { generation, check: check.clone(), key: new }])?;
+        // The record is sealed with the new key, out of reach of a machine just removed; if it
+        // does not go out, this process goes back to the key it sealed with, and the next push
+        // or pull finishes publishing it.
+        let before = self.seal_key.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.set_seal_key(Some((generation, check.clone())));
         let record = Record::team_key(self.team_id(&info), key, generation, &check);
-        self.write_authority(store, &info, &record)?;
-        self.share_keys(store, &info)?;
-        store.set_local_note(NOTE_PUBLISHED_KEY, &format!("{generation}.{check}"))?;
+        let published = self
+            .write_authority(store, &info, &record)
+            .and_then(|()| self.share_keys(store, &info))
+            .and_then(|()| {
+                store.set_local_note(NOTE_PUBLISHED_KEY, &format!("{generation}.{check}"))
+            });
+        if let Err(e) = published {
+            self.set_seal_key(before);
+            return Err(e);
+        }
         Ok(generation)
     }
 

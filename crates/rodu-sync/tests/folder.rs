@@ -2576,3 +2576,21 @@ fn a_long_running_process_seals_an_admission_with_the_key_the_team_changed_to_si
     let opens = |g| rodu_sync::seal::open(&kept_key(root.path(), "ann", g), TEAM_ID, ann, &bytes);
     assert!(opens(1).is_none() && opens(2).is_some());
 }
+
+#[test]
+fn after_a_re_key_that_did_not_go_out_an_admin_change_waits_too() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err());
+    // In the same process: making bob an admin seals ann's authority file, so it waits too.
+    assert!(ann_folder.set_admin(a.store(), &public(&bob_key), true).is_err());
+    unblock(root.path(), ann, "keys.json", saved);
+    ann_folder.set_admin(a.store(), &public(&bob_key), true).unwrap();
+    write(&a, &ann_folder, "After");
+    b.sync(&bob_folder);
+    assert!(has(&b, "After"), "{:?}", b.titles());
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+    assert!(bob_folder.rekey(b.store()).is_ok(), "bob is an admin now");
+}
