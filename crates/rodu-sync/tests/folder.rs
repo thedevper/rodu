@@ -2406,3 +2406,235 @@ fn a_re_key_follows_every_key_record_that_counts_even_one_this_machine_lacks() {
     let (dan_folder, d) = dan_joins(root.path(), &ann_folder, &a);
     assert_eq!(dan_folder.key_state(d.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
 }
+
+#[test]
+fn a_re_key_whose_record_could_not_be_written_is_published_by_the_next_sync() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    // The folder refuses ann's authority file: a folder in its place that cannot be replaced.
+    let blocked = root.path().join(format!("Shared/Team/sync/{ann:016x}/authority.sealed"));
+    let saved = std::fs::read(&blocked).unwrap();
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir_all(blocked.join("in-the-way")).unwrap();
+    assert!(ann_folder.rekey(a.store()).is_err());
+    // Work goes on meanwhile, sealed with the new key ann now holds.
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "During" })], None).unwrap();
+    ann_folder.pull(a.store(), &checker()).unwrap();
+    assert!(ann_folder.push(a.store()).is_err(), "nothing sealed under a key nobody can get");
+    // Once the folder takes the file again, the next sync publishes the record and the key.
+    std::fs::remove_dir_all(&blocked).unwrap();
+    std::fs::write(&blocked, saved).unwrap();
+    write(&a, &ann_folder, "After");
+    b.sync(&bob_folder);
+    assert!(has(&b, "During") && has(&b, "After"), "{:?}", b.titles());
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+}
+
+/// Puts a folder where `peer`'s file `name` goes, so the folder app cannot replace it; returns
+/// what was there, for [`unblock`].
+fn block(root: &std::path::Path, peer: u64, name: &str) -> Option<Vec<u8>> {
+    let path = root.join(format!("Shared/Team/sync/{peer:016x}/{name}"));
+    let saved = std::fs::read(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    std::fs::create_dir_all(path.join("in-the-way")).unwrap();
+    saved
+}
+
+fn unblock(root: &std::path::Path, peer: u64, name: &str, saved: Option<Vec<u8>>) {
+    let path = root.join(format!("Shared/Team/sync/{peer:016x}/{name}"));
+    std::fs::remove_dir_all(&path).unwrap();
+    if let Some(saved) = saved {
+        std::fs::write(&path, saved).unwrap();
+    }
+}
+
+#[test]
+fn a_re_key_that_stopped_after_keeping_its_key_is_finished_before_anything_is_sealed() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    // As if ann's re-key stopped right after noting and keeping the new key: no record names it.
+    let new = TeamKey::generate().unwrap();
+    a.store().set_local_note("made-key", &format!("1.{}", new.check())).unwrap();
+    let line = format!("1.{}.{}\n", new.check(), new.to_hex().as_str());
+    std::fs::write(root.path().join("keys-ann"), line).unwrap();
+    write(&a, &ann_folder, "Sealed with it");
+    b.sync(&bob_folder);
+    assert!(has(&b, "Sealed with it"), "{:?}", b.titles());
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+}
+
+#[test]
+fn only_a_key_not_yet_published_holds_up_a_push() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let (ann, bob) = (a.store().peer(), b.store().peer());
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // A member's push does not wait on its own authority file.
+    let saved = block(root.path(), bob, "authority.sealed");
+    write(&b, &bob_folder, "From bob");
+    unblock(root.path(), bob, "authority.sealed", saved);
+    // Nor does an admin's on wrapping the key for one more machine, once it reached others.
+    let dan_folder = rekeying_at(root.path(), &key_hex(), "dan");
+    let d = join_signed(&dan_folder, "dan");
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.admit(a.store(), &request_of(&ann_folder, "dan")).is_err());
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "From ann" })], None).unwrap();
+    ann_folder.push(a.store()).unwrap();
+    unblock(root.path(), ann, "keys.json", saved);
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    d.sync(&dan_folder);
+    a.sync(&ann_folder);
+    for title in ["From bob", "From ann"] {
+        assert!(has(&a, title) && has(&b, title) && has(&d, title), "{title}");
+    }
+}
+
+#[test]
+fn a_key_planted_in_the_keyring_never_seals_nor_gets_a_record() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    let planted = TeamKey::generate().unwrap();
+    let line = format!("1.{}.{}\n", planted.check(), planted.to_hex().as_str());
+    std::fs::write(root.path().join("keys-ann"), line).unwrap();
+    // ann's work still goes out, under the key the team has.
+    write(&a, &ann_folder, "Not with it");
+    assert!(opens_with_first_key(&ann_folder, ann));
+    b.sync(&bob_folder);
+    assert!(has(&b, "Not with it"));
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 0, newest: 0 }));
+    // A re-key follows the keys the team has, not the planted one, and seals with the new key.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    write(&a, &ann_folder, "With the new one");
+    assert!(!opens_with_first_key(&ann_folder, ann));
+    b.sync(&bob_folder);
+    assert!(has(&b, "With the new one"), "{:?}", b.titles());
+}
+
+#[test]
+fn a_re_key_finishes_the_one_before_it_first() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    // A re-key that stopped after keeping its key, then another while the folder refuses wraps.
+    let new = TeamKey::generate().unwrap();
+    a.store().set_local_note("made-key", &format!("1.{}", new.check())).unwrap();
+    let line = format!("1.{}.{}\n", new.check(), new.to_hex().as_str());
+    std::fs::write(root.path().join("keys-ann"), line).unwrap();
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err(), "not past a key that never went out");
+    unblock(root.path(), ann, "keys.json", saved);
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    write(&a, &ann_folder, "After both");
+    b.sync(&bob_folder);
+    assert!(has(&b, "After both"), "{:?}", b.titles());
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
+}
+
+#[test]
+fn a_re_key_whose_wraps_could_not_be_written_seals_nothing_until_they_are() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err());
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "During" })], None).unwrap();
+    ann_folder.pull(a.store(), &checker()).unwrap();
+    assert!(ann_folder.push(a.store()).is_err(), "bob has the record but no wrap yet");
+    unblock(root.path(), ann, "keys.json", saved);
+    write(&a, &ann_folder, "After");
+    b.sync(&bob_folder);
+    assert!(has(&b, "During") && has(&b, "After"), "{:?}", b.titles());
+}
+
+#[test]
+fn a_long_running_process_seals_an_admission_with_the_key_the_team_changed_to_since() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let (ann, cat) = (a.store().peer(), c.store().peer());
+    // Every machine has generation 1, cat's too.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    c.sync(&cat_folder);
+    assert_eq!(cat_folder.key_state(c.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+    // ann's web board settles on it; her terminal then removes cat and changes the key again.
+    let web = rekeying_at(root.path(), ROOT_KEY, "ann");
+    a.sync(&web);
+    assert!(ann_folder.remove(a.store(), cat).unwrap());
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    // An admission from the web board is sealed with generation 2: cat cannot read it.
+    let dan_folder = rekeying_at(root.path(), &key_hex(), "dan");
+    let _d = join_signed(&dan_folder, "dan");
+    web.admit(a.store(), &request_of(&web, "dan")).unwrap();
+    let path = root.path().join(format!("Shared/Team/sync/{ann:016x}/authority.sealed"));
+    let bytes = std::fs::read(path).unwrap();
+    let opens = |g| rodu_sync::seal::open(&kept_key(root.path(), "ann", g), TEAM_ID, ann, &bytes);
+    assert!(opens(1).is_none() && opens(2).is_some());
+}
+
+#[test]
+fn after_a_re_key_that_did_not_go_out_an_admin_change_waits_too() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err());
+    // In the same process: making bob an admin seals ann's authority file, so it waits too.
+    assert!(ann_folder.set_admin(a.store(), &public(&bob_key), true).is_err());
+    unblock(root.path(), ann, "keys.json", saved);
+    ann_folder.set_admin(a.store(), &public(&bob_key), true).unwrap();
+    write(&a, &ann_folder, "After");
+    b.sync(&bob_folder);
+    assert!(has(&b, "After"), "{:?}", b.titles());
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+    assert!(bob_folder.rekey(b.store()).is_ok(), "bob is an admin now");
+}
+
+#[test]
+fn a_re_key_that_did_not_go_out_never_lets_the_removed_machine_read_what_follows() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let (ann, cat) = (a.store().peer(), c.store().peer());
+    // Every machine has generation 1, cat's too, and ann's web board settles on it. Her terminal
+    // then removes cat, and the next re-key's wraps cannot be written.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    a.sync(&ann_folder);
+    c.sync(&cat_folder);
+    assert_eq!(cat_folder.key_state(c.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+    let web = rekeying_at(root.path(), ROOT_KEY, "ann");
+    a.sync(&web);
+    assert!(ann_folder.remove(a.store(), cat).unwrap());
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err());
+    // The web board's next pull rewrites its small files: none opens with the key cat holds.
+    let dir = root.path().join(format!("Shared/Team/sync/{ann:016x}"));
+    let files = || -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .map(|p| {
+                (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap())
+            })
+            .collect()
+    };
+    let before = files();
+    std::fs::remove_file(dir.join("exchange.sealed")).unwrap();
+    let report = web.pull(a.store(), &checker()).unwrap();
+    assert!(report.batch.notes.iter().any(|n| n.contains("publishing the team key")), "{report:?}");
+    assert!(web.push(a.store()).is_err());
+    let first = kept_key(root.path(), "ann", 1);
+    let written: Vec<(String, Vec<u8>)> =
+        files().into_iter().filter(|(name, bytes)| before.get(name) != Some(bytes)).collect();
+    assert!(written.iter().any(|(name, _)| name == "exchange.sealed"), "{written:?}");
+    for (name, bytes) in &written {
+        let opens = rodu_sync::seal::open(&first, TEAM_ID, ann, bytes).is_some();
+        assert!(!opens, "{name} opens with cat's key");
+    }
+    unblock(root.path(), ann, "keys.json", saved);
+}

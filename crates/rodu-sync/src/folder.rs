@@ -409,6 +409,12 @@ const NOTE_WRAPPED: &str = "wrapped";
 /// `<peer>.<generation>.<check>` per line, kept after the wrap leaves its keys file: a key wrapped
 /// for a machine removed since is changed ([`TeamFolder::rekey_if_exposed`]).
 const NOTE_WRAPPED_FOR: &str = "wrapped-for";
+/// The local note naming the team key this machine last made, `<generation>.<check>`: the only
+/// key it signs a record for again ([`TeamFolder::settle_seal_key`]).
+const NOTE_MADE_KEY: &str = "made-key";
+/// The local note naming the newest team key this machine holds once it is known to seal for
+/// the team (its record counts, and it was published if made here), `<generation>.<check>`.
+const NOTE_PUBLISHED_KEY: &str = "published-key";
 /// The most refused authority entries noted.
 const MAX_REFUSED: usize = 4096;
 /// The local note listing the hashes of the transfers this replica follows, epoch 1 first.
@@ -483,6 +489,9 @@ pub struct TeamFolder {
     /// Keys a pull unwrapped and has not checked against the key records yet: they open the
     /// folder's small files (whose content their own signatures vouch for), never seal anything.
     pending: Mutex<Vec<Held>>,
+    /// The team key to seal with, as (generation, check), once a push or pull settled it
+    /// ([`TeamFolder::settle_seal_key`]); until then the newest held.
+    seal_key: Mutex<Option<(u64, String)>>,
 }
 
 /// The path holds untrusted names from the folder and ends up in a terminal: control
@@ -555,6 +564,7 @@ impl TeamFolder {
             signing: None,
             keyring: None,
             pending: Mutex::new(Vec::new()),
+            seal_key: Mutex::new(None),
         }
     }
 
@@ -728,6 +738,10 @@ impl TeamFolder {
                 "This machine was removed from the team: nothing it writes is taken in any more",
             ));
         }
+        // Before anything is sealed: a key this machine changed to reaches the team first, so
+        // what it seals with that key opens for them.
+        self.settle_seal_key(store, &info)?;
+        let mut warnings = Vec::new();
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         let mut written = None;
         store.export_own(|payload| {
@@ -737,10 +751,9 @@ impl TeamFolder {
             written = Some(path);
             Ok(())
         })?;
-        let warnings = match self.compact(store, &info, &dir) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format!("compacting this machine's sync files: {}", e.message)],
-        };
+        if let Err(e) = self.compact(store, &info, &dir) {
+            warnings.push(format!("compacting this machine's sync files: {}", e.message));
+        }
         Ok(Pushed { written, warnings })
     }
 
@@ -888,6 +901,9 @@ impl TeamFolder {
     /// machine's signed record into the team document; the next push sends it.
     pub fn admit(&self, store: &LoroStore, request: &JoinRequest) -> Result<()> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let authority = self.authority_of(store, &info)?;
         if self.trusted(store, &info)?.cut.contains_key(&request.peer) {
             return Err(RoduError::invalid("That machine was removed from the team")
@@ -914,6 +930,8 @@ impl TeamFolder {
         let info = self.checked_info()?;
         // Before any file is opened: one may be sealed with a key that just reached this machine.
         self.take_keys(store, &info)?;
+        // Before anything is sealed: what it writes opens for the team.
+        let settled = self.settle_seal_key(store, &info);
         let trusted = self.trusted(store, &info)?;
         let first = self.pull_once(store, checker, &info, &trusted)?;
         let now = self.trusted(store, &info)?;
@@ -922,6 +940,12 @@ impl TeamFolder {
         } else {
             first.then(self.pull_once(store, checker, &info, &now)?)
         };
+        if let Err(e) = settled {
+            report.batch.notes.push(format!(
+                "publishing the team key this machine changed to: {}; tried again next time",
+                e.message
+            ));
+        }
         // What came in stays in; only the word on what this machine holds waits for next time.
         if let Err(e) = self.note_seen(store, &info) {
             report.batch.notes.push(format!(
@@ -1391,6 +1415,9 @@ impl TeamFolder {
     /// next push sends the record.
     pub fn remove(&self, store: &LoroStore, peer: u64) -> Result<bool> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
         let key = match &self.signing {
@@ -1429,6 +1456,9 @@ impl TeamFolder {
     /// stay in. The next push sends the record.
     pub fn set_admin(&self, store: &LoroStore, target: &PublicKey, on: bool) -> Result<()> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let team = self.team_id(&info);
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
@@ -1480,6 +1510,9 @@ impl TeamFolder {
     /// ended counts any more. The next push sends the record.
     pub fn transfer(&self, store: &LoroStore, new: &PublicKey) -> Result<()> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error means nothing may be sealed yet.
+        self.settle_seal_key(store, &info)?;
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
         let key = self.owner_key(&authority, "hand over the team")?;
@@ -1577,8 +1610,16 @@ impl TeamFolder {
     /// `plain`, sealed for `peer` with the newest team key this machine holds.
     fn seal_for(&self, info: &TeamInfo, peer: u64, plain: &[u8]) -> Result<Vec<u8>> {
         let held = self.held(false)?;
-        let newest = held.first().ok_or_else(|| RoduError::internal("no team key to seal with"))?;
-        seal::seal(&newest.key, self.team_id(info), peer, plain)
+        let settled = self.seal_key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let key = settled
+            .and_then(|(g, check)| held.iter().find(|h| h.generation == g && h.check == check))
+            .or(held.first())
+            .ok_or_else(|| RoduError::internal("no team key to seal with"))?;
+        seal::seal(&key.key, self.team_id(info), peer, plain)
+    }
+
+    fn set_seal_key(&self, key: Option<(u64, String)>) {
+        *self.seal_key.lock().unwrap_or_else(|e| e.into_inner()) = key;
     }
 
     /// Whether this is an encrypted signed team that keeps the keys it receives.
@@ -1867,22 +1908,109 @@ impl TeamFolder {
                 ));
             }
         };
+        // A key this machine changed to before and never published goes out first: one after it
+        // would leave a generation no record names, and no machine would take either.
+        self.settle_seal_key(store, &info)?;
         // Past every generation a counting record names along the chain from what this machine
         // holds, so the new key is newer than any key a removed machine may hold, even one this
         // machine never received; a record that jumps ahead never uses up the generations.
-        let newest_held = self.held(false)?.first().map_or(0, |h| h.generation);
+        // From the key it seals with: a newer one held that no record names (planted, say) would
+        // leave a generation no machine takes.
+        let sealing = self.seal_key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let newest_held = match sealing {
+            Some((generation, _)) => generation,
+            None => self.held(false)?.first().map_or(0, |h| h.generation),
+        };
         let generation = Self::chain(newest_held, &authority.team_keys(&records)) + 1;
         if authority::generation(&generation.to_string()).is_none() {
             return Err(RoduError::invalid("This team changed its key as often as it can"));
         }
         let new = TeamKey::generate()?;
         let check = new.check();
-        // Kept before anything names it, so a stop in between never leaves a key nobody holds.
+        // Noted as made here, then kept before anything names it, so a stop in between never
+        // leaves a key nobody holds, and the next sync finishes publishing it.
+        store.set_local_note(NOTE_MADE_KEY, &format!("{generation}.{check}"))?;
         self.keep_keys(&[Held { generation, check: check.clone(), key: new }])?;
+        // The record is sealed with the new key, out of reach of a machine just removed. If it
+        // does not go out, the new key stays the one this process seals with: what it seals then
+        // waits for the team rather than reaching the removed machine, and the next push (which
+        // refuses until then) or pull finishes publishing it.
+        self.set_seal_key(Some((generation, check.clone())));
         let record = Record::team_key(self.team_id(&info), key, generation, &check);
         self.write_authority(store, &info, &record)?;
         self.share_keys(store, &info)?;
+        store.set_local_note(NOTE_PUBLISHED_KEY, &format!("{generation}.{check}"))?;
         Ok(generation)
+    }
+
+    /// Encrypted signed team: settles which key this machine seals with, so that what it seals
+    /// opens for the team.
+    ///
+    /// That is the newest key it holds that a record that counts names (or the invite code's).
+    /// A newer one no such record names, planted in the keyring or one whose record stopped
+    /// counting, only opens files. The exception is a key this machine made in a
+    /// [`Self::rekey`] whose writes failed, or that stopped after keeping it: on the owner's or an
+    /// admin's machine its record (signed again, which gives the same record) goes into the
+    /// document and this machine's authority file, and the key is wrapped for the team, wraps
+    /// first; then it seals. An error means that could not be done, and nothing may be sealed:
+    /// sealing with the older key could let a machine just removed read it.
+    fn settle_seal_key(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
+        if !self.rekeys() {
+            return Ok(());
+        }
+        let held = self.held(false)?;
+        let Some(newest) = held.first().filter(|h| h.generation > 0) else {
+            self.set_seal_key(None);
+            return Ok(());
+        };
+        let pair = format!("{}.{}", newest.generation, newest.check);
+        let named = (newest.generation, newest.check.clone());
+        // Already settled once: the steady state reads nothing from the folder.
+        if store.local_note(NOTE_PUBLISHED_KEY)?.as_deref() == Some(pair.as_str()) {
+            self.set_seal_key(Some(named));
+            return Ok(());
+        }
+        let records = self.authority_records(store, info)?;
+        let authority = self.resolve(store, &records)?;
+        let me = key.public();
+        let counting = authority.team_keys(&records);
+        let made_here = store.local_note(NOTE_MADE_KEY)?.as_deref() == Some(pair.as_str());
+        if made_here && !counting.contains(&named) && !authority.may_admit(&me) {
+            return Err(RoduError::invalid(format!(
+                "The team key this machine changed to (generation {}) never reached the team, \
+                 and this machine may no longer admit: nothing is sealed until the team owner or \
+                 an admin changes the key again",
+                newest.generation
+            )));
+        }
+        if made_here {
+            // Never the older key meanwhile, even in a process that settled on it long ago: a
+            // machine just removed may hold it.
+            self.set_seal_key(Some(named.clone()));
+            // Wrapped first: a teammate holding the wrap takes the key the moment its record
+            // lands.
+            self.share_keys(store, info)?;
+            let record =
+                Record::team_key(self.team_id(info), key, newest.generation, &newest.check);
+            let in_file = self
+                .authority_file(info, store.peer())?
+                .is_some_and(|file| file.records.iter().any(|text| text == record.text()));
+            if !authority.keys_by(&records, &me).contains(&named) || !in_file {
+                self.write_authority(store, info, &record)?;
+            }
+            store.set_local_note(NOTE_PUBLISHED_KEY, &pair)?;
+            return Ok(());
+        }
+        let usable = held
+            .iter()
+            .find(|h| h.generation == 0 || counting.contains(&(h.generation, h.check.clone())))
+            .map(|h| (h.generation, h.check.clone()));
+        if usable.as_ref() == Some(&named) {
+            store.set_local_note(NOTE_PUBLISHED_KEY, &pair)?;
+        }
+        self.set_seal_key(usable);
+        Ok(())
     }
 
     /// Encrypted signed team: the newest team key this machine holds, and the newest one the team
