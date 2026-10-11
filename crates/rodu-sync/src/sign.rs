@@ -61,6 +61,7 @@ const AUTHORITY_DOMAIN: &[u8] = b"rodu-authority-1\0";
 const SEEN_DOMAIN: &[u8] = b"rodu-seen-1\0";
 const EXCHANGE_DOMAIN: &[u8] = b"rodu-exchange-1\0";
 const EXCHANGE_KEY_DOMAIN: &[u8] = b"rodu-exchange-key-1\0";
+const WRAPPED_DOMAIN: &[u8] = b"rodu-wrapped-key-1\0";
 
 /// Exactly `2 * N` lowercase hex digits.
 fn from_hex<const N: usize>(text: &str) -> Option<Zeroizing<[u8; N]>> {
@@ -114,6 +115,22 @@ fn seen_message(workspace_id: &str, peer: u64, text: &str) -> Vec<u8> {
 fn exchange_message(workspace_id: &str, peer: u64, exchange: &[u8; 32]) -> Vec<u8> {
     let mut message = with_team(EXCHANGE_DOMAIN, workspace_id, peer);
     message.extend(exchange);
+    message
+}
+
+fn wrapped_message(
+    workspace_id: &str,
+    peer: u64,
+    generation: u64,
+    check: &str,
+    wrapped: &[u8],
+) -> Vec<u8> {
+    let mut message = with_team(WRAPPED_DOMAIN, workspace_id, peer);
+    message.extend(generation.to_le_bytes());
+    message.extend((check.len() as u64).to_le_bytes());
+    message.extend(check.as_bytes());
+    message.extend((wrapped.len() as u64).to_le_bytes());
+    message.extend(wrapped);
     message
 }
 
@@ -255,6 +272,20 @@ impl MachineKey {
         hex::encode(self.0.sign(&exchange_message(workspace_id, peer, exchange)).to_bytes())
     }
 
+    /// This key's signature, 128 hex, on a team key of `generation` and `check` wrapped for
+    /// `peer`, so a machine takes a wrapped key only from a machine allowed to share keys.
+    pub fn sign_wrapped(
+        &self,
+        workspace_id: &str,
+        peer: u64,
+        generation: u64,
+        check: &str,
+        wrapped: &[u8],
+    ) -> String {
+        let message = wrapped_message(workspace_id, peer, generation, check, wrapped);
+        hex::encode(self.0.sign(&message).to_bytes())
+    }
+
     /// This key's signature, 128 hex, on an authority record's text up to its signer key.
     pub fn sign_authority(&self, workspace_id: &str, text: &str) -> String {
         hex::encode(self.0.sign(&authority_message(workspace_id, text)).to_bytes())
@@ -336,6 +367,20 @@ pub fn check_exchange(
         .is_some_and(|sig| key.verifies(&exchange_message(workspace_id, peer, exchange), &sig))
 }
 
+/// Whether `key` signed this team key of `generation` and `check`, wrapped for `peer`.
+pub fn check_wrapped(
+    key: &PublicKey,
+    workspace_id: &str,
+    peer: u64,
+    generation: u64,
+    check: &str,
+    wrapped: &[u8],
+    signature: &str,
+) -> bool {
+    let message = wrapped_message(workspace_id, peer, generation, check, wrapped);
+    from_hex::<SIGNATURE_LEN>(signature).is_some_and(|sig| key.verifies(&message, &sig))
+}
+
 /// Whether `key` signed a request to join as `peer` under `name`.
 pub fn check_request(
     key: &PublicKey,
@@ -390,6 +435,30 @@ mod tests {
         assert_eq!(open_file(TEAM, 7, &swapped), None);
         assert_eq!(open_file(TEAM, 7, &signed[..OVERHEAD - 1]), None);
         assert_eq!(open_file(TEAM, 7, b"plain loro bytes, never signed"), None);
+    }
+
+    #[test]
+    fn a_wrapped_key_signature_binds_team_peer_generation_check_and_bytes() {
+        let key = MachineKey::generate().unwrap();
+        let check = "a".repeat(64);
+        let wrapped = [7u8; 104];
+        let sig = key.sign_wrapped(TEAM, 9, 2, &check, &wrapped);
+        assert!(check_wrapped(&key.public(), TEAM, 9, 2, &check, &wrapped, &sig));
+        let other = MachineKey::generate().unwrap().public();
+        assert!(!check_wrapped(&other, TEAM, 9, 2, &check, &wrapped, &sig), "another key");
+        assert!(!check_wrapped(&key.public(), "other", 9, 2, &check, &wrapped, &sig), "team");
+        assert!(!check_wrapped(&key.public(), TEAM, 10, 2, &check, &wrapped, &sig), "peer");
+        assert!(!check_wrapped(&key.public(), TEAM, 9, 3, &check, &wrapped, &sig), "generation");
+        let check_b = "b".repeat(64);
+        assert!(!check_wrapped(&key.public(), TEAM, 9, 2, &check_b, &wrapped, &sig), "check");
+        let mut changed = wrapped;
+        changed[103] ^= 1;
+        assert!(!check_wrapped(&key.public(), TEAM, 9, 2, &check, &changed, &sig), "bytes");
+        assert!(!check_wrapped(&key.public(), TEAM, 9, 2, &check, &wrapped, &sig[2..]));
+        // Never the same message as an exchange signature over the same bytes.
+        let exchange = [7u8; 32];
+        let other_domain = key.sign_exchange(TEAM, 9, &exchange);
+        assert!(!check_wrapped(&key.public(), TEAM, 9, 2, &check, &wrapped, &other_domain));
     }
 
     #[test]
