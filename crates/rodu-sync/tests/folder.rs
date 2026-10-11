@@ -2550,3 +2550,29 @@ fn a_re_key_whose_wraps_could_not_be_written_seals_nothing_until_they_are() {
     b.sync(&bob_folder);
     assert!(has(&b, "During") && has(&b, "After"), "{:?}", b.titles());
 }
+
+#[test]
+fn a_long_running_process_seals_an_admission_with_the_key_the_team_changed_to_since() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let (ann, cat) = (a.store().peer(), c.store().peer());
+    // Every machine has generation 1, cat's too.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    c.sync(&cat_folder);
+    assert_eq!(cat_folder.key_state(c.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+    // ann's web board settles on it; her terminal then removes cat and changes the key again.
+    let web = rekeying_at(root.path(), ROOT_KEY, "ann");
+    a.sync(&web);
+    assert!(ann_folder.remove(a.store(), cat).unwrap());
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    // An admission from the web board is sealed with generation 2: cat cannot read it.
+    let dan_folder = rekeying_at(root.path(), &key_hex(), "dan");
+    let _d = join_signed(&dan_folder, "dan");
+    web.admit(a.store(), &request_of(&web, "dan")).unwrap();
+    let path = root.path().join(format!("Shared/Team/sync/{ann:016x}/authority.sealed"));
+    let bytes = std::fs::read(path).unwrap();
+    let opens = |g| rodu_sync::seal::open(&kept_key(root.path(), "ann", g), TEAM_ID, ann, &bytes);
+    assert!(opens(1).is_none() && opens(2).is_some());
+}
