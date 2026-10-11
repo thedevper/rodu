@@ -2453,8 +2453,9 @@ fn unblock(root: &std::path::Path, peer: u64, name: &str, saved: Option<Vec<u8>>
 fn a_re_key_that_stopped_after_keeping_its_key_is_finished_before_anything_is_sealed() {
     let root = tempfile::tempdir().unwrap();
     let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
-    // As if ann's re-key stopped right after keeping the new key: no record names it anywhere.
+    // As if ann's re-key stopped right after noting and keeping the new key: no record names it.
     let new = TeamKey::generate().unwrap();
+    a.store().set_local_note("made-key", &format!("1.{}", new.check())).unwrap();
     let line = format!("1.{}.{}\n", new.check(), new.to_hex().as_str());
     std::fs::write(root.path().join("keys-ann"), line).unwrap();
     write(&a, &ann_folder, "Sealed with it");
@@ -2481,8 +2482,7 @@ fn only_a_key_not_yet_published_holds_up_a_push() {
     let saved = block(root.path(), ann, "keys.json");
     assert!(ann_folder.admit(a.store(), &request_of(&ann_folder, "dan")).is_err());
     a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "From ann" })], None).unwrap();
-    let pushed = ann_folder.push(a.store()).unwrap();
-    assert!(pushed.warnings.iter().any(|w| w.contains("passing the team keys on")), "{pushed:?}");
+    ann_folder.push(a.store()).unwrap();
     unblock(root.path(), ann, "keys.json", saved);
     a.sync(&ann_folder);
     b.sync(&bob_folder);
@@ -2491,4 +2491,39 @@ fn only_a_key_not_yet_published_holds_up_a_push() {
     for title in ["From bob", "From ann"] {
         assert!(has(&a, title) && has(&b, title) && has(&d, title), "{title}");
     }
+}
+
+#[test]
+fn a_key_planted_in_the_keyring_never_seals_nor_gets_a_record() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let planted = TeamKey::generate().unwrap();
+    let line = format!("1.{}.{}\n", planted.check(), planted.to_hex().as_str());
+    std::fs::write(root.path().join("keys-ann"), line).unwrap();
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "Not with it" })], None).unwrap();
+    let refused = ann_folder.push(a.store()).unwrap_err();
+    assert!(refused.message.contains("named by no record"), "{}", refused.message);
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 0, newest: 0 }));
+    // Taken out again, ann's work goes out under the key the team has.
+    std::fs::remove_file(root.path().join("keys-ann")).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    assert!(has(&b, "Not with it"));
+}
+
+#[test]
+fn a_re_key_whose_wraps_could_not_be_written_seals_nothing_until_they_are() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err());
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "During" })], None).unwrap();
+    ann_folder.pull(a.store(), &checker()).unwrap();
+    assert!(ann_folder.push(a.store()).is_err(), "bob has the record but no wrap yet");
+    unblock(root.path(), ann, "keys.json", saved);
+    write(&a, &ann_folder, "After");
+    b.sync(&bob_folder);
+    assert!(has(&b, "During") && has(&b, "After"), "{:?}", b.titles());
 }
