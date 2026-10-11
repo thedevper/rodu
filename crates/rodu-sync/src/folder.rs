@@ -728,6 +728,12 @@ impl TeamFolder {
                 "This machine was removed from the team: nothing it writes is taken in any more",
             ));
         }
+        // Before anything is sealed: a key this machine changed to reaches the team first, so
+        // what it seals with that key opens for them.
+        self.mirror_if_behind(store, &info)?;
+        if self.rekeys() {
+            self.share_keys(store, &info)?;
+        }
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         let mut written = None;
         store.export_own(|payload| {
@@ -935,6 +941,12 @@ impl TeamFolder {
                 e.message
             ));
         }
+        if let Err(e) = self.mirror_if_behind(store, &info) {
+            report.batch.notes.push(format!(
+                "writing this machine's authority file: {}; tried again next time",
+                e.message
+            ));
+        }
         if let Err(e) = self.share_keys(store, &info) {
             report.batch.notes.push(format!(
                 "passing the team keys on to the team's machines: {}; tried again next time",
@@ -1083,6 +1095,23 @@ impl TeamFolder {
     /// damaged, grew too large or was changed loses nothing), with `also`, and whatever the file
     /// held that still reads.
     fn mirror(&self, store: &LoroStore, info: &TeamInfo, also: Option<&Record>) -> Result<()> {
+        self.mirror_when(store, info, also, true)
+    }
+
+    /// Signed team: [`Self::mirror`] when the authority file lacks something it should hold,
+    /// such as a key record a write that failed never put there. Until it is there, no machine
+    /// takes the key it names, so nothing sealed with that key would open for them.
+    fn mirror_if_behind(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        self.mirror_when(store, info, None, false)
+    }
+
+    fn mirror_when(
+        &self,
+        store: &LoroStore,
+        info: &TeamInfo,
+        also: Option<&Record>,
+        always: bool,
+    ) -> Result<()> {
         let Some((key, _)) = &self.signing else { return Ok(()) };
         let me = key.public();
         let mut file = self
@@ -1092,9 +1121,11 @@ impl TeamFolder {
         // Every key record too, whoever signed it: a machine that never got an earlier key still
         // learns its record here, sealed with a key it can get, and so takes the keys after it.
         let signed = records.iter().chain(also).filter(|r| r.signer() == me || r.is_team_key());
+        let mut changed = false;
         for text in signed.map(|r| r.text().to_owned()) {
             if !file.records.contains(&text) {
                 file.records.push(text);
+                changed = true;
             }
         }
         for (peer, member, signer) in self.checked_admissions(store, info)? {
@@ -1107,8 +1138,12 @@ impl TeamFolder {
                 );
                 if !file.admissions.contains(&entry) {
                     file.admissions.push(entry);
+                    changed = true;
                 }
             }
+        }
+        if !always && !changed {
+            return Ok(());
         }
         let json = serde_json::to_vec(&file).expect("an authority file serializes");
         let (name, bytes) = match &self.key {
