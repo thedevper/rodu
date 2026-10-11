@@ -1462,11 +1462,8 @@ fn a_join_says_which_folder_it_used_and_a_taken_name_points_to_as() {
     assert!(taken.err.contains("--as ann"), "{}", taken.err);
     assert!(!laptop.join(".rodu").exists());
     let joined = ok_at(&laptop, &home, "ann", &["team", "join", &code, "--as", "ann"]);
-    let folder = std::fs::canonicalize(my_drive.join("Rodu/ANN")).unwrap();
+    // Joined part by part: "Rodu/ANN" would show a `/` among Windows' `\`.
+    let folder = my_drive.join("Rodu").join("ANN");
     let said = joined.lines().find(|l| l.starts_with("Joined the team")).unwrap();
-    assert!(
-        said.contains(&my_drive.join("Rodu/ANN").display().to_string())
-            || said.contains(&folder.display().to_string()),
-        "{joined}"
-    );
+    assert!(said.ends_with(&format!("through {}", folder.display())), "{joined}");
 }
