@@ -1113,6 +1113,7 @@ fn the_owner_or_an_admin_removes_a_member_whose_later_work_stays_out() {
 
     // bob has the new key and seals with it: cat's old one opens nothing bob writes now.
     assert!(ok(&bob, &["team"]).contains("Team key: changed once; this machine has the newest"));
+    let before: std::collections::BTreeSet<PathBuf> = update_paths(&team.folder).into_iter().collect();
     ok(&bob, &["add", "Bob after"]);
     assert!(ok(&team.ann, &["ls"]).contains("Bob after"));
     let key = std::fs::read_to_string(cat.join(".rodu/team.key")).unwrap();
@@ -1127,6 +1128,21 @@ fn the_owner_or_an_admin_removes_a_member_whose_later_work_stays_out() {
         .count();
     let all = sealed_files(&team.folder).len();
     assert!(opened < all, "files written since the re-key stay closed to cat ({opened} of {all})");
+    // Each update written after the re-key, bob's "Bob after" among them, is closed to cat.
+    let opens = |path: &Path| {
+        let peer = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        let peer = u64::from_str_radix(peer, 16).unwrap();
+        let body = std::fs::read(path).unwrap();
+        rodu_sync::seal::open(&key, id, peer, &body[52..]).is_some()
+    };
+    // The old key does open what was written before, so the check below can fail.
+    assert!(before.iter().any(|p| opens(p)), "the old key opens files from before the re-key");
+    let written: Vec<PathBuf> =
+        update_paths(&team.folder).into_iter().filter(|p| !before.contains(p)).collect();
+    assert!(!written.is_empty(), "bob's card went out as an update");
+    for path in &written {
+        assert!(!opens(path), "{} opens with cat's old key", path.display());
+    }
 
     // Changing the key again takes the owner or an admin, an encrypted team, and --yes.
     let member = rodu(&bob, &["team", "rekey", "--yes"]);
@@ -1139,6 +1155,20 @@ fn the_owner_or_an_admin_removes_a_member_whose_later_work_stays_out() {
 }
 
 /// Each numbered sync file's writer and sealed payload (past the 52-byte frame header).
+/// Every `*.update` file in the team folder.
+fn update_paths(folder: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for dir in std::fs::read_dir(folder.join("sync")).unwrap() {
+        for file in std::fs::read_dir(dir.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_some_and(|e| e == "update") {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
 fn sealed_files(folder: &Path) -> Vec<(u64, Vec<u8>)> {
     let mut files = Vec::new();
     for dir in std::fs::read_dir(folder.join("sync")).unwrap() {
