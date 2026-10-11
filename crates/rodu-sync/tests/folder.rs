@@ -2497,19 +2497,42 @@ fn only_a_key_not_yet_published_holds_up_a_push() {
 fn a_key_planted_in_the_keyring_never_seals_nor_gets_a_record() {
     let root = tempfile::tempdir().unwrap();
     let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
     let planted = TeamKey::generate().unwrap();
     let line = format!("1.{}.{}\n", planted.check(), planted.to_hex().as_str());
     std::fs::write(root.path().join("keys-ann"), line).unwrap();
-    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "Not with it" })], None).unwrap();
-    let refused = ann_folder.push(a.store()).unwrap_err();
-    assert!(refused.message.contains("named by no record"), "{}", refused.message);
-    b.sync(&bob_folder);
-    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 0, newest: 0 }));
-    // Taken out again, ann's work goes out under the key the team has.
-    std::fs::remove_file(root.path().join("keys-ann")).unwrap();
-    a.sync(&ann_folder);
+    // ann's work still goes out, under the key the team has.
+    write(&a, &ann_folder, "Not with it");
+    assert!(opens_with_first_key(&ann_folder, ann));
     b.sync(&bob_folder);
     assert!(has(&b, "Not with it"));
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 0, newest: 0 }));
+    // A re-key follows the keys the team has, not the planted one, and seals with the new key.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    write(&a, &ann_folder, "With the new one");
+    assert!(!opens_with_first_key(&ann_folder, ann));
+    b.sync(&bob_folder);
+    assert!(has(&b, "With the new one"), "{:?}", b.titles());
+}
+
+#[test]
+fn a_re_key_finishes_the_one_before_it_first() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    // A re-key that stopped after keeping its key, then another while the folder refuses wraps.
+    let new = TeamKey::generate().unwrap();
+    a.store().set_local_note("made-key", &format!("1.{}", new.check())).unwrap();
+    let line = format!("1.{}.{}\n", new.check(), new.to_hex().as_str());
+    std::fs::write(root.path().join("keys-ann"), line).unwrap();
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err(), "not past a key that never went out");
+    unblock(root.path(), ann, "keys.json", saved);
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    write(&a, &ann_folder, "After both");
+    b.sync(&bob_folder);
+    assert!(has(&b, "After both"), "{:?}", b.titles());
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
 }
 
 #[test]
