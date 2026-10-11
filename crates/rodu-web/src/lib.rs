@@ -10,6 +10,8 @@ mod api;
 mod app;
 #[cfg(target_arch = "wasm32")]
 mod panel;
+#[cfg(target_arch = "wasm32")]
+mod team;
 
 /// Mount the board into the page's `<body>`.
 #[cfg(target_arch = "wasm32")]

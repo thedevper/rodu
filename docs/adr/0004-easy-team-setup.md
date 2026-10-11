@@ -1,6 +1,6 @@
 # ADR 0004: Team setup in as few steps as possible
 
-- Status: accepted 2026-10-11; steps 1 and 2 built 2026-10-11
+- Status: accepted 2026-10-11; steps 1, 2 and 3a built 2026-10-11
 
 ## Context
 
@@ -143,7 +143,16 @@ Each step ships alone.
 2. **Personal invites.** `team invite`, `team invites`, `--revoke`, the proof in a join request,
    and automatic admission on owner and admin machines. Tests cover a wrong, expired, reused and
    revoked invite, and a request carrying a proof from another workspace.
-3. **The team screen in `rodu web`.**
+3. **The team screen in `rodu web`**, in two parts:
+   - **3a. A team workspace.** A Team panel in the board: the people, their machines and roles,
+     the machines asking to join (admit with the code), the invites waiting (invite someone and
+     copy the invite once, cancel one), and removing someone after a confirmation. It goes through
+     new `/api/team` routes behind the same token, which call the same code as the CLI under the
+     server's one service lock, then push.
+   - **3b. Before there is a team.** "Share with a team" in a plain workspace, picking a Google
+     Drive from the list, and joining by pasting an invite from `rodu web` started where there is
+     no workspace yet. Both change what the running server serves (a plain store becomes a team
+     store, with live sync), so they come after 3a.
 
 ### Step 1 as built
 
@@ -268,6 +277,57 @@ Each step ships alone.
   - Admission happens when the inviting machine pulls. If that machine is off, the teammate waits.
     The request also waits in the folder, so the owner or an admin can admit it by hand with
     `rodu team admit`.
+
+### Step 3a as built
+
+- **API.** `rodu-api` has the team views (`TeamView`, people, machines with their marks, machines
+  asking, invites) and requests. `rodu-http` serves `GET /api/team` and `POST /api/team/invites`,
+  `/api/team/invites/revoke`, `/api/team/admit` and `/api/team/remove`, behind the same token,
+  Host check and body limits as the rest of the API, with unknown fields refused. A workspace with
+  no team answers 404 with a hint to `rodu team create`.
+- **One code path.** The server reaches the team through a `TeamPanel` trait that the `rodu`
+  crate implements with the functions `rodu team` uses, extracted from the commands:
+  `team_view` (which `rodu team members` now prints), `make_invite`, `admit_by_code`,
+  `machines_to_remove` and `remove_machines`. Each call runs under the server's one service lock.
+  A change first pulls, as every command does, so a removal sees the person whose files just
+  arrived, and is pushed right after.
+- **The panel.** A Team button in the top bar opens a side panel: the folder, whether the team is
+  encrypted and signed, each person with their agents and machines (this machine, numbers cards,
+  team owner, admin, waiting, removed), unknown machines, and the trust sentence. On the owner's or
+  an admin's machine it also shows:
+  - the machines asking to join, each with a field for the code the person reads out, so admitting
+    still means checking the code with them;
+  - a form to invite someone, then the invite in a box with a Copy button, shown once and gone
+    when the panel closes or the invite is cancelled;
+  - the invites waiting, each with Cancel;
+  - Remove on each person whose machines are not this one, the owner's or an admin's, after a
+    browser confirmation that says what removal does, including the key change on an encrypted
+    team.
+  The panel follows the server's revision, so machines that join or are admitted elsewhere show
+  up while it is open.
+- **The invite in the browser.** The invite holds the join secret, and the team key on an
+  encrypted team. It travels from the local server to the page over 127.0.0.1, inside the same
+  boundary as the per-run token, which already lets the page do anything the user can. It is never
+  stored by the page.
+- **Tests.**
+  - `rodu-http`, with a stand-in panel: each route reaches the panel, a change pulls first and
+    pushes after, a look does neither, and a refused change pushes nothing. Without the token, with
+    the wrong method or with an unknown field, nothing reaches the panel. With no team, the routes
+    answer 404.
+  - `tests/team.rs`, through a real `rodu web`:
+    - on an encrypted team, inviting from the board admits bob with no code sent back;
+    - admitting cat by her code, a wrong code refused, revoking what is not there refused, removing
+      cat (which changes the key), and the owner's machine refused;
+    - a member's board sees the team but cannot invite;
+    - an unsigned team's board takes no invites.
+  - The built board was driven in headless Chrome against a stand-in team: the panel's list, admit,
+    invite and copy box, cancel, remove after confirmation, Escape, with no CSP violations and no
+    page errors.
+- **Known limits.**
+  - Remove takes out all of a person's machines. Removing one machine of several is still
+    `rodu team remove <name> --machine <id>`.
+  - Admin roles and handing the team on stay in the CLI.
+  - `rodu web` still prints an admission through an invite as a `warning: sync:` line.
 
 ## What this does not do
 

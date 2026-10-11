@@ -16,8 +16,9 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use rodu_api::{
-    BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody, ItemDetail,
-    ItemView, MeView, MoveRequest, PatchRequest, PrincipalView, RevisionView, StateView,
+    AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
+    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, PatchRequest,
+    PrincipalView, RemoveRequest, RevisionView, RevokeRequest, StateView, TeamDone, TeamView,
     TransitionRequest,
 };
 use rodu_core::query::parse_query;
@@ -66,6 +67,34 @@ pub struct WebServerOptions<S: Store> {
     pub files: Option<HashMap<String, Bytes>>,
     /// Fixed token for tests; a random one is generated otherwise.
     pub token: Option<String>,
+    /// The team panel, for a workspace that syncs with a team.
+    pub team: Option<Arc<dyn TeamPanel<S>>>,
+}
+
+/// What the board's Team panel can see and do (ADR 0004, step 3a). The CLI's crate implements it
+/// with the same code as `rodu team`; each call runs under the server's one service lock, and a
+/// change is pushed at once.
+pub trait TeamPanel<S: Store>: Send + Sync {
+    fn view(&self, service: &RoduService<S>) -> rodu_core::Result<TeamView>;
+    fn invite(
+        &self,
+        service: &RoduService<S>,
+        name: &str,
+        days: Option<u64>,
+    ) -> rodu_core::Result<InviteCreated>;
+    fn revoke(&self, service: &RoduService<S>, name: &str) -> rodu_core::Result<TeamDone>;
+    fn admit(
+        &self,
+        service: &RoduService<S>,
+        name: &str,
+        code: &str,
+    ) -> rodu_core::Result<TeamDone>;
+    fn remove(
+        &self,
+        service: &RoduService<S>,
+        name: &str,
+        machine: Option<&str>,
+    ) -> rodu_core::Result<TeamDone>;
 }
 
 pub struct RunningServer {
@@ -127,6 +156,7 @@ struct App<S: Store> {
     dist_dir: Option<PathBuf>,
     files: Option<HashMap<String, Bytes>>,
     live: Option<Live<S>>,
+    team: Option<Arc<dyn TeamPanel<S>>>,
     /// Raised by every pull that took something in and every write, so the board can ask
     /// cheaply whether to reload.
     revision: AtomicU64,
@@ -155,6 +185,7 @@ where
         dist_dir,
         files: options.files,
         live: options.live.as_ref().map(|live| Live::new(Arc::clone(&live.sync))),
+        team: options.team,
         revision: AtomicU64::new(0),
     });
     // The live sync timer runs in the server's own task, so it stops with the server.
@@ -273,6 +304,11 @@ enum Endpoint {
     Move,
     Comments,
     Revision,
+    Team,
+    TeamInvite,
+    TeamRevoke,
+    TeamAdmit,
+    TeamRemove,
 }
 
 fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
@@ -286,6 +322,11 @@ fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
         "/api/board" => return Some((Endpoint::Board, None, GET)),
         "/api/revision" => return Some((Endpoint::Revision, None, GET)),
         "/api/items" => return Some((Endpoint::Create, None, POST)),
+        "/api/team" => return Some((Endpoint::Team, None, GET)),
+        "/api/team/invites" => return Some((Endpoint::TeamInvite, None, POST)),
+        "/api/team/invites/revoke" => return Some((Endpoint::TeamRevoke, None, POST)),
+        "/api/team/admit" => return Some((Endpoint::TeamAdmit, None, POST)),
+        "/api/team/remove" => return Some((Endpoint::TeamRemove, None, POST)),
         _ => {}
     }
     let rest = path.strip_prefix("/api/items/")?;
@@ -413,6 +454,45 @@ where
             }
             Endpoint::Revision => {
                 ok(StatusCode::OK, &RevisionView { revision: app.revision.load(Ordering::SeqCst) })
+            }
+            Endpoint::Team
+            | Endpoint::TeamInvite
+            | Endpoint::TeamRevoke
+            | Endpoint::TeamAdmit
+            | Endpoint::TeamRemove => {
+                let Some(team) = &app.team else {
+                    return Err(Failure::Domain(
+                        RoduError::not_found("This workspace does not sync with a team")
+                            .with_hint("Share it with: rodu team create"),
+                    ));
+                };
+                // A change starts from what the folder holds now, as `rodu team` does.
+                if endpoint != Endpoint::Team
+                    && let Some(live) = &app.live
+                    && live.pull(&service)
+                {
+                    app.revision.fetch_add(1, Ordering::SeqCst);
+                }
+                match endpoint {
+                    Endpoint::Team => ok(StatusCode::OK, &team.view(&service)?),
+                    Endpoint::TeamInvite => {
+                        let input: InviteRequest = parse_body(body)?;
+                        ok(StatusCode::CREATED, &team.invite(&service, &input.name, input.days)?)
+                    }
+                    Endpoint::TeamRevoke => {
+                        let input: RevokeRequest = parse_body(body)?;
+                        ok(StatusCode::OK, &team.revoke(&service, &input.name)?)
+                    }
+                    Endpoint::TeamAdmit => {
+                        let input: AdmitRequest = parse_body(body)?;
+                        ok(StatusCode::OK, &team.admit(&service, &input.name, &input.code)?)
+                    }
+                    _ => {
+                        let input: RemoveRequest = parse_body(body)?;
+                        let machine = input.machine.as_deref();
+                        ok(StatusCode::OK, &team.remove(&service, &input.name, machine)?)
+                    }
+                }
             }
         };
         // A change made here goes out at once, and other tabs see it on their next look.
