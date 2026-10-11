@@ -242,6 +242,23 @@ pub struct RemoveRequest {
     pub machine: Option<String>,
 }
 
+/// A place on this machine a plain board can be shared from: a Google Drive folder (ADR 0004).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceView {
+    /// What the user sees, such as `Shared drive Engineering (ann@example.com)`.
+    pub label: String,
+    pub path: String,
+    /// A shared drive: every member sees it at the same place.
+    pub shared: bool,
+}
+
+/// `POST /api/team/share`: share this board with a team, its files in `path` (one of the places).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareRequest {
+    pub path: String,
+}
+
 /// What a team change did, to show the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamDone {

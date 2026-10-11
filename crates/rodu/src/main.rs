@@ -41,8 +41,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // A reader that went away (`rodu web | head`) must not stop the command: println! would
-    // panic, and the board prints after its link.
+    // A reader that went away (`rodu web | head`) must not stop the command: the board keeps
+    // printing, as when it reopens after a share, and println! would panic.
     let mut out = |line: &str| {
         let _ = writeln!(std::io::stdout(), "{line}");
     };
