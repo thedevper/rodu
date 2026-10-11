@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use rodu_api::{
+    AskingView, InviteCreated, InviteView, MachineView, PersonView, TeamDone, TeamView,
+};
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{
     Actor, ErrorCode, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService,
 };
+use rodu_http::TeamPanel;
 use rodu_sync::folder::{Admitted, JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::seal::TeamKey;
 use rodu_sync::sign::{self, MachineKey, PublicKey};
@@ -423,6 +427,91 @@ fn report_lines(report: &PullReport) -> Vec<String> {
         .collect()
 }
 
+/// The board's Team panel for a team workspace: the same code as `rodu team`.
+pub(crate) struct FolderPanel {
+    dir: PathBuf,
+    team: TeamConfig,
+}
+
+/// The Team panel of a team workspace; `None` for a plain one.
+pub(crate) fn panel(ws: &Workspace) -> Option<std::sync::Arc<dyn TeamPanel<AnyStore>>> {
+    let team = ws.config.team.clone()?;
+    ws.service.store.team()?;
+    Some(std::sync::Arc::new(FolderPanel { dir: ws.dir.clone(), team }))
+}
+
+impl FolderPanel {
+    /// The store and folder of a signed team, for a step only an owner or admin takes.
+    fn signed<'a>(
+        &self,
+        service: &'a RoduService<AnyStore>,
+    ) -> Result<(&'a LoroStore, TeamFolder)> {
+        let store = service
+            .store
+            .team()
+            .ok_or_else(|| RoduError::invalid("This is not a team workspace"))?;
+        if self.team.signing.is_none() {
+            return Err(RoduError::invalid(
+                "This team does not sign its files: anyone with the invite code takes part",
+            ));
+        }
+        Ok((store, team_folder(&self.dir, &self.team)?))
+    }
+}
+
+impl TeamPanel<AnyStore> for FolderPanel {
+    fn view(&self, service: &RoduService<AnyStore>) -> Result<TeamView> {
+        team_view(&self.dir, &self.team, service)
+    }
+
+    fn invite(
+        &self,
+        service: &RoduService<AnyStore>,
+        name: &str,
+        days: Option<u64>,
+    ) -> Result<InviteCreated> {
+        let (store, folder) = self.signed(service)?;
+        let days = days.unwrap_or(INVITE_DAYS);
+        let (code, until) = make_invite(&self.dir, &self.team, store, &folder, name, days)?;
+        Ok(InviteCreated { name: name.to_owned(), code: code.to_string(), until })
+    }
+
+    fn revoke(&self, service: &RoduService<AnyStore>, name: &str) -> Result<TeamDone> {
+        let (store, folder) = self.signed(service)?;
+        if !folder.revoke_invite(store, name)? {
+            return Err(RoduError::not_found(format!(
+                "No invite for {} is waiting",
+                name.escape_debug()
+            )));
+        }
+        Ok(TeamDone { message: format!("Cancelled the invite for {name}") })
+    }
+
+    fn admit(&self, service: &RoduService<AnyStore>, name: &str, code: &str) -> Result<TeamDone> {
+        let (store, folder) = self.signed(service)?;
+        let request = admit_by_code(&folder, store, name, code)?;
+        Ok(TeamDone {
+            message: format!(
+                "Admitted {}'s machine {:016x}; each machine takes in its changes when it next \
+                 syncs",
+                request.name, request.peer
+            ),
+        })
+    }
+
+    fn remove(
+        &self,
+        service: &RoduService<AnyStore>,
+        name: &str,
+        machine: Option<&str>,
+    ) -> Result<TeamDone> {
+        let (store, folder) = self.signed(service)?;
+        let machines = machines_to_remove(service, store, &folder, name, machine)?;
+        let lines = remove_machines(store, &folder, name, &machines, self.team.encrypted)?;
+        Ok(TeamDone { message: lines.join(". ") })
+    }
+}
+
 /// Live sync with the team folder while `rodu web` or `rodu mcp` runs: the same pull, numbering
 /// and push every other command does before and after it runs.
 pub(crate) struct FolderLive {
@@ -650,30 +739,82 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
 /// 0002, step 2) that is only what each machine says.
 pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     let ws = open(io, false)?;
-    let (Some(team), Some(store)) = (&ws.config.team, ws.service.store.team()) else {
+    let (Some(team), Some(_)) = (&ws.config.team, ws.service.store.team()) else {
         return Err(RoduError::invalid("This is not a team workspace")
             .with_hint("Make it one: rodu team create --folder <shared folder>"));
     };
     // The same pull every command does first, which also records this machine if it is missing.
     before(io, &ws);
+    let view = team_view(&ws.dir, team, &ws.service)?;
+    for person in &view.people {
+        (io.out)(&person.name);
+        if !person.agents.is_empty() {
+            (io.out)(&format!("  agents: {}", person.agents.join(", ")));
+        }
+        if person.machines.is_empty() {
+            (io.out)("  no machine recorded yet");
+        }
+        for machine in &person.machines {
+            (io.out)(&machine_line(machine));
+        }
+    }
+    if !view.unknown.is_empty() {
+        (io.out)(
+            "Unknown machines (writing to the folder, but no person on the team claims them):",
+        );
+        for machine in &view.unknown {
+            (io.out)(&machine_line(machine));
+        }
+    }
+    if !view.asking.is_empty() {
+        (io.out)("Asking to join (the team owner or an admin admits with rodu team admit):");
+        for request in &view.asking {
+            (io.out)(&format!(
+                "  {} (code {}, machine {})",
+                request.name, request.code, request.machine
+            ));
+        }
+    }
+    (io.out)(&view.trust);
+    after(io, &ws);
+    Ok(())
+}
+
+fn machine_line(machine: &MachineView) -> String {
+    if machine.marks.is_empty() {
+        format!("  machine {}", machine.id)
+    } else {
+        format!("  machine {} ({})", machine.id, machine.marks.join(", "))
+    }
+}
+
+/// The team as `rodu team members` and the board's Team panel show it.
+fn team_view(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> Result<TeamView> {
+    let store = service.store.team().ok_or_else(|| {
+        RoduError::invalid("This is not a team workspace")
+            .with_hint("Make it one: rodu team create --folder <shared folder>")
+    })?;
     let members = store.members()?;
     let numbering = match store.numbering_peer()? {
         Some(peer) => Some(peer),
         None if team.numbering => Some(store.peer()),
         None => None,
     };
-    let mut principals = ws.service.store.list_principals()?;
+    let mut principals = service.store.list_principals()?;
     principals.sort_by(|a, b| a.name.cmp(&b.name));
     // A signed team: which machines the root admitted, and which ask to join.
-    let signed = match &team.signing {
-        Some(_) => {
-            let folder = team_folder(&ws.dir, team)?;
+    let folder = match &team.signing {
+        Some(_) => Some(team_folder(dir, team)?),
+        None => None,
+    };
+    let signed = match &folder {
+        Some(folder) => {
             Some((folder.admissions(store)?, folder.requests()?, folder.authority(store)?))
         }
         None => None,
     };
-    let removed = match &team.signing {
-        Some(_) => team_folder(&ws.dir, team)?.removed(store)?,
+    let removed = match &folder {
+        Some(folder) => folder.removed(store)?,
         None => BTreeMap::new(),
     };
     // The role of a machine in a signed team, by the keys admitted for it.
@@ -701,93 +842,109 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     let all: BTreeSet<u64> = members.keys().chain(&folders).copied().collect();
     let short = |peer: u64| short_peer(peer, &all);
     let mut claimed = BTreeSet::new();
+    let mut people = Vec::new();
     for person in principals.iter().filter(|p| p.kind == PrincipalKind::Human) {
-        (io.out)(&person.name);
-        let agents: Vec<&str> = principals
+        let agents: Vec<String> = principals
             .iter()
             .filter(|p| p.owner_id.as_deref() == Some(person.id.as_str()))
-            .map(|p| p.name.as_str())
+            .map(|p| p.name.clone())
             .collect();
-        if !agents.is_empty() {
-            (io.out)(&format!("  agents: {}", agents.join(", ")));
-        }
-        let machines: Vec<u64> =
-            members.iter().filter(|(_, id)| **id == person.id).map(|(peer, _)| *peer).collect();
-        if machines.is_empty() {
-            (io.out)("  no machine recorded yet");
-        }
-        for peer in machines {
+        let mut machines = Vec::new();
+        // Whether `rodu team remove` would take this person out, by the same rule.
+        let mut active = false;
+        let mut protected = false;
+        for (peer, _) in members.iter().filter(|(_, id)| **id == person.id) {
+            let peer = *peer;
             claimed.insert(peer);
+            active |= !removed.contains_key(&peer);
+            protected |= peer == store.peer() || matches!(role(peer), Some("team owner" | "admin"));
             let waiting = signed.as_ref().is_some_and(|(admitted, ..)| {
                 !admitted.contains_key(&peer) && !removed.contains_key(&peer)
             });
-            let marks: Vec<&str> = [
+            let marks = [
                 (peer == store.peer()).then_some("this machine"),
                 (Some(peer) == numbering).then_some("numbers cards"),
                 role(peer),
                 waiting.then_some("waiting to be admitted"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            (io.out)(&if marks.is_empty() {
-                format!("  machine {}", short(peer))
-            } else {
-                format!("  machine {} ({})", short(peer), marks.join(", "))
+            ];
+            machines.push(MachineView {
+                id: short(peer),
+                marks: marks.into_iter().flatten().map(str::to_owned).collect(),
             });
         }
+        let removable = signed.is_some() && active && !protected;
+        people.push(PersonView { name: person.name.clone(), agents, machines, removable });
     }
-    // A machine asking to join is listed with its request below, not as unknown.
+    // A machine asking to join is listed with its request, not as unknown.
     let asking_peers: BTreeSet<u64> =
         signed.iter().flat_map(|(_, requests, _)| requests.iter().map(|r| r.peer)).collect();
-    let unknown: Vec<u64> =
-        folders.difference(&claimed).filter(|p| !asking_peers.contains(p)).copied().collect();
-    if !unknown.is_empty() {
-        (io.out)(
-            "Unknown machines (writing to the folder, but no person on the team claims them):",
-        );
-        for peer in unknown {
+    let unknown = folders
+        .difference(&claimed)
+        .filter(|p| !asking_peers.contains(p))
+        .map(|&peer| {
             let waiting =
                 signed.as_ref().is_some_and(|(admitted, ..)| !admitted.contains_key(&peer));
-            (io.out)(&if removed.contains_key(&peer) {
-                format!("  machine {} (removed)", short(peer))
+            let mark = if removed.contains_key(&peer) {
+                Some("removed")
             } else if waiting {
-                format!("  machine {} (waiting to be admitted)", short(peer))
+                Some("waiting to be admitted")
             } else {
-                format!("  machine {}", short(peer))
-            });
-        }
-    }
-    match &signed {
-        Some((admitted, requests, _)) => {
-            let asking: Vec<&JoinRequest> =
-                requests.iter().filter(|r| !is_admitted(admitted, r.peer, &r.key)).collect();
-            if !asking.is_empty() {
-                (io.out)(
-                    "Asking to join (the team owner or an admin admits with rodu team admit):",
-                );
-                for request in asking {
-                    (io.out)(&format!(
-                        "  {} (code {}, machine {})",
-                        request.name,
-                        request.key.code(),
-                        short(request.peer)
-                    ));
-                }
-            }
-            (io.out)(
-                "The team takes in changes only from machines its owner or an admin admitted, \
-                 proven by their signatures. Which person a machine belongs to is what that \
-                 machine says.",
-            );
-        }
-        None => (io.out)(
-            "This list is what each machine says about itself; nothing proves it yet. Anyone who \
-             can write to the team folder can add to it.",
-        ),
-    }
-    after(io, &ws);
-    Ok(())
+                None
+            };
+            MachineView { id: short(peer), marks: mark.into_iter().map(str::to_owned).collect() }
+        })
+        .collect();
+    let asking = match &signed {
+        Some((admitted, requests, _)) => requests
+            .iter()
+            .filter(|r| !is_admitted(admitted, r.peer, &r.key))
+            .map(|r| AskingView {
+                name: r.name.clone(),
+                code: r.key.code(),
+                machine: short(r.peer),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let may_admit = match (&signed, load_identity(dir)?) {
+        (Some((_, _, authority)), Some(identity)) => authority.may_admit(&identity.public()),
+        _ => false,
+    };
+    let now = unix_now();
+    let invites = match &folder {
+        Some(folder) => folder
+            .pending_invites()?
+            .into_iter()
+            .map(|invite| InviteView {
+                name: invite.name,
+                until: rodu_core::clock::utc_day(invite.expires),
+                expired: invite.expires <= now,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let trust = if signed.is_some() {
+        "The team takes in changes only from machines its owner or an admin admitted, proven by \
+         their signatures. Which person a machine belongs to is what that machine says."
+    } else {
+        "This list is what each machine says about itself; nothing proves it yet. Anyone who can \
+         write to the team folder can add to it."
+    };
+    Ok(TeamView {
+        folder: team.folder.clone(),
+        encrypted: team.encrypted,
+        signed: signed.is_some(),
+        may_admit,
+        people,
+        unknown,
+        asking,
+        invites,
+        trust: trust.to_owned(),
+    })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// A machine as `rodu team members` shows it: the first 8 hex digits of its peer id, which its
@@ -846,13 +1003,35 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
         }
         return Ok(());
     };
+    let request = admit_by_code(&folder, store, name, code)?;
+    after(io, &ws);
+    (io.out)(&format!(
+        "Admitted {}'s machine {:016x}; each machine takes in its changes when it next syncs",
+        request.name, request.peer
+    ));
+    Ok(())
+}
+
+/// Admits the machine asking to join as `name` whose code is `code`.
+fn admit_by_code(
+    folder: &TeamFolder,
+    store: &LoroStore,
+    name: &str,
+    code: &str,
+) -> Result<JoinRequest> {
+    let admitted = folder.admissions(store)?;
+    let waiting: Vec<JoinRequest> = folder
+        .requests()?
+        .into_iter()
+        .filter(|r| !is_admitted(&admitted, r.peer, &r.key))
+        .collect();
     // Read out with or without its dashes.
     let digits = code_digits;
     let code = code.trim();
     let matching: Vec<&JoinRequest> = waiting
         .iter()
         .filter(|r| {
-            r.name == *name && digits(&r.key.code()) == digits(code) && !digits(code).is_empty()
+            r.name == name && digits(&r.key.code()) == digits(code) && !digits(code).is_empty()
         })
         .collect();
     let request = match matching.as_slice() {
@@ -876,12 +1055,7 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
         }
     };
     folder.admit(store, request)?;
-    after(io, &ws);
-    (io.out)(&format!(
-        "Admitted {}'s machine {:016x}; each machine takes in its changes when it next syncs",
-        request.name, request.peer
-    ));
-    Ok(())
+    Ok(request.clone())
 }
 
 /// `rodu team invite <name> [--days N]`: a personal invite for one person, which admits the
@@ -914,8 +1088,34 @@ pub(crate) fn invite(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
             .map_err(|_| RoduError::invalid(format!("--days takes a number, not \"{days}\"")))?,
     };
     let team = ws.config.team.as_ref().expect("a signed team");
+    let (code, until) = make_invite(&ws.dir, team, store, &folder, name, days)?;
+    (io.out)(&format!("Invite for {name}, until {until} (UTC), for one machine:"));
+    (io.out)(&code);
+    (io.out)(&send_invite_hint(name, team.encrypted));
+    Ok(())
+}
+
+/// What to do with an invite once made.
+fn send_invite_hint(name: &str, encrypted: bool) -> String {
+    format!(
+        "Send it to {name} only, not through the team folder: the machine that joins with it is \
+         admitted when this machine next syncs, and if two do, neither is.{} They run: rodu team \
+         join, then paste it",
+        if encrypted { " It holds the team key." } else { "" }
+    )
+}
+
+/// A personal invite for `name` lasting `days`, and the UTC day it ends.
+fn make_invite(
+    dir: &Path,
+    team: &TeamConfig,
+    store: &LoroStore,
+    folder: &TeamFolder,
+    name: &str,
+    days: u64,
+) -> Result<(zeroize::Zeroizing<String>, String)> {
     let key = if team.encrypted {
-        Some(load_key(&ws.dir)?.ok_or_else(|| {
+        Some(load_key(dir)?.ok_or_else(|| {
             RoduError::invalid("This workspace's team key is missing, so it cannot invite")
         })?)
     } else {
@@ -925,18 +1125,7 @@ pub(crate) fn invite(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
     let expires =
         folder.pending_invites()?.into_iter().find(|p| p.name == *name).map_or(0, |p| p.expires);
     let code = invite_code(&team.workspace_id, team.signing.as_deref(), key.as_ref());
-    (io.out)(&format!(
-        "Invite for {name}, until {} (UTC), for one machine:",
-        rodu_core::clock::utc_day(expires)
-    ));
-    (io.out)(&personal_code(&code, &secret, name));
-    (io.out)(&format!(
-        "Send it to {name} only, not through the team folder: the machine that joins with it is \
-         admitted when this machine next syncs, and if two do, neither is.{} They run: rodu team \
-         join, then paste it",
-        if key.is_some() { " It holds the team key." } else { "" }
-    ));
-    Ok(())
+    Ok((personal_code(&code, &secret, name), rodu_core::clock::utc_day(expires)))
 }
 
 /// `rodu team invites`: the personal invites this machine made that were not used yet.
@@ -1135,17 +1324,50 @@ pub(crate) fn remove(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
     })?;
     let ws = open(io, false)?;
     let (store, folder) = signed_team(io, &ws)?;
-    let person = ws
-        .service
+    let machine = args.value("machine");
+    let machines = machines_to_remove(&ws.service, store, &folder, name, machine)?;
+    let encrypted = ws.config.team.as_ref().is_some_and(|t| t.encrypted);
+    if !args.flag("yes") {
+        return Err(RoduError::invalid("Removing someone needs --yes").with_hint(format!(
+            "Nothing {name}'s {} write from then on is taken in, and a removed machine cannot \
+             be admitted again. {}Also take away their access to the shared folder. Then run: \
+             rodu team remove {name}{} --yes",
+            if machines.len() == 1 { "machine" } else { "machines" },
+            if encrypted {
+                "The team key is changed too: they can still read what the folder holds now, but \
+                 not what each machine writes once it has the new key. "
+            } else {
+                ""
+            },
+            machine.map(|m| format!(" --machine {m}")).unwrap_or_default()
+        )));
+    }
+    let done = remove_machines(store, &folder, name, &machines, encrypted);
+    after(io, &ws);
+    for line in done? {
+        (io.out)(&line);
+    }
+    Ok(())
+}
+
+/// The machines of the person called `name` that a removal takes out, all checked first: theirs
+/// not removed yet, or only the one `machine` names, and none the owner's or an admin's.
+fn machines_to_remove(
+    service: &RoduService<AnyStore>,
+    store: &LoroStore,
+    folder: &TeamFolder,
+    name: &str,
+    machine: Option<&str>,
+) -> Result<Vec<u64>> {
+    let person = service
         .store
         .list_principals()?
         .into_iter()
-        .find(|p| p.kind == PrincipalKind::Human && p.name == *name)
+        .find(|p| p.kind == PrincipalKind::Human && p.name == name)
         .ok_or_else(|| {
             RoduError::not_found(format!("No one on the team is called {}", name.escape_debug()))
                 .with_hint("rodu team members lists the team")
         })?;
-    let machine = args.value("machine");
     let removed = folder.removed(store)?;
     let machines: Vec<u64> = store
         .members()?
@@ -1174,48 +1396,43 @@ pub(crate) fn remove(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
              team on; or name another machine with --machine <id>",
         ));
     }
-    if !args.flag("yes") {
-        let encrypted = ws.config.team.as_ref().is_some_and(|t| t.encrypted);
-        return Err(RoduError::invalid("Removing someone needs --yes").with_hint(format!(
-            "Nothing {name}'s {} write from then on is taken in, and a removed machine cannot \
-             be admitted again. {}Also take away their access to the shared folder. Then run: \
-             rodu team remove {name}{} --yes",
-            if machines.len() == 1 { "machine" } else { "machines" },
-            if encrypted {
-                "The team key is changed too: they can still read what the folder holds now, but \
-                 not what each machine writes once it has the new key. "
-            } else {
-                ""
-            },
-            machine.map(|m| format!(" --machine {m}")).unwrap_or_default()
-        )));
-    }
-    for peer in &machines {
+    Ok(machines)
+}
+
+/// Removes `machines`, then changes the team key of an encrypted team; what to tell the user.
+fn remove_machines(
+    store: &LoroStore,
+    folder: &TeamFolder,
+    name: &str,
+    machines: &[u64],
+    encrypted: bool,
+) -> Result<Vec<String>> {
+    for peer in machines {
         folder.remove(store, *peer)?;
     }
-    let encrypted = ws.config.team.as_ref().is_some_and(|t| t.encrypted);
     // After the removals, so the new key is wrapped for nobody removed.
     let rekeyed = if encrypted { Some(folder.rekey(store)) } else { None };
-    after(io, &ws);
     let shown: Vec<String> = machines.iter().map(|peer| format!("{peer:016x}")).collect();
-    (io.out)(&format!(
+    let mut lines = vec![format!(
         "Removed {name}'s {} {}; every machine refuses what {} writes from now on once it next syncs",
         if machines.len() == 1 { "machine" } else { "machines" },
         shown.join(", "),
         if machines.len() == 1 { "it" } else { "they" }
-    ));
+    )];
     match rekeyed {
-        Some(Ok(_)) => (io.out)(REKEYED),
+        Some(Ok(_)) => lines.push(REKEYED.to_owned()),
         Some(Err(e)) => {
             return Err(RoduError::invalid(format!(
-                "Removed, but the team key was not changed: {}",
+                "Removed {name}'s {} {}, but the team key was not changed: {}",
+                if machines.len() == 1 { "machine" } else { "machines" },
+                shown.join(", "),
                 e.message
             ))
             .with_hint("Change it with: rodu team rekey --yes"));
         }
         None => {}
     }
-    Ok(())
+    Ok(lines)
 }
 
 const REKEYED: &str = "Changed the team key: each machine still on the team gets the new one from \

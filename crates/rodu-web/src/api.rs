@@ -2,8 +2,10 @@
 
 use gloo_net::http::{Method, RequestBuilder};
 use rodu_api::{
-    BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody, ItemDetail,
-    ItemView, MeView, MoveRequest, PatchRequest, PrincipalView, RevisionView, TransitionRequest,
+    AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
+    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, PatchRequest,
+    PrincipalView, RemoveRequest, RevisionView, RevokeRequest, TeamDone, TeamView,
+    TransitionRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -19,7 +21,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn local(message: impl Into<String>) -> Self {
+    pub fn local(message: impl Into<String>) -> Self {
         Self { status: 0, message: message.into(), hint: None }
     }
 }
@@ -173,5 +175,31 @@ impl Api {
     pub async fn comment(self, key: &str, body: &str) -> Result<CommentView, ApiError> {
         let body = CommentRequest { body: body.to_string() };
         self.call(Method::POST, &format!("{}/comments", item_path(key)), Some(&body)).await
+    }
+
+    // --- the team panel ---
+
+    pub async fn team(self) -> Result<TeamView, ApiError> {
+        self.get("/api/team").await
+    }
+
+    pub async fn invite(self, name: &str, days: Option<u64>) -> Result<InviteCreated, ApiError> {
+        let body = InviteRequest { name: name.to_owned(), days };
+        self.call(Method::POST, "/api/team/invites", Some(&body)).await
+    }
+
+    pub async fn revoke_invite(self, name: &str) -> Result<TeamDone, ApiError> {
+        let body = RevokeRequest { name: name.to_owned() };
+        self.call(Method::POST, "/api/team/invites/revoke", Some(&body)).await
+    }
+
+    pub async fn admit(self, name: &str, code: &str) -> Result<TeamDone, ApiError> {
+        let body = AdmitRequest { name: name.to_owned(), code: code.to_owned() };
+        self.call(Method::POST, "/api/team/admit", Some(&body)).await
+    }
+
+    pub async fn remove(self, name: &str) -> Result<TeamDone, ApiError> {
+        let body = RemoveRequest { name: name.to_owned(), machine: None };
+        self.call(Method::POST, "/api/team/remove", Some(&body)).await
     }
 }
