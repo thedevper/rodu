@@ -487,6 +487,25 @@ impl Board {
         stream.read_to_string(&mut raw).unwrap();
         raw.split_once("\r\n\r\n").map(|(_, body)| body.to_owned()).unwrap_or_default()
     }
+
+    /// A POST with a JSON body; the status code and the body.
+    fn post(&self, path: &str, json: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&self.host).unwrap();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+            self.host,
+            self.bearer,
+            json.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let status = raw.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let body = raw.split_once("\r\n\r\n").map(|(_, body)| body.to_owned());
+        (status, body.unwrap_or_default())
+    }
 }
 
 #[test]
@@ -1565,4 +1584,126 @@ fn a_join_says_which_folder_it_used_and_a_taken_name_points_to_as() {
     let said = joined.lines().find(|l| l.starts_with("Joined the team")).unwrap();
     let (_, through) = said.split_once(", through ").expect("the folder it used");
     assert_eq!(Path::new(through), my_drive.join("Rodu/ANN"), "{joined}");
+}
+
+// --- the board's Team panel (ADR 0004, step 3a) ------------------------------------------------
+
+/// The value of `"field":"…"` in a JSON body.
+fn json_field(body: &str, field: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(body).expect(body);
+    value[field].as_str().unwrap_or_default().to_owned()
+}
+
+/// Waits until `check` holds for the board's `GET /api/team`, as its live sync catches up.
+fn team_until(board: &Board, what: &str, check: impl Fn(&serde_json::Value) -> bool) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let body = board.get("/api/team");
+        let value: serde_json::Value = serde_json::from_str(&body).expect(&body);
+        if check(&value) {
+            return body;
+        }
+        assert!(std::time::Instant::now() < deadline, "{what} never showed: {body}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// The marks of `name`'s machines in a team view.
+fn marks_of(team: &serde_json::Value, name: &str) -> Vec<String> {
+    let people = team["people"].as_array().unwrap();
+    let person = people.iter().find(|p| p["name"] == name);
+    person.map_or(Vec::new(), |p| {
+        p["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["marks"].as_array().unwrap().iter())
+            .map(|mark| mark.as_str().unwrap().to_owned())
+            .collect()
+    })
+}
+
+#[test]
+fn the_boards_team_panel_invites_admits_and_removes() {
+    let team = signed_team(true);
+    let board = start_board(&team.ann);
+    let view = board.get("/api/team");
+    let value: serde_json::Value = serde_json::from_str(&view).expect(&view);
+    assert_eq!((value["signed"].as_bool(), value["encrypted"].as_bool()), (Some(true), Some(true)));
+    assert_eq!(value["mayAdmit"].as_bool(), Some(true), "{view}");
+    assert!(marks_of(&value, "ann").contains(&"team owner".to_owned()), "{view}");
+
+    // An invite made on the board admits bob's machine with no code sent back.
+    let (status, made) = board.post("/api/team/invites", r#"{"name":"bob","days":3}"#);
+    assert_eq!(status, 201, "{made}");
+    let invite = json_field(&made, "code");
+    assert!(invite.starts_with(&format!("{}+", team.code)), "{made}");
+    assert!(board.get("/api/team").contains(r#""name":"bob""#));
+    let bob = team.ann.parent().unwrap().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    let folder = team.folder.to_str().unwrap();
+    ok(&bob, &["team", "join", &invite, "--folder", folder]);
+    team_until(&board, "bob admitted", |t| {
+        let machines = t["people"].as_array().unwrap().iter().find(|p| p["name"] == "bob");
+        machines.is_some_and(|p| p["machines"].as_array().is_some_and(|m| !m.is_empty()))
+            && !marks_of(t, "bob").contains(&"waiting to be admitted".to_owned())
+    });
+    assert!(board.get("/api/team").contains(r#""invites":[]"#), "the invite is used up");
+
+    // cat joins with the team's code and is admitted by her machine's code.
+    let (_, cat_code) = join_signed(&team, "cat");
+    team_until(&board, "cat asking", |t| t["asking"].to_string().contains("cat"));
+    let (status, wrong) = board.post("/api/team/admit", r#"{"name":"cat","code":"0000"}"#);
+    assert_eq!(status, 404, "{wrong}");
+    let body = format!(r#"{{"name":"cat","code":"{cat_code}"}}"#);
+    let (status, admitted) = board.post("/api/team/admit", &body);
+    assert_eq!(status, 200, "{admitted}");
+    assert!(json_field(&admitted, "message").contains("Admitted cat's machine"), "{admitted}");
+
+    // Revoking what is not there, and removing cat, which changes the team key.
+    let (status, none) = board.post("/api/team/invites/revoke", r#"{"name":"dan"}"#);
+    assert_eq!(status, 404, "{none}");
+    let (status, removed) = board.post("/api/team/remove", r#"{"name":"cat"}"#);
+    assert_eq!(status, 200, "{removed}");
+    let message = json_field(&removed, "message");
+    assert!(message.contains("Removed cat's machine") && message.contains("team key"), "{message}");
+    assert!(
+        marks_of(&serde_json::from_str(&board.get("/api/team")).unwrap(), "cat")
+            .contains(&"removed".to_owned())
+    );
+    // The owner's own machine is not removed from the board either.
+    let (status, refused) = board.post("/api/team/remove", r#"{"name":"ann"}"#);
+    assert_eq!(status, 400, "{refused}");
+}
+
+#[test]
+fn a_members_machine_sees_the_team_but_cannot_change_it() {
+    let team = signed_team(false);
+    let (bob, code) = join_signed(&team, "bob");
+    ok(&team.ann, &["team", "admit", "bob", &code]);
+    ok(&bob, &["sync"]);
+    let board = start_board(&bob);
+    let view = board.get("/api/team");
+    assert!(view.contains(r#""mayAdmit":false"#), "{view}");
+    let (status, refused) = board.post("/api/team/invites", r#"{"name":"cat"}"#);
+    assert_eq!(status, 400, "{refused}");
+    assert!(refused.contains("Only the team owner's machine, or an admin's"), "{refused}");
+    // A body with a field the API does not know is refused before anything happens.
+    let (status, _) = board.post("/api/team/invites", r#"{"name":"cat","admin":true}"#);
+    assert_eq!(status, 400);
+
+    // An unsigned team shows its list but takes no invites.
+    let plain = team_with_board();
+    let view = plain.1.get("/api/team");
+    assert!(view.contains(r#""signed":false"#), "{view}");
+    let (status, refused) = plain.1.post("/api/team/invites", r#"{"name":"cat"}"#);
+    assert_eq!(status, 400, "{refused}");
+    assert!(refused.contains("does not sign its files"), "{refused}");
+}
+
+/// An unsigned team with a board running on its creator's machine.
+fn team_with_board() -> (Team, Board) {
+    let team = team();
+    let board = start_board(&team.ann);
+    (team, board)
 }

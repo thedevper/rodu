@@ -2565,6 +2565,7 @@ dependencies = [
 name = "rodu"
 version = "0.5.0"
 dependencies = [
+ "rodu-api",
  "rodu-core",
  "rodu-http",
  "rodu-mcp",

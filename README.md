@@ -42,7 +42,10 @@ nearest `.rodu/` above the working directory, or `$RODU_DIR`.
 `rodu web` serves the board on `127.0.0.1` only (port 4870, or `--port`) and opens
 `http://127.0.0.1:4870/#token=...`. Every API call needs that per-run token. Drag cards between
 columns to change status (workflow rules apply, and refusals say how to fix them), drag within a
-column to reorder, filter with JQL-lite, and click a card to edit it or comment.
+column to reorder, filter with JQL-lite, and click a card to edit it or comment. In a team
+workspace, **Team** shows who is on the team and their machines; on the owner's or an admin's
+machine it also invites someone (copy the invite, shown once), admits a machine by the code its
+person reads out, cancels an invite, and removes someone after asking.
 
 ## Work as a team
 

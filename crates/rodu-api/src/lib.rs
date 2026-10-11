@@ -129,3 +129,107 @@ pub struct TransitionRequest {
 pub struct CommentRequest {
     pub body: String,
 }
+
+// --- the team panel (ADR 0004, step 3a) ------------------------------------------------------
+
+/// `GET /api/team`: the team this workspace syncs with, as `rodu team members` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamView {
+    /// The shared folder, as this machine reaches it.
+    pub folder: String,
+    pub encrypted: bool,
+    /// Whether the team admits each machine (a signed team).
+    pub signed: bool,
+    /// Whether this machine may admit, invite and remove: the owner's or an admin's.
+    pub may_admit: bool,
+    pub people: Vec<PersonView>,
+    /// Machines writing to the folder that no person on the team claims.
+    pub unknown: Vec<MachineView>,
+    /// Machines asking to join, not yet admitted.
+    pub asking: Vec<AskingView>,
+    /// The personal invites this machine made that were not used yet.
+    pub invites: Vec<InviteView>,
+    /// What the list rests on: signatures, or only what each machine says.
+    pub trust: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonView {
+    pub name: String,
+    pub agents: Vec<String>,
+    pub machines: Vec<MachineView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineView {
+    /// The first 8 hex digits of its peer id, or all 16 when another machine shares those.
+    pub id: String,
+    /// Such as "this machine", "numbers cards", "team owner", "admin", "waiting to be admitted",
+    /// "removed".
+    pub marks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskingView {
+    pub name: String,
+    /// The machine's code, to check with the person before admitting.
+    pub code: String,
+    pub machine: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteView {
+    pub name: String,
+    /// The UTC day it ends, `2026-01-31`.
+    pub until: String,
+    pub expired: bool,
+}
+
+/// `POST /api/team/invites`: a personal invite for `name`, lasting `days` (7 when left out).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InviteRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<u64>,
+}
+
+/// The invite to send, shown once: it holds the join secret and, on an encrypted team, the team
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteCreated {
+    pub name: String,
+    pub code: String,
+    pub until: String,
+}
+
+/// `POST /api/team/invites/revoke`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeRequest {
+    pub name: String,
+}
+
+/// `POST /api/team/admit`: admit the machine asking to join as `name` whose code is `code`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmitRequest {
+    pub name: String,
+    pub code: String,
+}
+
+/// `POST /api/team/remove`: remove `name`'s machines, or only the one `machine` names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+/// What a team change did, to show the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamDone {
+    pub message: String,
+}
