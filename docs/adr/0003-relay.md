@@ -1,10 +1,7 @@
 # ADR 0003: A relay for live sync
 
 - Status: proposed 2026-10-11
-- Depends on: ADR 0002 step 3b (re-keying), in PR #15, which is not on `main` yet. Merge #15
-  first. Until then, `main`'s ADR 0002 still lists 3b as later work and names `x25519-dalek`. #15
-  records 3b as built and corrects the dependency to `curve25519-dalek`. No relay code starts
-  before 3b is on `main`.
+- Depends on: ADR 0002 step 3b (re-keying), built and merged in PR #15.
 
 ## Context
 

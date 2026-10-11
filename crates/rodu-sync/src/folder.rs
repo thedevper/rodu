@@ -405,6 +405,10 @@ const NOTE_SEEN: &str = "seen";
 /// one per line: only those are kept when it writes the file again, so an entry someone changed is
 /// wrapped afresh rather than left in place.
 const NOTE_WRAPPED: &str = "wrapped";
+/// The local note listing every key this machine wrapped and for whom, one
+/// `<peer>.<generation>.<check>` per line, kept after the wrap leaves its keys file: a key wrapped
+/// for a machine removed since is changed ([`TeamFolder::rekey_if_exposed`]).
+const NOTE_WRAPPED_FOR: &str = "wrapped-for";
 /// The most refused authority entries noted.
 const MAX_REFUSED: usize = 4096;
 /// The local note listing the hashes of the transfers this replica follows, epoch 1 first.
@@ -936,6 +940,17 @@ impl TeamFolder {
                 "passing the team keys on to the team's machines: {}; tried again next time",
                 e.message
             ));
+        }
+        match self.rekey_if_exposed(store, &info) {
+            Ok(Some(generation)) => report.batch.notes.push(format!(
+                "this machine had passed the team key on to a machine removed since: changed it \
+                 (generation {generation})"
+            )),
+            Ok(None) => {}
+            Err(e) => report.batch.notes.push(format!(
+                "changing a team key passed on to a removed machine: {}; tried again next time",
+                e.message
+            )),
         }
         Ok(report)
     }
@@ -1734,6 +1749,19 @@ impl TeamFolder {
                 });
             }
         }
+        let noted = store.local_note(NOTE_WRAPPED_FOR)?.unwrap_or_default();
+        let mut wrapped_for: BTreeSet<&str> = noted.lines().collect();
+        let before = wrapped_for.len();
+        for entry in &file.keys {
+            // `<peer>.<generation>.<check>`: the part before the wrapped bytes.
+            if let Some(at) = entry.match_indices('.').nth(2).map(|(at, _)| at) {
+                wrapped_for.insert(&entry[..at]);
+            }
+        }
+        if wrapped_for.len() != before {
+            let lines: Vec<&str> = wrapped_for.into_iter().collect();
+            store.set_local_note(NOTE_WRAPPED_FOR, &lines.join("\n"))?;
+        }
         if file == existing {
             return Ok(());
         }
@@ -1784,6 +1812,38 @@ impl TeamFolder {
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
         fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
         write_replacing(&dir, &dir.join(EXCHANGE_FILE), &self.seal_for(info, peer, &json)?)
+    }
+
+    /// Encrypted signed team, on the owner's or an admin's machine: changes the team key when this
+    /// machine wrapped one of its newest keys for a machine removed since. That happens when it
+    /// re-keyed, or shared a key, before it heard of a removal another machine made: the key it
+    /// made may be the one every machine seals with, and the removed machine holds it. The new key
+    /// goes past it and is wrapped only for machines not removed, so this ends. Returns the new
+    /// generation, if it changed.
+    fn rekey_if_exposed(&self, store: &LoroStore, info: &TeamInfo) -> Result<Option<u64>> {
+        let Some((key, _)) = &self.signing else { return Ok(None) };
+        if !self.rekeys() || !self.authority_of(store, info)?.may_admit(&key.public()) {
+            return Ok(None);
+        }
+        let held = self.held(false)?;
+        let top = held.first().map_or(0, |h| h.generation);
+        if top == 0 {
+            return Ok(None);
+        }
+        let cut = self.trusted(store, info)?.cut;
+        let noted = store.local_note(NOTE_WRAPPED_FOR)?.unwrap_or_default();
+        let exposed = noted.lines().any(|line| {
+            let mut parts = line.split('.');
+            let (Some(peer), Some(generation), Some(check)) =
+                (parts.next().and_then(parse_peer_dir), parts.next(), parts.next())
+            else {
+                return false;
+            };
+            cut.contains_key(&peer)
+                && authority::generation(generation) == Some(top)
+                && held.iter().any(|h| h.generation == top && h.check == check)
+        });
+        if exposed { self.rekey(store).map(Some) } else { Ok(None) }
     }
 
     /// Encrypted signed team, on the owner's or an admin's machine: changes the team key. The new

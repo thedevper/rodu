@@ -2223,6 +2223,47 @@ fn a_wrap_by_a_machine_with_no_right_to_share_never_hides_the_owners_wrap_of_the
     assert_eq!(dan_folder.key_state(d.store()).unwrap().unwrap().held, 1);
 }
 
+#[test]
+fn a_key_made_before_hearing_of_a_removal_is_changed_once_its_maker_hears_of_it() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let (ann, cat) = (a.store().peer(), c.store().peer());
+    let bob_key = request_of(&ann_folder, "bob").key;
+    ann_folder.set_admin(a.store(), &bob_key, true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // ann changes the key and wraps it for cat, still a member; bob, before he has ann's key,
+    // removes cat and changes the key to the same generation.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    assert!(keys_json(root.path(), ann).contains(&format!("{cat:016x}.1.")));
+    assert!(bob_folder.remove(b.store(), cat).unwrap());
+    assert_eq!(bob_folder.rekey(b.store()).unwrap(), 1);
+    a.sync(&ann_folder);
+    cat_folder.pull(c.store(), &checker()).unwrap();
+    b.sync(&bob_folder);
+    // Hearing of the removal, ann changes her key again, past both, and wraps it only for bob.
+    a.sync(&ann_folder);
+    assert_eq!(ann_folder.key_state(a.store()).unwrap().unwrap().held, 2);
+    assert!(!keys_json(root.path(), ann).contains(&format!("{cat:016x}.2.")));
+    // Once bob has it, what he writes never opens with any key cat holds.
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.key_state(b.store()).unwrap().unwrap().held, 2);
+    write(&b, &bob_folder, "Bob after");
+    let bob = b.store().peer();
+    let path = numbered(&bob_folder, bob).pop().unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let Frame::Complete(body) = unframe_sealed(&bytes) else { panic!() };
+    let cat_keys = std::fs::read_to_string(root.path().join("keys-cat")).unwrap_or_default();
+    for line in cat_keys.lines() {
+        let key = TeamKey::from_hex(line.rsplit('.').next().unwrap()).unwrap();
+        assert!(rodu_sync::seal::open(&key, TEAM_ID, bob, body).is_none(), "{line}");
+    }
+    assert!(!opens_with_first_key(&bob_folder, bob));
+    // Nothing further changes it.
+    a.sync(&ann_folder);
+    assert_eq!(ann_folder.key_state(a.store()).unwrap().unwrap().held, 2);
+}
+
 fn kept_key(root: &std::path::Path, name: &str, generation: u64) -> TeamKey {
     let text = std::fs::read_to_string(root.join(format!("keys-{name}"))).unwrap();
     let line = text.lines().find(|l| l.starts_with(&format!("{generation}."))).unwrap();

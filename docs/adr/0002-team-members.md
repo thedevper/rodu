@@ -384,6 +384,15 @@ Where 3b differs from the text above, 3b is what holds.
   `team.key` keeps the invite code's key. A machine seals with the newest key it holds (the lowest
   check first when two records name one generation, so every machine picks the same) and opens a
   file with whichever key it holds that opens it.
+- **Two re-keys at once.** Two owner or admin machines that each re-key before seeing the other's
+  record make keys of the same generation, and every machine seals with the one whose check is
+  lowest. If one of them re-keyed, or passed a key on, before it heard of a removal the other
+  made, it wrapped that key for the removed machine, and that key may be the one everyone seals
+  with. So each such machine keeps a local note of every key it wrapped and for whom
+  (`wrapped-for`, kept after the wrap leaves its keys file), and when a pull shows it wrapped one
+  of its newest keys for a machine removed since, it re-keys again: past both keys, wrapped only
+  for machines not removed. Until it next pulls, work sealed with its key stays open to the
+  removed machine.
 - **A file no key opens yet waits.** A sealed file that does not open with any key this machine
   holds is said once ("does not open with any team key this machine holds") and read again once
   the machine holds another key. Before 3b it was refused for good. Now a file sealed with a key
