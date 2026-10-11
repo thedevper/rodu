@@ -1113,7 +1113,8 @@ fn the_owner_or_an_admin_removes_a_member_whose_later_work_stays_out() {
 
     // bob has the new key and seals with it: cat's old one opens nothing bob writes now.
     assert!(ok(&bob, &["team"]).contains("Team key: changed once; this machine has the newest"));
-    let before: std::collections::BTreeSet<PathBuf> = update_paths(&team.folder).into_iter().collect();
+    let before: std::collections::BTreeSet<PathBuf> =
+        update_paths(&team.folder).into_iter().collect();
     ok(&bob, &["add", "Bob after"]);
     assert!(ok(&team.ann, &["ls"]).contains("Bob after"));
     let key = std::fs::read_to_string(cat.join(".rodu/team.key")).unwrap();
