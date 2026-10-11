@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use crate::store::AnyStore;
 use crate::team::TeamConfig;
 
+mod drive;
 mod readable;
 mod store;
 pub mod team;
@@ -37,9 +38,9 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
   team [--show-invite]       where this workspace syncs, and its invite code
-  team create --folder <shared folder> --encrypt|--no-encrypt [--readable-copy] [--signed]   share this workspace with a team (--signed: you admit each machine)
-  team join <invite code|-> --folder <shared folder> --name <you>   join a team here (- reads the code from stdin)
-  team join <invite code|-> --folder <shared folder> --as <your name>   join from another machine of yours
+  team create [--drive <n> | --folder <shared folder>] [--no-encrypt] [--unsigned] [--readable-copy]   share this workspace with a team through Google Drive (encrypted, and you admit each machine, unless told otherwise; makes a workspace here if there is none)
+  team join [<invite code|->] [--folder <shared folder>] [--name <you>]   join a team here, finding its folder in Google Drive (asks for the code when none is given)
+  team join <invite code|-> [--folder <shared folder>] --as <your name>   join from another machine of yours
   team members               who is on the team, their agents and machines
   team admit [<name> <code>]  signed team: list machines asking to join, or admit one
   team admin <name> on <code> | off [--machine <id>]   signed team, owner: let a person's machine admit others, or stop it
@@ -97,6 +98,7 @@ const STRING_OPTIONS: &[&str] = &[
     "folder",
     "as",
     "machine",
+    "drive",
 ];
 const BOOL_OPTIONS: &[&str] = &[
     "no-open",
@@ -108,6 +110,7 @@ const BOOL_OPTIONS: &[&str] = &[
     "yes",
     "readable-copy",
     "signed",
+    "unsigned",
 ];
 
 #[derive(Debug, Default)]
@@ -256,6 +259,16 @@ fn init(io: &mut Io<'_>, args: &Args) -> Result<()> {
         return Err(RoduError::invalid("init needs --name and --key")
             .with_hint("e.g. rodu init --name your-name --key DEMO"));
     };
+    init_workspace(io, name, key, args.value("title"))
+}
+
+/// Whether a workspace is found from here: the nearest `.rodu`, or `$RODU_DIR`.
+fn has_workspace(io: &Io<'_>) -> bool {
+    find_dir(io).is_some_and(|d| d.join("config.json").is_file())
+}
+
+/// Creates a workspace in `.rodu` here (or `$RODU_DIR`) for `name`, with collection `key`.
+fn init_workspace(io: &mut Io<'_>, name: &str, key: &str, title: Option<&str>) -> Result<()> {
     let dir = match var(io, "RODU_DIR") {
         Some(dir) => resolve(&io.cwd, dir),
         None => io.cwd.join(".rodu"),
@@ -285,7 +298,7 @@ fn init(io: &mut Io<'_>, args: &Args) -> Result<()> {
         )?;
         let actor = Actor { principal_id: user.id.clone(), via_agent_id: None };
         let upper = key.to_uppercase();
-        let title = args.value("title").unwrap_or(&upper);
+        let title = title.unwrap_or(&upper);
         let collection = service.create_collection(&actor, key, title)?;
         Ok(Config { user_id: user.id, agent_id: agent.id, collection: collection.key, team: None })
     })?;

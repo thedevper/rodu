@@ -47,7 +47,10 @@ fn team() -> Team {
     std::fs::create_dir_all(&ann).unwrap();
     ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
     ok(&ann, &["add", "Made alone"]);
-    let out = ok(&ann, &["team", "create", "--folder", folder.to_str().unwrap(), "--no-encrypt"]);
+    let out = ok(
+        &ann,
+        &["team", "create", "--folder", folder.to_str().unwrap(), "--no-encrypt", "--unsigned"],
+    );
     let code = out
         .lines()
         .find_map(|l| l.strip_prefix("Invite code: "))
@@ -91,28 +94,27 @@ fn a_team_shares_one_board_through_a_folder() {
 }
 
 #[test]
-fn create_asks_for_an_encryption_choice_and_refuses_a_second_team() {
+fn create_refuses_contradicting_choices_and_a_second_team() {
     let root = tempfile::tempdir().unwrap();
     let ann = root.path().join("ann");
     std::fs::create_dir_all(&ann).unwrap();
     ok(&ann, &["init", "--name", "ann", "--key", "DEMO"]);
     let folder = root.path().join("shared");
     let f = folder.to_str().unwrap();
-    let none = rodu(&ann, &["team", "create", "--folder", f]);
-    assert_eq!(none.code, 1);
-    assert!(none.err.contains("--encrypt or --no-encrypt"), "{}", none.err);
     let both = rodu(&ann, &["team", "create", "--folder", f, "--encrypt", "--no-encrypt"]);
-    assert!(both.err.contains("Choose one of"), "{}", both.err);
+    assert!(both.err.contains("Choose one of --encrypt"), "{}", both.err);
+    let both = rodu(&ann, &["team", "create", "--folder", f, "--signed", "--unsigned"]);
+    assert!(both.err.contains("Choose one of --signed"), "{}", both.err);
     assert!(!ann.join(".rodu/rodu.loro").exists(), "a refused create changes nothing");
 
-    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
-    let again = rodu(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
+    let again = rodu(&ann, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
     assert!(again.err.contains("already syncs"), "{}", again.err);
 
     let other = root.path().join("other");
     std::fs::create_dir_all(&other).unwrap();
     ok(&other, &["init", "--name", "zed", "--key", "ZED"]);
-    let taken = rodu(&other, &["team", "create", "--folder", f, "--no-encrypt"]);
+    let taken = rodu(&other, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
     assert!(taken.err.contains("already holds another team"), "{}", taken.err);
     assert!(!other.join(".rodu/rodu.loro").exists(), "a refused create converts nothing");
 
@@ -121,7 +123,7 @@ fn create_asks_for_an_encryption_choice_and_refuses_a_second_team() {
     std::fs::create_dir_all(early.join("sync")).unwrap();
     std::fs::copy(folder.join("rodu-team.json"), early.join("rodu-team.json")).unwrap();
     let e = early.to_str().unwrap();
-    let taken = rodu(&other, &["team", "create", "--folder", e, "--no-encrypt"]);
+    let taken = rodu(&other, &["team", "create", "--folder", e, "--no-encrypt", "--unsigned"]);
     assert!(taken.err.contains("already holds another team"), "{}", taken.err);
     assert!(!other.join(".rodu/rodu.loro").exists());
 }
@@ -135,14 +137,14 @@ fn a_create_that_stopped_half_way_can_be_run_again() {
     ok(&ann, &["add", "Made alone"]);
     let folder = root.path().join("shared");
     let f = folder.to_str().unwrap();
-    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
     // As if it stopped after its first sync file and before the config.
     let config_path = ann.join(".rodu/config.json");
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config.as_object_mut().unwrap().remove("team");
     std::fs::write(&config_path, config.to_string()).unwrap();
-    let out = ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    let out = ok(&ann, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
     assert!(out.contains("Invite code:"), "{out}");
     let bob = root.path().join("bob");
     std::fs::create_dir_all(&bob).unwrap();
@@ -266,7 +268,10 @@ fn sealed_team() -> Sealed {
     std::fs::create_dir_all(&ann).unwrap();
     ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
     ok(&ann, &["add", "Quarterly numbers"]);
-    let out = ok(&ann, &["team", "create", "--folder", folder.to_str().unwrap(), "--encrypt"]);
+    let out = ok(
+        &ann,
+        &["team", "create", "--folder", folder.to_str().unwrap(), "--encrypt", "--unsigned"],
+    );
     assert!(out.contains("Keep the invite code secret"), "{out}");
     let code = out
         .lines()
@@ -385,9 +390,9 @@ fn an_encrypted_create_that_stopped_half_way_keeps_its_key() {
     config.as_object_mut().unwrap().remove("team");
     std::fs::write(&config_path, config.to_string()).unwrap();
     let f = team.folder.to_str().unwrap();
-    let plain = rodu(&team.ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    let plain = rodu(&team.ann, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
     assert!(plain.err.contains("run it again with --encrypt"), "{}", plain.err);
-    let out = ok(&team.ann, &["team", "create", "--folder", f, "--encrypt"]);
+    let out = ok(&team.ann, &["team", "create", "--folder", f, "--encrypt", "--unsigned"]);
     assert!(out.contains(&format!("Invite code: {}", team.code)), "the same team and key: {out}");
 }
 
@@ -399,16 +404,16 @@ fn a_half_made_team_carries_on_only_as_what_it_was() {
     ok(&ann, &["init", "--name", "ann", "--key", "DEMO"]);
     let folder = root.path().join("shared");
     let f = folder.to_str().unwrap();
-    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
     let config_path = ann.join(".rodu/config.json");
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config.as_object_mut().unwrap().remove("team");
     std::fs::write(&config_path, config.to_string()).unwrap();
-    let run = rodu(&ann, &["team", "create", "--folder", f, "--encrypt"]);
+    let run = rodu(&ann, &["team", "create", "--folder", f, "--encrypt", "--unsigned"]);
     assert!(run.err.contains("run it again with --no-encrypt"), "{}", run.err);
     assert!(!ann.join(".rodu/team.key").exists(), "no key was written");
-    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt"]);
+    ok(&ann, &["team", "create", "--folder", f, "--no-encrypt", "--unsigned"]);
 }
 
 #[test]
@@ -614,6 +619,7 @@ fn a_readable_copy_follows_the_board_and_rewrites_only_what_changed() {
             folder.to_str().unwrap(),
             "--no-encrypt",
             "--readable-copy",
+            "--unsigned",
         ],
     );
     assert!(out.contains("never encrypted"), "{out}");
@@ -1155,7 +1161,10 @@ fn roles_need_a_signed_team() {
     std::fs::create_dir_all(&ann).unwrap();
     ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
     let folder = root.path().join("Drive/Board");
-    ok(&ann, &["team", "create", "--folder", folder.to_str().unwrap(), "--no-encrypt"]);
+    ok(
+        &ann,
+        &["team", "create", "--folder", folder.to_str().unwrap(), "--no-encrypt", "--unsigned"],
+    );
     let out = rodu(&ann, &["team", "admin", "ann", "on", "0000"]);
     assert!(out.err.contains("has no owner or admins"), "{}", out.err);
     let out = rodu(&ann, &["team", "admin", "ann", "maybe"]);
@@ -1207,4 +1216,155 @@ fn a_signed_workspace_whose_machine_key_is_gone_stops_syncing() {
     let run = rodu(&team.ann, &["ls"]);
     assert_eq!(run.code, 0, "the command still runs on this machine's board");
     assert!(run.err.contains("machine key is missing"), "{}", run.err);
+}
+
+// --- setting up through Google Drive (ADR 0004, step 1) ---------------------------------------
+
+/// `rodu` with `HOME` set to a stand-in home folder and `USER` to `user`.
+fn rodu_at(cwd: &Path, home: &Path, user: &str, args: &[&str]) -> Run {
+    let output = Command::new(env!("CARGO_BIN_EXE_rodu"))
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("RODU_DIR")
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("USER", user)
+        .env("USERNAME", user)
+        .output()
+        .unwrap();
+    Run {
+        code: output.status.code().unwrap_or(-1),
+        out: String::from_utf8_lossy(&output.stdout).into_owned(),
+        err: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[track_caller]
+fn ok_at(cwd: &Path, home: &Path, user: &str, args: &[&str]) -> String {
+    let run = rodu_at(cwd, home, user, args);
+    assert_eq!(run.code, 0, "rodu {args:?}\nstdout: {}\nstderr: {}", run.out, run.err);
+    run.out
+}
+
+/// A stand-in home whose Google Drive for desktop has the account `account`, and returns its
+/// My Drive.
+fn drive_home(home: &Path, account: &str) -> PathBuf {
+    let my_drive = home.join(format!("Library/CloudStorage/GoogleDrive-{account}/My Drive"));
+    std::fs::create_dir_all(&my_drive).unwrap();
+    my_drive
+}
+
+#[test]
+fn a_team_is_made_and_joined_through_google_drive_with_no_folder_typed() {
+    let root = tempfile::tempdir().unwrap();
+    // ann's Drive; the team's folder is synced into bob's Drive under a shortcut he named.
+    let ann_home = root.path().join("home-ann");
+    let ann_drive = drive_home(&ann_home, "ann@example.com");
+    let board = root.path().join("Board");
+    std::fs::create_dir_all(&board).unwrap();
+    // No workspace yet: create makes one, named after the user and the folder.
+    let out = ok_at(&board, &ann_home, "ann", &["team", "create"]);
+    let folder = ann_drive.join("Rodu/BOARD");
+    assert!(folder.join("rodu-team.json").is_file(), "{out}");
+    assert!(out.contains("My Drive (ann@example.com)") && out.contains("BOARD-1"), "{out}");
+    let status = ok_at(&board, &ann_home, "ann", &["team"]);
+    assert!(status.contains("Encryption: on"), "{status}");
+    let code = ok_at(&board, &ann_home, "ann", &["team", "--show-invite"])
+        .lines()
+        .find_map(|l| l.strip_prefix("Invite code: ").map(str::to_owned))
+        .expect("an invite code");
+    assert!(code.starts_with("rodu2-"), "signed by default: {code}");
+    ok_at(&board, &ann_home, "ann", &["add", "From ann"]);
+
+    let bob_home = root.path().join("home-bob");
+    let bob_drive = drive_home(&bob_home, "bob@example.org");
+    copy_dir(&folder, &bob_drive.join("From ann/Rodu/BOARD"));
+    let bob = root.path().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    let joined = ok_at(&bob, &bob_home, "bob", &["team", "join", &code]);
+    let machine = joined
+        .lines()
+        .find_map(|l| l.strip_prefix("This machine's code: ").map(str::to_owned))
+        .expect("a machine code");
+    assert!(ok_at(&bob, &bob_home, "bob", &["ls"]).contains("From ann"));
+    // Drive syncs bob's request back to ann's machine.
+    copy_dir(&bob_drive.join("From ann/Rodu/BOARD"), &folder);
+    let admitted = ok_at(&board, &ann_home, "ann", &["team", "admit", "bob", &machine]);
+    assert!(admitted.contains("bob"), "{admitted}");
+    // Once admitted, what bob writes reaches ann.
+    copy_dir(&folder, &bob_drive.join("From ann/Rodu/BOARD"));
+    ok_at(&bob, &bob_home, "bob", &["add", "From bob"]);
+    copy_dir(&bob_drive.join("From ann/Rodu/BOARD"), &folder);
+    assert!(ok_at(&board, &ann_home, "ann", &["ls"]).contains("From bob"));
+}
+
+/// Copies `from` into `to`, as a folder app syncing it to another machine would.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn with_several_google_drives_create_lists_them_and_takes_the_one_chosen() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    drive_home(&home, "ann@example.com");
+    let work = home.join("Library/CloudStorage/GoogleDrive-ann@example.com/Shared drives/Product");
+    std::fs::create_dir_all(&work).unwrap();
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok_at(&ann, &home, "ann", &["init", "--name", "ann", "--key", "DEMO"]);
+    let listed = rodu_at(&ann, &home, "ann", &["team", "create"]);
+    assert_eq!(listed.code, 1);
+    // The shared drive comes first: it suits an organisation.
+    assert!(listed.out.contains("1. Shared drive Product (ann@example.com)"), "{}", listed.out);
+    assert!(listed.out.contains("2. My Drive (ann@example.com)"), "{}", listed.out);
+    assert!(listed.err.contains("--drive <number>"), "{}", listed.err);
+    assert!(!ann.join(".rodu/rodu.loro").exists(), "nothing changes until one is chosen");
+    let wrong = rodu_at(&ann, &home, "ann", &["team", "create", "--drive", "3"]);
+    assert!(wrong.err.contains("from 1 to 2"), "{}", wrong.err);
+    ok_at(&ann, &home, "ann", &["team", "create", "--drive", "1"]);
+    assert!(work.join("Rodu/DEMO/rodu-team.json").is_file());
+}
+
+#[test]
+fn with_no_google_drive_or_no_team_folder_yet_it_says_what_to_do() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok_at(&ann, &home, "ann", &["init", "--name", "ann", "--key", "DEMO"]);
+    let none = rodu_at(&ann, &home, "ann", &["team", "create"]);
+    assert!(none.err.contains("No Google Drive folder found"), "{}", none.err);
+    assert!(none.err.contains("--folder"), "{}", none.err);
+    // Nor does it leave a workspace behind where there was none.
+    let empty = root.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let nothing = rodu_at(&empty, &home, "ann", &["team", "create"]);
+    assert!(nothing.err.contains("No Google Drive folder found"), "{}", nothing.err);
+    assert!(!empty.join(".rodu").exists());
+    // A teammate whose Drive has not got the team's folder yet.
+    let shared = root.path().join("shared");
+    let out = ok_at(&ann, &home, "ann", &["team", "create", "--folder", shared.to_str().unwrap()]);
+    let code = out.lines().find_map(|l| l.strip_prefix("Invite code: ")).unwrap().to_owned();
+    let bob_home = root.path().join("home-bob");
+    drive_home(&bob_home, "bob@example.org");
+    let bob = root.path().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    let early = rodu_at(&bob, &bob_home, "bob", &["team", "join", &code]);
+    assert!(early.err.contains("not in this machine's Google Drive yet"), "{}", early.err);
+    assert!(early.err.contains("shortcut"), "{}", early.err);
+    assert!(!bob.join(".rodu").exists(), "a join that finds nothing writes nothing");
+    // With no code and nobody at a terminal to paste one, join says what it needs.
+    let no_code = rodu_at(&bob, &bob_home, "bob", &["team", "join"]);
+    assert!(no_code.err.contains("needs an invite code"), "{}", no_code.err);
 }
