@@ -430,7 +430,6 @@ fn report_lines(report: &PullReport) -> Vec<String> {
 /// The board's Team panel for a team workspace: the same code as `rodu team`.
 pub(crate) struct FolderPanel {
     dir: PathBuf,
-    config: Config,
     team: TeamConfig,
 }
 
@@ -438,7 +437,7 @@ pub(crate) struct FolderPanel {
 pub(crate) fn panel(ws: &Workspace) -> Option<std::sync::Arc<dyn TeamPanel<AnyStore>>> {
     let team = ws.config.team.clone()?;
     ws.service.store.team()?;
-    Some(std::sync::Arc::new(FolderPanel { dir: ws.dir.clone(), config: ws.config.clone(), team }))
+    Some(std::sync::Arc::new(FolderPanel { dir: ws.dir.clone(), team }))
 }
 
 impl FolderPanel {
@@ -462,7 +461,7 @@ impl FolderPanel {
 
 impl TeamPanel<AnyStore> for FolderPanel {
     fn view(&self, service: &RoduService<AnyStore>) -> Result<TeamView> {
-        team_view(&self.dir, &self.config, &self.team, service)
+        team_view(&self.dir, &self.team, service)
     }
 
     fn invite(
@@ -746,7 +745,7 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
     };
     // The same pull every command does first, which also records this machine if it is missing.
     before(io, &ws);
-    let view = team_view(&ws.dir, &ws.config, team, &ws.service)?;
+    let view = team_view(&ws.dir, team, &ws.service)?;
     for person in &view.people {
         (io.out)(&person.name);
         if !person.agents.is_empty() {
@@ -790,12 +789,7 @@ fn machine_line(machine: &MachineView) -> String {
 }
 
 /// The team as `rodu team members` and the board's Team panel show it.
-fn team_view(
-    dir: &Path,
-    config: &Config,
-    team: &TeamConfig,
-    service: &RoduService<AnyStore>,
-) -> Result<TeamView> {
+fn team_view(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> Result<TeamView> {
     let store = service.store.team().ok_or_else(|| {
         RoduError::invalid("This is not a team workspace")
             .with_hint("Make it one: rodu team create --folder <shared folder>")
@@ -803,7 +797,7 @@ fn team_view(
     let members = store.members()?;
     let numbering = match store.numbering_peer()? {
         Some(peer) => Some(peer),
-        None if config.team.as_ref().is_some_and(|t| t.numbering) => Some(store.peer()),
+        None if team.numbering => Some(store.peer()),
         None => None,
     };
     let mut principals = service.store.list_principals()?;
@@ -856,9 +850,14 @@ fn team_view(
             .map(|p| p.name.clone())
             .collect();
         let mut machines = Vec::new();
+        // Whether `rodu team remove` would take this person out, by the same rule.
+        let mut active = false;
+        let mut protected = false;
         for (peer, _) in members.iter().filter(|(_, id)| **id == person.id) {
             let peer = *peer;
             claimed.insert(peer);
+            active |= !removed.contains_key(&peer);
+            protected |= peer == store.peer() || matches!(role(peer), Some("team owner" | "admin"));
             let waiting = signed.as_ref().is_some_and(|(admitted, ..)| {
                 !admitted.contains_key(&peer) && !removed.contains_key(&peer)
             });
@@ -873,7 +872,8 @@ fn team_view(
                 marks: marks.into_iter().flatten().map(str::to_owned).collect(),
             });
         }
-        people.push(PersonView { name: person.name.clone(), agents, machines });
+        let removable = signed.is_some() && active && !protected;
+        people.push(PersonView { name: person.name.clone(), agents, machines, removable });
     }
     // A machine asking to join is listed with its request, not as unknown.
     let asking_peers: BTreeSet<u64> =
@@ -1423,7 +1423,9 @@ fn remove_machines(
         Some(Ok(_)) => lines.push(REKEYED.to_owned()),
         Some(Err(e)) => {
             return Err(RoduError::invalid(format!(
-                "Removed, but the team key was not changed: {}",
+                "Removed {name}'s {} {}, but the team key was not changed: {}",
+                if machines.len() == 1 { "machine" } else { "machines" },
+                shown.join(", "),
                 e.message
             ))
             .with_hint("Change it with: rodu team rekey --yes"));

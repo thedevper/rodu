@@ -724,12 +724,13 @@ async fn the_team_routes_reach_the_panel_and_a_change_pulls_first_and_pushes_aft
         *team.calls.lock().unwrap(),
         ["view", "invite bob None", "revoke bob", "admit cat 1234", "remove cat Some(\"0f19\")"]
     );
-    // A refused change is the panel's error, and nothing is pushed for it.
+    // A refused change is the panel's error. It is pushed all the same, since a team change can
+    // write before it fails.
     let pushes = sync.pushes.load(SeqCst);
     let reply = send(&s, "POST", "/api/team/invites", body(json!({"name": "nobody"}))).await;
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(reply.json()["message"].as_str().unwrap().contains("Only the team owner"));
-    assert_eq!(sync.pushes.load(SeqCst), pushes);
+    assert_eq!(sync.pushes.load(SeqCst), pushes + 1);
 }
 
 #[tokio::test]

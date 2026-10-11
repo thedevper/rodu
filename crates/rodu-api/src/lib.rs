@@ -159,6 +159,9 @@ pub struct PersonView {
     pub name: String,
     pub agents: Vec<String>,
     pub machines: Vec<MachineView>,
+    /// Whether removing this person can be offered: a machine not removed yet, and none the
+    /// owner's or an admin's.
+    pub removable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,7 +176,9 @@ pub struct MachineView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskingView {
     pub name: String,
-    /// The machine's code, to check with the person before admitting.
+    /// The machine's code. Never sent to the board: an admin there types the code the person
+    /// reads out, and the server compares it, so the check cannot be skipped by copying.
+    #[serde(skip)]
     pub code: String,
     pub machine: String,
 }

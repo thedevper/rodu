@@ -1652,13 +1652,24 @@ fn the_boards_team_panel_invites_admits_and_removes() {
 
     // cat joins with the team's code and is admitted by her machine's code.
     let (_, cat_code) = join_signed(&team, "cat");
-    team_until(&board, "cat asking", |t| t["asking"].to_string().contains("cat"));
+    let asking = team_until(&board, "cat asking", |t| t["asking"].to_string().contains("cat"));
+    // The board never gets the machine's code: the admin types the one cat reads out.
+    let digits: String = cat_code.chars().filter(char::is_ascii_alphanumeric).collect();
+    assert!(!asking.contains(&cat_code) && !asking.contains(&digits), "{asking}");
     let (status, wrong) = board.post("/api/team/admit", r#"{"name":"cat","code":"0000"}"#);
     assert_eq!(status, 404, "{wrong}");
     let body = format!(r#"{{"name":"cat","code":"{cat_code}"}}"#);
     let (status, admitted) = board.post("/api/team/admit", &body);
     assert_eq!(status, 200, "{admitted}");
     assert!(json_field(&admitted, "message").contains("Admitted cat's machine"), "{admitted}");
+
+    let removable = |name: &str| {
+        let view: serde_json::Value = serde_json::from_str(&board.get("/api/team")).unwrap();
+        let people = view["people"].as_array().unwrap().clone();
+        people.iter().find(|p| p["name"] == name).and_then(|p| p["removable"].as_bool())
+    };
+    team_until(&board, "cat listed", |t| t["people"].to_string().contains(r#""name":"cat""#));
+    assert_eq!((removable("ann"), removable("cat")), (Some(false), Some(true)));
 
     // Revoking what is not there, and removing cat, which changes the team key.
     let (status, none) = board.post("/api/team/invites/revoke", r#"{"name":"dan"}"#);
@@ -1667,10 +1678,10 @@ fn the_boards_team_panel_invites_admits_and_removes() {
     assert_eq!(status, 200, "{removed}");
     let message = json_field(&removed, "message");
     assert!(message.contains("Removed cat's machine") && message.contains("team key"), "{message}");
-    assert!(
-        marks_of(&serde_json::from_str(&board.get("/api/team")).unwrap(), "cat")
-            .contains(&"removed".to_owned())
-    );
+    let view = board.get("/api/team");
+    let marks = marks_of(&serde_json::from_str(&view).unwrap(), "cat");
+    assert!(marks.contains(&"removed".to_owned()), "{view}");
+    assert_eq!(removable("cat"), Some(false), "a removed person is not offered again");
     // The owner's own machine is not removed from the board either.
     let (status, refused) = board.post("/api/team/remove", r#"{"name":"ann"}"#);
     assert_eq!(status, 400, "{refused}");

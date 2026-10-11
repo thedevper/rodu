@@ -392,6 +392,16 @@ where
         let key = key.as_deref().unwrap_or_default();
         let body = body.unwrap_or(serde_json::Value::Null);
         let writes = method != Method::GET;
+        // A team change may write before it fails (a removal whose re-key failed): it is pushed
+        // whatever it returns, as `rodu team` pushes after a failed command too.
+        let team_change = writes
+            && matches!(
+                endpoint,
+                Endpoint::TeamInvite
+                    | Endpoint::TeamRevoke
+                    | Endpoint::TeamAdmit
+                    | Endpoint::TeamRemove
+            );
         let answer = match endpoint {
             Endpoint::Me => {
                 ok(StatusCode::OK, &MeView { name: ctx.name(Some(&app.actor.principal_id))? })
@@ -475,28 +485,31 @@ where
                 }
                 match endpoint {
                     Endpoint::Team => ok(StatusCode::OK, &team.view(&service)?),
+                    // Past the body check, the change runs: its error comes back as the answer
+                    // rather than returning early, so what it wrote is still pushed below.
                     Endpoint::TeamInvite => {
                         let input: InviteRequest = parse_body(body)?;
-                        ok(StatusCode::CREATED, &team.invite(&service, &input.name, input.days)?)
+                        let made = team.invite(&service, &input.name, input.days);
+                        made.map_err(Failure::from).and_then(|made| ok(StatusCode::CREATED, &made))
                     }
                     Endpoint::TeamRevoke => {
                         let input: RevokeRequest = parse_body(body)?;
-                        ok(StatusCode::OK, &team.revoke(&service, &input.name)?)
+                        answer_with(team.revoke(&service, &input.name))
                     }
                     Endpoint::TeamAdmit => {
                         let input: AdmitRequest = parse_body(body)?;
-                        ok(StatusCode::OK, &team.admit(&service, &input.name, &input.code)?)
+                        answer_with(team.admit(&service, &input.name, &input.code))
                     }
                     _ => {
                         let input: RemoveRequest = parse_body(body)?;
                         let machine = input.machine.as_deref();
-                        ok(StatusCode::OK, &team.remove(&service, &input.name, machine)?)
+                        answer_with(team.remove(&service, &input.name, machine))
                     }
                 }
             }
         };
         // A change made here goes out at once, and other tabs see it on their next look.
-        if writes && answer.is_ok() {
+        if writes && (answer.is_ok() || team_change) {
             app.revision.fetch_add(1, Ordering::SeqCst);
             if let Some(live) = &app.live {
                 live.push(&service);
@@ -506,6 +519,11 @@ where
     })
     .await
     .map_err(|e| Failure::Domain(RoduError::internal(format!("request task failed: {e}"))))?
+}
+
+/// A team change's result as the answer to send.
+fn answer_with(done: rodu_core::Result<TeamDone>) -> Outcome<(StatusCode, serde_json::Value)> {
+    done.map_err(Failure::from).and_then(|done| ok(StatusCode::OK, &done))
 }
 
 struct Ctx<'a, S: Store> {
