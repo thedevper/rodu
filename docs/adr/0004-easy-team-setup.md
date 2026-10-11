@@ -290,17 +290,20 @@ Each step ships alone.
   `team_view` (which `rodu team members` now prints), `make_invite`, `admit_by_code`,
   `machines_to_remove` and `remove_machines`. Each call runs under the server's one service lock.
   A change first pulls, as every command does, so a removal sees the person whose files just
-  arrived, and is pushed right after.
+  arrived, and is pushed right after. It is pushed even when it fails part way, as when a removal
+  is recorded but the key change after it is not, so what it did write reaches the team.
 - **The panel.** A Team button in the top bar opens a side panel: the folder, whether the team is
   encrypted and signed, each person with their agents and machines (this machine, numbers cards,
   team owner, admin, waiting, removed), unknown machines, and the trust sentence. On the owner's or
   an admin's machine it also shows:
   - the machines asking to join, each with a field for the code the person reads out, so admitting
-    still means checking the code with them;
+    still means checking the code with them. The server never sends a machine's code to the
+    board, so the page cannot fill it in;
   - a form to invite someone, then the invite in a box with a Copy button, shown once and gone
     when the panel closes or the invite is cancelled;
   - the invites waiting, each with Cancel;
-  - Remove on each person whose machines are not this one, the owner's or an admin's, after a
+  - Remove on each person the server marks removable (a signed team, someone with a machine not
+    yet removed, and none of their machines this one, the owner's or an admin's), after a
     browser confirmation that says what removal does, including the key change on an encrypted
     team.
   The panel follows the server's revision, so machines that join or are admitted elsewhere show
@@ -311,13 +314,14 @@ Each step ships alone.
   stored by the page.
 - **Tests.**
   - `rodu-http`, with a stand-in panel: each route reaches the panel, a change pulls first and
-    pushes after, a look does neither, and a refused change pushes nothing. Without the token, with
+    pushes after, a look does neither, and a change the panel refuses is still pushed. Without the token, with
     the wrong method or with an unknown field, nothing reaches the panel. With no team, the routes
     answer 404.
   - `tests/team.rs`, through a real `rodu web`:
     - on an encrypted team, inviting from the board admits bob with no code sent back;
-    - admitting cat by her code, a wrong code refused, revoking what is not there refused, removing
-      cat (which changes the key), and the owner's machine refused;
+    - cat asking with no code in the view, admitting cat by her code, a wrong code refused,
+      revoking what is not there refused, removing cat (which changes the key and makes her no
+      longer removable), and the owner's machine neither removable nor removed;
     - a member's board sees the team but cannot invite;
     - an unsigned team's board takes no invites.
   - The built board was driven in headless Chrome against a stand-in team: the panel's list, admit,

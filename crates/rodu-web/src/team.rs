@@ -25,24 +25,45 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
     let made = RwSignal::new(None::<InviteCreated>);
     let invite_name = RwSignal::new(String::new());
     let invite_days = RwSignal::new(String::from("7"));
+    // The codes typed for machines asking to join, by machine, so a reload keeps them.
+    let typed = RwSignal::new(std::collections::HashMap::<String, String>::new());
 
+    // Every signal here is gone once the panel closes, and a reply can still arrive after that:
+    // each one is reached with try_, and a closed panel ignores the reply.
     let load = move || async move {
-        match api.team().await {
-            Ok(team) => loaded.set(Loaded::Team(team)),
-            Err(e) if e.status == 404 => loaded.set(Loaded::NoTeam(e)),
-            Err(e) => on_error.run(e),
+        let next = match api.team().await {
+            Ok(team) => Loaded::Team(team),
+            Err(e) if e.status == 404 => Loaded::NoTeam(e),
+            Err(e) => {
+                on_error.run(e);
+                return;
+            }
+        };
+        // Only a change rebuilds the panel, so focus and what is being typed are kept.
+        let changed = loaded.try_with_untracked(|now| match (now, &next) {
+            (Loaded::Team(a), Loaded::Team(b)) => a != b,
+            _ => true,
+        });
+        if changed == Some(true) {
+            loaded.try_set(next);
         }
     };
-    spawn_local(load());
-
-    // While open, follow the team as machines join and leave.
+    // While open, follow the team as machines join and leave. The revision is read before the
+    // first load, so a change landing between the two is still picked up by the first check.
     let seen = StoredValue::new(None::<u64>);
+    spawn_local(async move {
+        if let Ok(now) = api.revision().await {
+            seen.try_set_value(Some(now));
+        }
+        load().await;
+    });
     let interval = set_interval_with_handle(
         move || {
             spawn_local(async move {
                 let Ok(now) = api.revision().await else { return };
-                if seen.get_value() != Some(now) {
-                    seen.set_value(Some(now));
+                let Some(before) = seen.try_get_value() else { return };
+                seen.try_set_value(Some(now));
+                if before != Some(now) {
                     load().await;
                 }
             });
@@ -66,7 +87,9 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
     // Say what a change did, or why it failed, then show the team as it is now.
     let finish = move |result: Result<String, ApiError>| async move {
         match result {
-            Ok(message) => done.set(Some(message)),
+            Ok(message) => {
+                done.try_set(Some(message));
+            }
             Err(e) => on_error.run(e),
         }
         load().await;
@@ -78,13 +101,16 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
         if name.is_empty() {
             return;
         }
-        let days = invite_days.get_untracked().trim().parse::<u64>().ok();
+        let Ok(days) = invite_days.get_untracked().trim().parse::<u64>() else {
+            on_error.run(ApiError::local("Give the number of days the invite lasts, from 1 to 90"));
+            return;
+        };
         spawn_local(async move {
-            match api.invite(&name, days).await {
+            match api.invite(&name, Some(days)).await {
                 Ok(created) => {
-                    invite_name.set(String::new());
-                    done.set(None);
-                    made.set(Some(created));
+                    invite_name.try_set(String::new());
+                    done.try_set(None);
+                    made.try_set(Some(created));
                 }
                 Err(e) => on_error.run(e),
             }
@@ -94,7 +120,7 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
 
     let revoke = move |name: String| {
         spawn_local(async move {
-            made.update(|m| {
+            made.try_update(|m| {
                 if m.as_ref().is_some_and(|m| m.name == name) {
                     *m = None;
                 }
@@ -103,9 +129,14 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
         });
     };
 
-    let admit = move |name: String, code: String| {
+    let admit = move |name: String, machine: String| {
+        let code = typed.with_untracked(|t| t.get(&machine).cloned()).unwrap_or_default();
         spawn_local(async move {
-            finish(api.admit(&name, &code).await.map(|d| d.message)).await;
+            let result = api.admit(&name, &code).await;
+            if result.is_ok() {
+                typed.try_update(|t| t.remove(&machine));
+            }
+            finish(result.map(|d| d.message)).await;
         });
     };
 
@@ -169,17 +200,8 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
                                 .into_iter()
                                 .map(|person| {
                                     let name = person.name.clone();
-                                    // The owner's or an admin's machine is never removed here.
-                                    let removable = may_admit
-                                        && !person.machines.is_empty()
-                                        && person.machines.iter().all(|m| {
-                                            !m.marks.iter().any(|mark| {
-                                                matches!(
-                                                    mark.as_str(),
-                                                    "this machine" | "team owner" | "admin" | "removed"
-                                                )
-                                            })
-                                        });
+                                    // The server says who can be removed, by the CLI's rule.
+                                    let removable = may_admit && person.removable;
                                     view! {
                                         <li>
                                             <div class="person-head">
@@ -255,23 +277,23 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
                                 view! {
                                     <h3>"Asking to join"</h3>
                                     <p class="muted">
-                                        "Ask each person for the code their machine shows, and admit only when it matches."
+                                        "Ask each person for the code their machine showed when it joined, and type it here: only a matching code admits it."
                                     </p>
                                     <ul class="team-asking">
                                         {team
                                             .asking
                                             .into_iter()
                                             .map(|request| {
-                                                let typed = RwSignal::new(String::new());
                                                 let name = request.name.clone();
+                                                let machine = request.machine.clone();
+                                                let shown = machine.clone();
+                                                let edited = machine.clone();
                                                 view! {
                                                     <li>
                                                         <div>
                                                             <strong>{request.name.clone()}</strong>
                                                             " · machine "
                                                             <code>{request.machine}</code>
-                                                            " · code "
-                                                            <code>{request.code}</code>
                                                         </div>
                                                         {may_admit
                                                             .then(|| {
@@ -280,15 +302,22 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
                                                                         class="inline-form"
                                                                         on:submit=move |e: ev::SubmitEvent| {
                                                                             e.prevent_default();
-                                                                            admit(name.clone(), typed.get_untracked());
+                                                                            admit(name.clone(), machine.clone());
                                                                         }
                                                                     >
                                                                         <input
                                                                             aria-label="The code they read to you"
                                                                             placeholder="The code they read to you"
                                                                             spellcheck="false"
-                                                                            prop:value=move || typed.get()
-                                                                            on:input=move |e| typed.set(event_target_value(&e))
+                                                                            prop:value=move || {
+                                                                                typed.with(|t| t.get(&shown).cloned()).unwrap_or_default()
+                                                                            }
+                                                                            on:input=move |e| {
+                                                                                let value = event_target_value(&e);
+                                                                                typed.update(|t| {
+                                                                                    t.insert(edited.clone(), value);
+                                                                                });
+                                                                            }
                                                                         />
                                                                         <button type="submit">"Admit"</button>
                                                                     </form>

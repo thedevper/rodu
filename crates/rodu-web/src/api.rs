@@ -21,7 +21,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn local(message: impl Into<String>) -> Self {
+    pub fn local(message: impl Into<String>) -> Self {
         Self { status: 0, message: message.into(), hint: None }
     }
 }
