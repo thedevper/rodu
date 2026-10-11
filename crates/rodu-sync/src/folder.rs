@@ -12,9 +12,12 @@
 //! the root public key, plus the encryption fields when it is also encrypted; each payload is
 //! signed before it is sealed (see [`crate::sign`]). A signed team's replica folders also hold a
 //! machine's request to join, the authority records and admissions it signed, and what it holds
-//! of removed machines (`request.json`, `authority.json`, `seen.json`; `.sealed` when encrypted). Which kind a workspace syncs is its own
-//! setting, never the folder's: a folder that does not match it is refused, so a changed team file
-//! cannot make it write plain or unsigned files, or trust another root key.
+//! of removed machines (`request.json`, `authority.json`, `seen.json`; `.sealed` when encrypted).
+//! An encrypted signed team's replica folders also hold each machine's X25519 key
+//! (`exchange.sealed`) and the new team keys an owner's or admin's machine wrapped for each
+//! machine (`keys.json`; ADR 0002, step 3b). Which kind a workspace syncs is its own setting, never
+//! the folder's: a folder that does not match it is refused, so a changed team file cannot make it
+//! write plain or unsigned files, or trust another root key.
 //!
 //! Each replica writes only under its own peer folder, and each file holds only that replica's
 //! own operations, framed as `RODU-UPDATE1`, the payload's length (u64 LE), its SHA-256, then the
@@ -27,10 +30,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rodu_core::{Result, RoduError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::authority::{self, Authority, Record};
 use crate::seal::{self, TeamKey};
@@ -65,6 +70,24 @@ const AUTHORITY_PLAIN: &str = "authority.json";
 const AUTHORITY_SEALED: &str = "authority.sealed";
 /// The largest authority file read.
 const MAX_AUTHORITY_FILE: u64 = 1024 * 1024;
+/// An encrypted team: the removals a machine signed, alone, sealed with the invite code's key, so a
+/// removed machine still hears of its removal after the team key changed and stops writing work
+/// nobody takes in. Each verifies by its own signature, as in the authority file.
+const REMOVED_FILE: &str = "removed.sealed";
+/// An encrypted signed team: a machine's X25519 key, signed with its machine key, in its replica
+/// folder, so an owner's or admin's machine can wrap a new team key for it.
+const EXCHANGE_FILE: &str = "exchange.sealed";
+/// The largest exchange file read.
+const MAX_EXCHANGE: u64 = 4096;
+/// An encrypted signed team: the team keys an owner's or admin's machine wrapped for each
+/// machine, in its replica folder. Plain: each key opens only for the machine it was wrapped for,
+/// and only a key a counting key record names is ever taken.
+const KEYS_FILE: &str = "keys.json";
+/// The largest keys file read.
+const MAX_KEYS_FILE: u64 = 1024 * 1024;
+/// The most wrapped keys tried from one keys file in one pull, so a planted file cannot make a
+/// pull run X25519 without end.
+const MAX_UNWRAP: usize = 64;
 /// A replica compacts its own files once it wrote this many since it last did.
 const COMPACT_AT: usize = 32;
 
@@ -216,6 +239,67 @@ struct AuthorityFile {
     admissions: Vec<String>,
 }
 
+/// What an exchange file holds: the machine's X25519 public key, signed with its machine key.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExchangeFile {
+    format: u32,
+    public_key: String,
+    exchange_key: String,
+    signature: String,
+}
+
+/// What a keys file holds: `<recipient peer, 16 hex>.<generation>.<key check>.<wrapped, hex>`.
+#[derive(Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct KeysFile {
+    format: u32,
+    keys: Vec<String>,
+}
+
+/// A wrapped key's entry in a keys file: recipient peer, generation, key check and the key as
+/// [`seal::wrap`] wrapped it; `None` unless every part is well formed.
+fn parse_wrapped(entry: &str) -> Option<(u64, u64, &str, Vec<u8>)> {
+    let parts: Vec<&str> = entry.split('.').collect();
+    let [peer, generation, check, wrapped] = parts.as_slice() else { return None };
+    let check_ok =
+        check.len() == 64 && check.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let wrapped_ok = wrapped.len() == seal::WRAPPED_LEN * 2
+        && wrapped.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !check_ok || !wrapped_ok {
+        return None;
+    }
+    Some((
+        parse_peer_dir(peer)?,
+        authority::generation(generation)?,
+        check,
+        hex::decode(wrapped).ok()?,
+    ))
+}
+
+/// A team key this machine holds: the first one (generation 0, from the invite code), or one it
+/// received after a re-key.
+#[derive(Clone)]
+struct Held {
+    generation: u64,
+    check: String,
+    key: TeamKey,
+}
+
+/// Where an encrypted signed team's keys stand on this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyState {
+    /// The newest generation this machine holds (0: only the invite code's).
+    pub held: u64,
+    /// The newest generation a key record that counts names.
+    pub newest: u64,
+}
+
+/// The first of `held` that opens `sealed`, written by `peer` of team `workspace_id`.
+fn open_with(held: &[Held], workspace_id: &str, peer: u64, sealed: &[u8]) -> Option<Vec<u8>> {
+    held.iter().find_map(|h| seal::open(&h.key, workspace_id, peer, sealed))
+}
+
 /// What the folder's authority files hold together, unchecked.
 struct Mirrored {
     records: Vec<String>,
@@ -300,6 +384,10 @@ const NOTE_AUTHORITY_REFUSED: &str = "authority-refused";
 /// The local note listing the seen claims this replica took into account, one
 /// `<by>.<signer>.<removed>.<end>` per line.
 const NOTE_SEEN: &str = "seen";
+/// The local note listing the hashes of the wrapped keys this machine wrote into its keys file,
+/// one per line: only those are kept when it writes the file again, so an entry someone changed is
+/// wrapped afresh rather than left in place.
+const NOTE_WRAPPED: &str = "wrapped";
 /// The most refused authority entries noted.
 const MAX_REFUSED: usize = 4096;
 /// The local note listing the hashes of the transfers this replica follows, epoch 1 first.
@@ -311,6 +399,10 @@ fn await_note(stat: &str) -> String {
 /// The local note on a file that goes past its removed peer's cut: the cut it was read under.
 fn cut_note(stat: &str) -> String {
     format!("cut/{stat}")
+}
+/// The local note on a sealed file no key this machine held opened: how many keys it held.
+fn unopened_note(stat: &str) -> String {
+    format!("unopened/{stat}")
 }
 
 impl PullReport {
@@ -364,6 +456,12 @@ pub struct TeamFolder {
     compact_max: usize,
     /// A signed team: this machine's key, and the team's root key.
     signing: Option<(MachineKey, PublicKey)>,
+    /// An encrypted signed team: the private file holding the team keys this machine received
+    /// after the first, one `<generation>.<check>.<key>` per line.
+    keyring: Option<PathBuf>,
+    /// Keys a pull unwrapped and has not checked against the key records yet: they open the
+    /// folder's small files (whose content their own signatures vouch for), never seal anything.
+    pending: Mutex<Vec<Held>>,
 }
 
 /// The path holds untrusted names from the folder and ends up in a terminal: control
@@ -434,7 +532,16 @@ impl TeamFolder {
             compact_at: COMPACT_AT,
             compact_max: MAX_IMPORT_BYTES,
             signing: None,
+            keyring: None,
+            pending: Mutex::new(Vec::new()),
         }
+    }
+
+    /// An encrypted signed team: keeps the team keys this machine receives in the private file
+    /// `path`, and seals with the newest. Without it, only the invite code's key is used.
+    pub fn keyring(mut self, path: impl Into<PathBuf>) -> Self {
+        self.keyring = Some(path.into());
+        self
     }
 
     /// Signs every file with `key`, and accepts only files signed by `root` or by a machine
@@ -627,9 +734,7 @@ impl TeamFolder {
             None => payload,
         };
         Ok(match &self.key {
-            Some(key) => {
-                frame_as(SEALED_MAGIC, &seal::seal(key, self.team_id(info), peer, payload)?)
-            }
+            Some(_) => frame_as(SEALED_MAGIC, &self.seal_for(info, peer, payload)?),
             None => frame(payload),
         })
     }
@@ -696,7 +801,7 @@ impl TeamFolder {
         };
         let json = serde_json::to_vec(&request).expect("a request serializes");
         let (file, bytes) = match &self.key {
-            Some(team) => (REQUEST_SEALED, seal::seal(team, self.team_id(&info), peer, &json)?),
+            Some(_) => (REQUEST_SEALED, self.seal_for(&info, peer, &json)?),
             None => (REQUEST_PLAIN, json),
         };
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
@@ -709,6 +814,7 @@ impl TeamFolder {
     pub fn requests(&self) -> Result<Vec<JoinRequest>> {
         let info = self.checked_info()?;
         let file = if self.key.is_some() { REQUEST_SEALED } else { REQUEST_PLAIN };
+        let held = self.held(true)?;
         let sync = self.root.join(SYNC_DIR);
         let mut found = Vec::new();
         for entry in fs::read_dir(&sync).map_err(|e| folder_error(&sync, e))? {
@@ -726,7 +832,7 @@ impl TeamFolder {
                 continue;
             };
             let json = match &self.key {
-                Some(team) => match seal::open(team, self.team_id(&info), peer, &bytes) {
+                Some(_) => match open_with(&held, self.team_id(&info), peer, &bytes) {
                     Some(json) => json,
                     None => continue,
                 },
@@ -770,7 +876,9 @@ impl TeamFolder {
             Some((key, _)) if authority.may_admit(&key.public()) => {
                 let record = key.admit(self.team_id(&info), request.peer, &request.key);
                 store.set_admission(request.peer, &record)?;
-                self.mirror(store, &info, None)
+                self.mirror(store, &info, None)?;
+                // The machine reads what is sealed with a newer key once it has that key too.
+                self.share_keys(store, &info)
             }
             _ => Err(RoduError::invalid(
                 "Only the team owner's machine, or an admin's, can admit machines",
@@ -783,6 +891,8 @@ impl TeamFolder {
     /// reads the folder once more, so they land now rather than on the next command.
     pub fn pull(&self, store: &LoroStore, checker: &Checker) -> Result<PullReport> {
         let info = self.checked_info()?;
+        // Before any file is opened: one may be sealed with a key that just reached this machine.
+        self.take_keys(store, &info)?;
         let trusted = self.trusted(store, &info)?;
         let first = self.pull_once(store, checker, &info, &trusted)?;
         let now = self.trusted(store, &info)?;
@@ -795,6 +905,18 @@ impl TeamFolder {
         if let Err(e) = self.note_seen(store, &info) {
             report.batch.notes.push(format!(
                 "saying what this machine holds of removed machines: {}; tried again next time",
+                e.message
+            ));
+        }
+        if let Err(e) = self.note_exchange(&info, store.peer()) {
+            report.batch.notes.push(format!(
+                "publishing this machine's key for receiving team keys: {}; tried again next time",
+                e.message
+            ));
+        }
+        if let Err(e) = self.share_keys(store, &info) {
+            report.batch.notes.push(format!(
+                "passing the team keys on to the team's machines: {}; tried again next time",
                 e.message
             ));
         }
@@ -839,7 +961,7 @@ impl TeamFolder {
         };
         let json = serde_json::to_vec(&seen).expect("a seen file serializes");
         let (file, bytes) = match &self.key {
-            Some(team) => (SEEN_SEALED, seal::seal(team, self.team_id(info), store.peer(), &json)?),
+            Some(_) => (SEEN_SEALED, self.seal_for(info, store.peer(), &json)?),
             None => (SEEN_PLAIN, json),
         };
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
@@ -924,7 +1046,8 @@ impl TeamFolder {
     }
 
     /// Writes this machine's authority file afresh: every authority record and admission this
-    /// replica checked that this machine's key signed (from its local notes, so a file that was
+    /// replica checked that this machine's key signed, and every key record whoever signed it
+    /// (from its local notes, so a file that was
     /// damaged, grew too large or was changed loses nothing), with `also`, and whatever the file
     /// held that still reads.
     fn mirror(&self, store: &LoroStore, info: &TeamInfo, also: Option<&Record>) -> Result<()> {
@@ -934,7 +1057,9 @@ impl TeamFolder {
             .authority_file(info, store.peer())?
             .unwrap_or(AuthorityFile { format: 1, ..Default::default() });
         let records = self.authority_records(store, info)?;
-        let signed = records.iter().chain(also).filter(|r| r.signer() == me);
+        // Every key record too, whoever signed it: a machine that never got an earlier key still
+        // learns its record here, sealed with a key it can get, and so takes the keys after it.
+        let signed = records.iter().chain(also).filter(|r| r.signer() == me || r.is_team_key());
         for text in signed.map(|r| r.text().to_owned()) {
             if !file.records.contains(&text) {
                 file.records.push(text);
@@ -955,30 +1080,53 @@ impl TeamFolder {
         }
         let json = serde_json::to_vec(&file).expect("an authority file serializes");
         let (name, bytes) = match &self.key {
-            Some(team) => {
-                (AUTHORITY_SEALED, seal::seal(team, self.team_id(info), store.peer(), &json)?)
-            }
+            Some(_) => (AUTHORITY_SEALED, self.seal_for(info, store.peer(), &json)?),
             None => (AUTHORITY_PLAIN, json),
         };
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
-        write_replacing(&dir, &dir.join(name), &bytes)
+        write_replacing(&dir, &dir.join(name), &bytes)?;
+        let Some(first) = &self.key else { return Ok(()) };
+        let removals: Vec<String> =
+            file.records.into_iter().filter(|text| text.starts_with("remove.")).collect();
+        if removals.is_empty() {
+            return Ok(());
+        }
+        let removed = AuthorityFile { format: 1, records: removals, admissions: Vec::new() };
+        let json = serde_json::to_vec(&removed).expect("a removals file serializes");
+        let bytes = seal::seal(first, self.team_id(info), store.peer(), &json)?;
+        write_replacing(&dir, &dir.join(REMOVED_FILE), &bytes)
     }
 
     /// `peer`'s authority file, if it is there and reads.
     fn authority_file(&self, info: &TeamInfo, peer: u64) -> Result<Option<AuthorityFile>> {
         let name = if self.key.is_some() { AUTHORITY_SEALED } else { AUTHORITY_PLAIN };
+        self.records_file(info, peer, name)
+    }
+
+    /// `peer`'s file `name` holding authority records, if it is there and reads.
+    fn records_file(
+        &self,
+        info: &TeamInfo,
+        peer: u64,
+        name: &str,
+    ) -> Result<Option<AuthorityFile>> {
         let Some(json) = self.small_file(info, peer, name, MAX_AUTHORITY_FILE) else {
             return Ok(None);
         };
         Ok(serde_json::from_slice::<AuthorityFile>(&json).ok().filter(|file| file.format == 1))
     }
 
-    /// Every record text and admission in the folder's authority files, unchecked: each is checked
-    /// by its signature like those in the document.
+    /// Every record text and admission in the folder's authority files, and every removal in its
+    /// removals files, unchecked: each is checked by its signature like those in the document.
     fn mirrored(&self, info: &TeamInfo) -> Result<Mirrored> {
         let (mut records, mut admissions) = (Vec::new(), Vec::new());
         for peer in self.replica_folders()? {
+            if self.key.is_some()
+                && let Some(file) = self.records_file(info, peer, REMOVED_FILE)?
+            {
+                records.extend(file.records.into_iter().filter(|t| t.starts_with("remove.")));
+            }
             let Some(file) = self.authority_file(info, peer)? else { continue };
             records.extend(file.records);
             for entry in file.admissions {
@@ -1016,7 +1164,7 @@ impl TeamFolder {
         }
         let bytes = read_at_most(&path, max).ok().flatten()?;
         match &self.key {
-            Some(team) => seal::open(team, self.team_id(info), peer, &bytes),
+            Some(_) => open_with(&self.held(true).ok()?, self.team_id(info), peer, &bytes),
             None => Some(bytes),
         }
     }
@@ -1285,6 +1433,11 @@ impl TeamFolder {
             for (peer, end) in authority.removals_by(&records, &admitted, target) {
                 self.write_authority(store, &info, &Record::removal(team, key, peer, end))?;
             }
+            // Likewise the team keys `target` changed to: every machine keeps taking them.
+            for (generation, check) in authority.keys_by(&records, target) {
+                let record = Record::team_key(team, key, generation, &check);
+                self.write_authority(store, &info, &record)?;
+            }
             Record::revoke(team, key, epoch, n, target, &kept)
         };
         self.write_authority(store, &info, &record)
@@ -1322,6 +1475,314 @@ impl TeamFolder {
         self.mirror(store, info, Some(record))
     }
 
+    /// Every team key this machine holds, the newest first (ties: the lowest check first, as on
+    /// every machine): those it received, then the invite code's; with `pending`, also those a
+    /// pull unwrapped and has not checked yet, last. Empty for a plain team.
+    fn held(&self, pending: bool) -> Result<Vec<Held>> {
+        let Some(first) = &self.key else { return Ok(Vec::new()) };
+        let mut held = self.read_keyring()?;
+        held.sort_by(|a, b| b.generation.cmp(&a.generation).then_with(|| a.check.cmp(&b.check)));
+        held.push(Held { generation: 0, check: first.check(), key: first.clone() });
+        if pending {
+            held.extend(self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+        }
+        Ok(held)
+    }
+
+    /// The keys in the keyring file that read: a line that does not, or whose key does not match
+    /// its check, is skipped.
+    fn read_keyring(&self) -> Result<Vec<Held>> {
+        let Some(path) = &self.keyring else { return Ok(Vec::new()) };
+        let bytes = match fs::read(path) {
+            Ok(bytes) => Zeroizing::new(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(folder_error(path, e)),
+        };
+        let text = std::str::from_utf8(&bytes).unwrap_or_default();
+        let held = text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('.');
+                let (generation, check, key) = (parts.next()?, parts.next()?, parts.next()?);
+                let key = TeamKey::from_hex(key).filter(|k| k.check() == check)?;
+                parts.next().is_none().then_some(())?;
+                Some(Held {
+                    generation: authority::generation(generation)?,
+                    check: key.check(),
+                    key,
+                })
+            })
+            .collect();
+        Ok(held)
+    }
+
+    /// Adds `new` to the keyring file, written whole under a temporary name and readable by this
+    /// user alone.
+    fn keep_keys(&self, new: &[Held]) -> Result<()> {
+        let Some(path) = &self.keyring else {
+            return Err(RoduError::internal("this workspace has no file for team keys"));
+        };
+        let mut all = self.read_keyring()?;
+        for held in new {
+            if !all.iter().any(|h| h.generation == held.generation && h.check == held.check) {
+                all.push(held.clone());
+            }
+        }
+        // Sized up front, so no copy of a key is left behind by a reallocation.
+        let mut text = Zeroizing::new(String::with_capacity(all.len() * 144));
+        for held in &all {
+            text.push_str(&held.generation.to_string());
+            text.push('.');
+            text.push_str(&held.check);
+            text.push('.');
+            text.push_str(held.key.to_hex().as_str());
+            text.push('\n');
+        }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        write_private(dir, path, text.as_bytes())
+    }
+
+    /// `plain`, sealed for `peer` with the newest team key this machine holds.
+    fn seal_for(&self, info: &TeamInfo, peer: u64, plain: &[u8]) -> Result<Vec<u8>> {
+        let held = self.held(false)?;
+        let newest = held.first().ok_or_else(|| RoduError::internal("no team key to seal with"))?;
+        seal::seal(&newest.key, self.team_id(info), peer, plain)
+    }
+
+    /// Whether this is an encrypted signed team that keeps the keys it receives.
+    fn rekeys(&self) -> bool {
+        self.key.is_some() && self.signing.is_some() && self.keyring.is_some()
+    }
+
+    /// Encrypted signed team: takes the team keys wrapped for this machine in the folder's keys
+    /// files. A key is kept only when a key record that counts names its generation and check;
+    /// until then it only opens the folder's small files, so that records sealed under it are
+    /// read. Up to [`MAX_UNWRAP`] new entries are tried per file.
+    fn take_keys(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
+        if !self.rekeys() {
+            return Ok(());
+        }
+        let secret = key.exchange_secret();
+        let held = self.held(false)?;
+        let mut found: Vec<Held> = Vec::new();
+        for peer in self.replica_folders()? {
+            let Some(file) = self.keys_file(peer) else { continue };
+            let mut tried = 0;
+            for entry in &file.keys {
+                let Some((to, generation, check, wrapped)) = parse_wrapped(entry) else { continue };
+                let known = |h: &Held| h.generation == generation && h.check == check;
+                if to != store.peer() || held.iter().any(known) || found.iter().any(known) {
+                    continue;
+                }
+                if tried == MAX_UNWRAP {
+                    break;
+                }
+                tried += 1;
+                let team = self.team_id(info);
+                if let Some(opened) = seal::unwrap(&secret, &wrapped, team, to, generation)
+                    && opened.check() == check
+                {
+                    found.push(Held { generation, check: check.to_owned(), key: opened });
+                }
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = found.clone();
+        let counting = self
+            .authority_records(store, info)
+            .and_then(|records| Ok(self.resolve(store, &records)?.team_keys(&records)));
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let counting = counting?;
+        // Taken as a chain: a key is kept only when every generation before it is held here or
+        // named by a counting record, so no single record, however high its generation, becomes
+        // the newest key on its own (an admin cannot use up the generations, nor stay the writing
+        // key for good).
+        found.sort_by(|a, b| a.generation.cmp(&b.generation).then_with(|| a.check.cmp(&b.check)));
+        let mut top = held.first().map_or(0, |h| h.generation);
+        let mut kept: Vec<Held> = Vec::new();
+        for candidate in found {
+            if candidate.generation <= Self::chain(top, &counting) + 1
+                && counting.contains(&(candidate.generation, candidate.check.clone()))
+            {
+                top = top.max(candidate.generation);
+                kept.push(candidate);
+            }
+        }
+        if kept.is_empty() { Ok(()) } else { self.keep_keys(&kept) }
+    }
+
+    /// The newest generation reachable from `held` through generations that `named` holds one
+    /// after another: the newest a machine holding `held` can take, and what a new key follows.
+    fn chain(held: u64, named: &BTreeSet<(u64, String)>) -> u64 {
+        let mut top = held;
+        while named.iter().any(|(g, _)| *g == top + 1) {
+            top += 1;
+        }
+        top
+    }
+
+    /// `peer`'s keys file, if it is there and reads.
+    fn keys_file(&self, peer: u64) -> Option<KeysFile> {
+        let path = self.root.join(SYNC_DIR).join(peer_dir_name(peer)).join(KEYS_FILE);
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            return None;
+        }
+        let bytes = read_at_most(&path, MAX_KEYS_FILE).ok().flatten()?;
+        serde_json::from_slice::<KeysFile>(&bytes).ok().filter(|file| file.format == 1)
+    }
+
+    /// Encrypted signed team, on the owner's or an admin's machine: wraps every key after the
+    /// first that this machine holds for every machine admitted and not removed that published
+    /// its X25519 key, keeping the wraps already in its keys file. Rewritten only when that
+    /// changed.
+    fn share_keys(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
+        if !self.rekeys() || !self.authority_of(store, info)?.may_admit(&key.public()) {
+            return Ok(());
+        }
+        let held: Vec<Held> = self.held(false)?.into_iter().filter(|h| h.generation > 0).collect();
+        let existing = self.keys_file(store.peer());
+        if held.is_empty() && existing.is_none() {
+            return Ok(());
+        }
+        let existing = existing.unwrap_or(KeysFile { format: 1, keys: Vec::new() });
+        let noted = store.local_note(NOTE_WRAPPED)?.unwrap_or_default();
+        let wrote: BTreeSet<&str> = noted.lines().collect();
+        let trusted = self.trusted(store, info)?;
+        let team = self.team_id(info);
+        let mut file = KeysFile { format: 1, keys: Vec::new() };
+        for (peer, keys) in &trusted.admitted {
+            if *peer == store.peer() || trusted.cut.contains_key(peer) {
+                continue;
+            }
+            let Some((signer, exchange)) = self.exchange_of(info, *peer) else { continue };
+            if !keys.contains(&signer) {
+                continue;
+            }
+            for held in &held {
+                let prefix =
+                    format!("{}.{}.{}.", peer_dir_name(*peer), held.generation, held.check);
+                let kept = existing.keys.iter().find(|entry| {
+                    entry.starts_with(&prefix) && wrote.contains(authority::key_of(entry).as_str())
+                });
+                file.keys.push(match kept {
+                    Some(entry) => entry.clone(),
+                    // One machine whose key cannot take a wrap never holds up the others.
+                    None => match seal::wrap(&held.key, &exchange, team, *peer, held.generation) {
+                        Ok(wrapped) => format!("{prefix}{}", hex::encode(wrapped)),
+                        Err(_) => continue,
+                    },
+                });
+            }
+        }
+        if file == existing {
+            return Ok(());
+        }
+        let hashes: Vec<String> = file.keys.iter().map(|entry| authority::key_of(entry)).collect();
+        // Noted before the file is written: a stop in between only wraps some keys afresh.
+        store.set_local_note(NOTE_WRAPPED, &hashes.join("\n"))?;
+        let json = serde_json::to_vec(&file).expect("a keys file serializes");
+        let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
+        fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
+        write_replacing(&dir, &dir.join(KEYS_FILE), &json)
+    }
+
+    /// The signer and the X25519 key in `peer`'s exchange file, if it is there and its signature
+    /// verifies. Whether that signer is admitted for `peer` is the caller's to check.
+    fn exchange_of(&self, info: &TeamInfo, peer: u64) -> Option<(PublicKey, [u8; 32])> {
+        let json = self.small_file(info, peer, EXCHANGE_FILE, MAX_EXCHANGE)?;
+        let file = serde_json::from_slice::<ExchangeFile>(&json).ok()?;
+        let signer = PublicKey::from_hex(&file.public_key)?;
+        let mut exchange = [0u8; 32];
+        let hex_ok = file.exchange_key.len() == 64
+            && file.exchange_key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        (hex_ok && file.format == 1).then_some(())?;
+        hex::decode_to_slice(&file.exchange_key, &mut exchange).ok()?;
+        // A low-order point would make every wrap for it fail.
+        seal::usable_exchange(&exchange).then_some(())?;
+        sign::check_exchange(&signer, self.team_id(info), peer, &exchange, &file.signature)
+            .then_some((signer, exchange))
+    }
+
+    /// Encrypted signed team: writes this machine's exchange file, unless the one there is
+    /// already this machine's.
+    fn note_exchange(&self, info: &TeamInfo, peer: u64) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
+        if !self.rekeys() {
+            return Ok(());
+        }
+        let exchange = key.exchange_public();
+        if self.exchange_of(info, peer) == Some((key.public(), exchange)) {
+            return Ok(());
+        }
+        let file = ExchangeFile {
+            format: 1,
+            public_key: key.public().to_hex(),
+            exchange_key: hex::encode(exchange),
+            signature: key.sign_exchange(self.team_id(info), peer, &exchange),
+        };
+        let json = serde_json::to_vec(&file).expect("an exchange file serializes");
+        let dir = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
+        fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
+        write_replacing(&dir, &dir.join(EXCHANGE_FILE), &self.seal_for(info, peer, &json)?)
+    }
+
+    /// Encrypted signed team, on the owner's or an admin's machine: changes the team key. The new
+    /// key is kept here, named in a signed key record, and wrapped for every machine admitted and
+    /// not removed; every machine seals with it once it has it. Returns its generation. The next
+    /// push sends the record.
+    pub fn rekey(&self, store: &LoroStore) -> Result<u64> {
+        let info = self.checked_info()?;
+        if !self.rekeys() {
+            return Err(RoduError::invalid(
+                "Only an encrypted team that signs its files changes its key",
+            ));
+        }
+        let records = self.authority_records(store, &info)?;
+        let authority = self.resolve(store, &records)?;
+        let key = match &self.signing {
+            Some((key, _)) if authority.may_admit(&key.public()) => key,
+            _ => {
+                return Err(RoduError::invalid(
+                    "Only the team owner's machine, or an admin's, can change the team key",
+                ));
+            }
+        };
+        // Past every generation a counting record names along the chain from what this machine
+        // holds, so the new key is newer than any key a removed machine may hold, even one this
+        // machine never received; a record that jumps ahead never uses up the generations.
+        let newest_held = self.held(false)?.first().map_or(0, |h| h.generation);
+        let generation = Self::chain(newest_held, &authority.team_keys(&records)) + 1;
+        if authority::generation(&generation.to_string()).is_none() {
+            return Err(RoduError::invalid("This team changed its key as often as it can"));
+        }
+        let new = TeamKey::generate()?;
+        let check = new.check();
+        // Kept before anything names it, so a stop in between never leaves a key nobody holds.
+        self.keep_keys(&[Held { generation, check: check.clone(), key: new }])?;
+        let record = Record::team_key(self.team_id(&info), key, generation, &check);
+        self.write_authority(store, &info, &record)?;
+        self.share_keys(store, &info)?;
+        Ok(generation)
+    }
+
+    /// Encrypted signed team: the newest team key this machine holds, and the newest one the team
+    /// changed to. `None` for any other team.
+    pub fn key_state(&self, store: &LoroStore) -> Result<Option<KeyState>> {
+        let info = self.checked_info()?;
+        if !self.rekeys() {
+            return Ok(None);
+        }
+        let held = self.held(false)?.first().map_or(0, |h| h.generation);
+        let records = self.authority_records(store, &info)?;
+        let authority = self.resolve(store, &records)?;
+        let newest = Self::chain(held, &authority.team_keys(&records));
+        Ok(Some(KeyState { held, newest }))
+    }
+
     /// What a signed team does with a file's payload once it is unframed and opened: its Loro
     /// update when a key [`Trusted`] for `peer` signed it.
     fn verify<'a>(
@@ -1348,6 +1809,8 @@ impl TeamFolder {
         trusted: &Trusted,
     ) -> Result<PullReport> {
         let info = info.clone();
+        // Each sealed file is opened with whichever key this machine holds sealed it.
+        let held = self.held(false)?;
         let mut awaiting: BTreeMap<u64, usize> = BTreeMap::new();
         let magic = if self.key.is_some() { SEALED_MAGIC } else { MAGIC };
         let sync = self.root.join(SYNC_DIR);
@@ -1406,6 +1869,13 @@ impl TeamFolder {
                     *awaiting.entry(peer).or_default() += 1;
                     continue;
                 }
+                // A sealed file no key opened is not read again until this machine holds another.
+                if let Some(stat) = &stat
+                    && self.key.is_some()
+                    && store.local_note(&unopened_note(stat))? == Some(held.len().to_string())
+                {
+                    continue;
+                }
                 // A file found to go past its peer's cut is not read again until the cut moves.
                 if let Some(stat) = &stat
                     && let Some(cut) = trusted.cut.get(&peer)
@@ -1435,16 +1905,34 @@ impl TeamFolder {
                 // plain one.
                 let sealed;
                 let opened = match unframe_as(magic, &bytes) {
-                    Frame::Complete(payload) => match &self.key {
-                        None => Ok(payload),
-                        Some(team) => match seal::open(team, self.team_id(&info), peer, payload) {
+                    Frame::Complete(payload) if self.key.is_none() => Ok(payload),
+                    Frame::Complete(payload) => {
+                        match open_with(&held, self.team_id(&info), peer, payload) {
                             Some(plain) => {
                                 sealed = plain;
                                 Ok(&sealed[..])
                             }
-                            None => Err("does not open with the team key"),
-                        },
-                    },
+                            // Perhaps sealed with a team key that has not reached this machine
+                            // yet: said once, and read again once this machine holds another.
+                            None => {
+                                if let Some(stat) = &stat {
+                                    store.set_local_note(
+                                        &unopened_note(stat),
+                                        &held.len().to_string(),
+                                    )?;
+                                }
+                                let said = format!("{key}/unopened");
+                                if !store.sync_seen(&said)? {
+                                    store.mark_sync_seen(&said)?;
+                                    report.damaged.push(format!(
+                                        "{shown}: does not open with any team key this machine \
+                                         holds; read again once it receives a new one"
+                                    ));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     Frame::Incomplete => {
                         report.incomplete.push(shown);
                         continue;
@@ -1565,10 +2053,27 @@ fn read_at_most(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
 /// Writes a whole file under a temporary hidden name, then renames it over `path`, so readers
 /// never see it half written.
 fn write_replacing(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    replace(dir, path, bytes, false)
+}
+
+/// [`write_replacing`] for a file only this user may read (no-op where there are no modes).
+fn write_private(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    replace(dir, path, bytes, true)
+}
+
+fn replace(dir: &Path, path: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let result = (|| {
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);

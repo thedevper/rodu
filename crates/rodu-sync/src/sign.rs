@@ -31,6 +31,16 @@
 //! "rodu-request-1" 0x00 || u64 LE byte length of the workspace id || the workspace id
 //!     || the asking peer id, u64 LE || u64 LE byte length of the name || the name (UTF-8)
 //! ```
+//!
+//! On an encrypted team each machine also has an X25519 key, to receive new team keys (step 3b).
+//! It is a key of its own, never the signing key used for Diffie-Hellman: its secret is the
+//! SHA-256 of `"rodu-exchange-key-1" 0x00 || the signing key's seed`, so it needs no file of its
+//! own. The machine publishes its public half signed with its signing key:
+//!
+//! ```text
+//! "rodu-exchange-1" 0x00 || u64 LE byte length of the workspace id || the workspace id
+//!     || the machine's peer id, u64 LE || its X25519 public key (32 bytes)
+//! ```
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rodu_core::{Result, RoduError};
@@ -49,6 +59,8 @@ const ADMIT_DOMAIN: &[u8] = b"rodu-admit-1\0";
 const REQUEST_DOMAIN: &[u8] = b"rodu-request-1\0";
 const AUTHORITY_DOMAIN: &[u8] = b"rodu-authority-1\0";
 const SEEN_DOMAIN: &[u8] = b"rodu-seen-1\0";
+const EXCHANGE_DOMAIN: &[u8] = b"rodu-exchange-1\0";
+const EXCHANGE_KEY_DOMAIN: &[u8] = b"rodu-exchange-key-1\0";
 
 /// Exactly `2 * N` lowercase hex digits.
 fn from_hex<const N: usize>(text: &str) -> Option<Zeroizing<[u8; N]>> {
@@ -96,6 +108,12 @@ fn seen_message(workspace_id: &str, peer: u64, text: &str) -> Vec<u8> {
     let mut message = with_team(SEEN_DOMAIN, workspace_id, peer);
     message.extend((text.len() as u64).to_le_bytes());
     message.extend(text.as_bytes());
+    message
+}
+
+fn exchange_message(workspace_id: &str, peer: u64, exchange: &[u8; 32]) -> Vec<u8> {
+    let mut message = with_team(EXCHANGE_DOMAIN, workspace_id, peer);
+    message.extend(exchange);
     message
 }
 
@@ -214,6 +232,29 @@ impl MachineKey {
         hex::encode(self.0.sign(&seen_message(workspace_id, peer, text)).to_bytes())
     }
 
+    /// This machine's X25519 secret, for receiving team keys: derived from the signing key's seed
+    /// under its own domain, so it is a separate key that needs no file of its own.
+    pub fn exchange_secret(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        let seed = Zeroizing::new(self.0.to_bytes());
+        let mut hash = Sha256::new();
+        hash.update(EXCHANGE_KEY_DOMAIN);
+        hash.update(seed.as_ref());
+        let mut secret = Zeroizing::new([0u8; KEY_LEN]);
+        secret.copy_from_slice(&hash.finalize());
+        secret
+    }
+
+    /// The public half of [`Self::exchange_secret`].
+    pub fn exchange_public(&self) -> [u8; KEY_LEN] {
+        crate::seal::exchange_public(&self.exchange_secret())
+    }
+
+    /// This key's signature, 128 hex, on `exchange` as the X25519 key of the machine writing as
+    /// `peer`.
+    pub fn sign_exchange(&self, workspace_id: &str, peer: u64, exchange: &[u8; KEY_LEN]) -> String {
+        hex::encode(self.0.sign(&exchange_message(workspace_id, peer, exchange)).to_bytes())
+    }
+
     /// This key's signature, 128 hex, on an authority record's text up to its signer key.
     pub fn sign_authority(&self, workspace_id: &str, text: &str) -> String {
         hex::encode(self.0.sign(&authority_message(workspace_id, text)).to_bytes())
@@ -281,6 +322,18 @@ pub fn check_seen(
 ) -> bool {
     from_hex::<SIGNATURE_LEN>(signature)
         .is_some_and(|sig| key.verifies(&seen_message(workspace_id, peer, text), &sig))
+}
+
+/// Whether `key` signed `exchange` as the X25519 key of the machine writing as `peer`.
+pub fn check_exchange(
+    key: &PublicKey,
+    workspace_id: &str,
+    peer: u64,
+    exchange: &[u8; KEY_LEN],
+    signature: &str,
+) -> bool {
+    from_hex::<SIGNATURE_LEN>(signature)
+        .is_some_and(|sig| key.verifies(&exchange_message(workspace_id, peer, exchange), &sig))
 }
 
 /// Whether `key` signed a request to join as `peer` under `name`.
@@ -379,6 +432,37 @@ mod tests {
         let other = MachineKey::generate().unwrap().public();
         assert!(!check_request(&other, TEAM, 5, "bob", &signature));
         assert!(!check_request(&key.public(), TEAM, 5, "bob", "00"));
+    }
+
+    #[test]
+    fn the_exchange_key_is_its_own_and_its_signature_binds_team_peer_and_key() {
+        let key = MachineKey::generate().unwrap();
+        let exchange = key.exchange_public();
+        assert_eq!(exchange, key.exchange_public(), "the same key every time");
+        assert_ne!(*key.exchange_secret(), key.0.to_bytes(), "not the signing seed");
+        assert_ne!(exchange, key.public().0, "not the signing key");
+        assert_ne!(exchange, MachineKey::generate().unwrap().exchange_public());
+        // Pinned: computed by an independent X25519 implementation (RFC 7748) from the SHA-256
+        // of the domain and the RFC 8032 test key's seed.
+        let pinned = MachineKey::from_hex(
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(pinned.exchange_public()),
+            "51c68322fd147957e6e875c81a66c32cde86896e99aa56b723da11174788803c"
+        );
+        let signature = key.sign_exchange(TEAM, 7, &exchange);
+        assert!(check_exchange(&key.public(), TEAM, 7, &exchange, &signature));
+        assert!(!check_exchange(&key.public(), TEAM, 8, &exchange, &signature), "another peer");
+        let other_team = "0190f0c4-0000-7000-8000-000000000002";
+        assert!(!check_exchange(&key.public(), other_team, 7, &exchange, &signature));
+        let mut changed = exchange;
+        changed[0] ^= 1;
+        assert!(!check_exchange(&key.public(), TEAM, 7, &changed, &signature), "another key");
+        let stranger = MachineKey::generate().unwrap().public();
+        assert!(!check_exchange(&stranger, TEAM, 7, &exchange, &signature), "another signer");
+        assert!(!check_exchange(&key.public(), TEAM, 7, &exchange, &signature[2..]));
     }
 
     #[test]
