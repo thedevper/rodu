@@ -52,12 +52,17 @@ and writes them.
 
 ```sh
 # in the folder you track work in; makes a workspace there if there is none yet
-rodu team create         # finds your Google Drive and prints an invite code
-# on a teammate's machine, once the team's folder is in their Google Drive:
-rodu team join           # paste the code when asked; it finds the folder
-# back on yours, with the code bob's machine printed (check it with bob):
-rodu team admit bob <code>
+rodu team create         # finds your Google Drive
+rodu team invite bob     # an invite for bob; send it to him yourself
+# on bob's machine, once the team's folder is in his Google Drive:
+rodu team join           # paste the invite when asked; it finds the folder
 ```
+
+Your machine admits bob's the next time it syncs, which any command, `rodu web` and `rodu mcp` do.
+An invite admits one machine, once, within 7 days (`--days` from 1 to 90). `rodu team invites`
+lists the ones not used yet, and `rodu team invite --revoke bob` cancels one. A teammate can also
+join with the team's invite code from `rodu team --show-invite`; their machine then prints a code
+to check with them before `rodu team admit bob <code>`.
 
 `team create` lists the Google Drives it finds (each account's My Drive, and its shared drives in an
 organisation) and puts the team's files in `Rodu/<KEY>` inside the one you pick with `--drive
@@ -73,8 +78,7 @@ teammate's machine get a key such as `DEMO-KQMRTZ` until the machine that create
 gives them their number; the old key keeps working.
 
 A team is encrypted: every file in the folder is sealed with a team key, so Google cannot read the
-board. The invite code holds that key: share it like a password, and see it again with `rodu team
---show-invite`. Every machine also signs what it writes, and the team takes in changes only from
+board. Invites and the invite code hold that key: share them like a password. Every machine also signs what it writes, and the team takes in changes only from
 machines its owner or an admin admitted:
 
 ```sh
