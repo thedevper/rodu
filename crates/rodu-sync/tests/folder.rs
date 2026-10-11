@@ -2406,3 +2406,27 @@ fn a_re_key_follows_every_key_record_that_counts_even_one_this_machine_lacks() {
     let (dan_folder, d) = dan_joins(root.path(), &ann_folder, &a);
     assert_eq!(dan_folder.key_state(d.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
 }
+
+#[test]
+fn a_re_key_whose_record_could_not_be_written_is_published_by_the_next_sync() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let ann = a.store().peer();
+    // The folder refuses ann's authority file: a folder in its place that cannot be replaced.
+    let blocked = root.path().join(format!("Shared/Team/sync/{ann:016x}/authority.sealed"));
+    let saved = std::fs::read(&blocked).unwrap();
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir_all(blocked.join("in-the-way")).unwrap();
+    assert!(ann_folder.rekey(a.store()).is_err());
+    // Work goes on meanwhile, sealed with the new key ann now holds.
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "During" })], None).unwrap();
+    ann_folder.pull(a.store(), &checker()).unwrap();
+    assert!(ann_folder.push(a.store()).is_err(), "nothing sealed under a key nobody can get");
+    // Once the folder takes the file again, the next sync publishes the record and the key.
+    std::fs::remove_dir_all(&blocked).unwrap();
+    std::fs::write(&blocked, saved).unwrap();
+    write(&a, &ann_folder, "After");
+    b.sync(&bob_folder);
+    assert!(has(&b, "During") && has(&b, "After"), "{:?}", b.titles());
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+}
