@@ -901,6 +901,9 @@ impl TeamFolder {
     /// machine's signed record into the team document; the next push sends it.
     pub fn admit(&self, store: &LoroStore, request: &JoinRequest) -> Result<()> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error leaves it to the next push, which refuses to seal.
+        let _ = self.settle_seal_key(store, &info);
         let authority = self.authority_of(store, &info)?;
         if self.trusted(store, &info)?.cut.contains_key(&request.peer) {
             return Err(RoduError::invalid("That machine was removed from the team")
@@ -1412,6 +1415,9 @@ impl TeamFolder {
     /// next push sends the record.
     pub fn remove(&self, store: &LoroStore, peer: u64) -> Result<bool> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error leaves it to the next push, which refuses to seal.
+        let _ = self.settle_seal_key(store, &info);
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
         let key = match &self.signing {
@@ -1450,6 +1456,9 @@ impl TeamFolder {
     /// stay in. The next push sends the record.
     pub fn set_admin(&self, store: &LoroStore, target: &PublicKey, on: bool) -> Result<()> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error leaves it to the next push, which refuses to seal.
+        let _ = self.settle_seal_key(store, &info);
         let team = self.team_id(&info);
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
@@ -1501,6 +1510,9 @@ impl TeamFolder {
     /// ended counts any more. The next push sends the record.
     pub fn transfer(&self, store: &LoroStore, new: &PublicKey) -> Result<()> {
         let info = self.checked_info()?;
+        // Sealed with the key the team has now, even in a process that settled it long ago; an
+        // error leaves it to the next push, which refuses to seal.
+        let _ = self.settle_seal_key(store, &info);
         let records = self.authority_records(store, &info)?;
         let authority = self.resolve(store, &records)?;
         let key = self.owner_key(&authority, "hand over the team")?;
