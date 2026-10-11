@@ -46,42 +46,49 @@ column to reorder, filter with JQL-lite, and click a card to edit it or comment.
 
 ## Work as a team
 
-Share a workspace through a folder your team already syncs (Google Drive, Dropbox, OneDrive,
-iCloud Drive or Syncthing). Rodu only reads and writes files there; the folder's own app moves
-them between machines.
+Share a board through Google Drive, with a personal account or your organisation's. No server and
+nothing to pay for: Google Drive for desktop moves the files between machines, and Rodu only reads
+and writes them.
 
 ```sh
-rodu team create --folder ~/Drive/our-board --encrypt   # prints an invite code
-# on a teammate's machine, with the same folder synced; paste the code when asked:
-rodu team join - --folder ~/Drive/our-board --name bob
+# in the folder you track work in; makes a workspace there if there is none yet
+rodu team create         # finds your Google Drive and prints an invite code
+# on a teammate's machine, once the team's folder is in their Google Drive:
+rodu team join           # paste the code when asked; it finds the folder
+# back on yours, with the code bob's machine printed (check it with bob):
+rodu team admit bob <code>
 ```
+
+`team create` lists the Google Drives it finds (each account's My Drive, and its shared drives in an
+organisation) and puts the team's files in `Rodu/<KEY>` inside the one you pick with `--drive
+<number>`. A shared drive suits an organisation: every member sees it at the same place, and members
+should have the Content manager role (the default for new members), because a Contributor cannot
+remove files and Rodu removes its own old ones. In a personal My Drive, share the `Rodu/<KEY>`
+folder with your team in Google Drive. Each teammate then adds a shortcut to it in their My Drive,
+so it syncs to their machine. Another folder app (Dropbox, OneDrive, iCloud Drive, Syncthing) works
+too, given its folder: `--folder <path>`.
 
 After that every command syncs by itself, and `rodu sync` does it by hand. New cards made on a
 teammate's machine get a key such as `DEMO-KQMRTZ` until the machine that created the team
 gives them their number; the old key keeps working.
 
-With `--encrypt`, every file in the folder is sealed with a team key, so the folder's provider
-cannot read the board. The invite code holds that key: share it like a password, and see it
-again with `rodu team --show-invite`. Anyone with the code and the folder can read and change
-the board. With `--no-encrypt`, anyone with access to the folder can read it.
-
-With `--signed`, every machine signs what it writes, and the team takes in changes only from
-machines its owner or an admin admitted. A machine that joins prints its code; check it with the
-person, then admit it:
+A team is encrypted: every file in the folder is sealed with a team key, so Google cannot read the
+board. The invite code holds that key: share it like a password, and see it again with `rodu team
+--show-invite`. Every machine also signs what it writes, and the team takes in changes only from
+machines its owner or an admin admitted:
 
 ```sh
-rodu team create --folder ~/Drive/our-board --encrypt --signed
 rodu team admit                 # machines asking to join
-rodu team admit bob <code>      # the code bob's machine printed
 rodu team members               # who is on the team
 rodu team remove bob --yes      # refuse what bob's machines write from now on
 ```
 
-On an encrypted signed team, `team remove` also changes the team key. What each machine writes
-once it has the new key is closed to the removed machine. What the folder held before stays
-readable to it, and so does what a machine writes before it next syncs. A team made without `--signed` cannot be switched to it
-later. `rodu team admin` lets another person admit machines, and `rodu team transfer-owner`
-hands the team over.
+`team remove` also changes the team key. What each machine writes once it has the new key is
+closed to the removed machine. What the folder held before stays readable to it, and so does what
+a machine writes before it next syncs. `rodu team admin` lets another person admit machines, and
+`rodu team transfer-owner` hands the team over. `--no-encrypt` leaves the files readable to anyone
+with access to the folder, and `--unsigned` lets anyone with the invite code in without being
+admitted.
 
 ## Use it from an agent (MCP)
 

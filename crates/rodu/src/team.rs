@@ -15,12 +15,12 @@ use rodu_sync::sign::{MachineKey, PublicKey};
 use rodu_sync::{Checker, LoroStore};
 use serde::{Deserialize, Serialize};
 
-use crate::readable;
 use crate::store::AnyStore;
 use crate::{
-    Args, Config, Io, Workspace, create_private_dir, find_dir, open, resolve, var,
-    write_private_file,
+    Args, Config, Io, Workspace, create_private_dir, find_dir, has_workspace, init_workspace, open,
+    resolve, var, write_private_file,
 };
+use crate::{drive, readable};
 
 /// The hidden command the import check runs in: `rodu __check-import` reads a framed import on
 /// stdin, replays it, and exits 0 if it is valid, 2 if not (anything else: it crashed).
@@ -1177,23 +1177,107 @@ fn key_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> Option<String>
     })
 }
 
-fn folder_arg(io: &Io<'_>, args: &Args) -> Result<PathBuf> {
-    let folder = args.value("folder").ok_or_else(|| {
-        RoduError::invalid("--folder is required")
-            .with_hint("The folder your team shares, e.g. in Google Drive or Dropbox")
-    })?;
-    Ok(resolve(&io.cwd, folder))
+/// Where a new team's files go: `--folder`, or `Rodu/<collection key>` in the Google Drive the
+/// user picks (the only one found, or `--drive <number>` from the list).
+fn create_folder(io: &mut Io<'_>, args: &Args, collection: &str) -> Result<PathBuf> {
+    if let Some(folder) = args.value("folder") {
+        return Ok(resolve(&io.cwd, folder));
+    }
+    let found = drive::locations(&io.env);
+    if found.is_empty() {
+        return Err(RoduError::invalid("No Google Drive folder found on this machine").with_hint(
+            "Install Google Drive for desktop and sign in, or give the folder your team shares: \
+             rodu team create --folder <path>",
+        ));
+    }
+    let picked = match args.value("drive") {
+        Some(number) => number
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| found.get(i))
+            .ok_or_else(|| {
+                RoduError::invalid(format!("--drive takes a number from 1 to {}", found.len()))
+            })?,
+        None if found.len() == 1 => &found[0],
+        None => {
+            (io.out)("Google Drive folders on this machine:");
+            for (i, location) in found.iter().enumerate() {
+                (io.out)(&format!("  {}. {}", i + 1, location.label));
+            }
+            return Err(RoduError::invalid("Choose where the team's files go").with_hint(
+                "rodu team create --drive <number>. A shared drive suits an organisation: every \
+                 member sees it at the same place",
+            ));
+        }
+    };
+    let path = picked.path.join("Rodu").join(collection);
+    (io.out)(&format!("The team's files go in {}, in {}", path.display(), picked.label));
+    Ok(path)
 }
 
-/// Whether the new team is encrypted.
+/// The folder of the team `workspace_id` on this machine: `--folder`, or the one holding it
+/// found in this machine's Google Drive.
+fn join_folder(io: &Io<'_>, args: &Args, workspace_id: &str) -> Result<PathBuf> {
+    if let Some(folder) = args.value("folder") {
+        return Ok(resolve(&io.cwd, folder));
+    }
+    let locations = drive::locations(&io.env);
+    let mut found = drive::find_team(&locations, workspace_id);
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 if locations.is_empty() => {
+            Err(RoduError::invalid("No Google Drive folder found on this machine").with_hint(
+                "Install Google Drive for desktop and sign in, or give the team's folder: \
+                 rodu team join --folder <path>",
+            ))
+        }
+        0 => Err(RoduError::not_found("The team's folder is not in this machine's Google Drive yet")
+            .with_hint(
+                "Ask to be added to the team's shared drive, or open the shared folder in Google \
+                 Drive and add a shortcut to it in My Drive. Once Drive has synced it, run the join \
+                 again, or give the folder: --folder <path>",
+            )),
+        _ => {
+            let list: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
+            Err(RoduError::invalid(format!(
+                "This team's folder is in more than one place: {}",
+                list.join(", ")
+            ))
+            .with_hint("Choose one: rodu team join --folder <path>"))
+        }
+    }
+}
+
+/// This machine's user name, if it is a valid name on a team.
+fn system_user(io: &Io<'_>) -> Option<String> {
+    let name = var(io, "USER").or_else(|| var(io, "USERNAME"))?;
+    let name: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    let name = name.trim_start_matches(['.', '_', '-']);
+    (!name.is_empty()).then(|| name.chars().take(40).collect())
+}
+
+/// A collection key from a folder's name: its letters and digits in capitals, starting with a
+/// letter, at most 10; `TEAM` if that leaves fewer than 2.
+fn key_from(dir: &Path) -> String {
+    let name = dir.file_name().map(|n| n.to_string_lossy().to_uppercase()).unwrap_or_default();
+    let key: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .skip_while(char::is_ascii_digit)
+        .take(10)
+        .collect();
+    if key.len() < 2 { "TEAM".to_owned() } else { key }
+}
+
+/// Whether the new team is encrypted: yes, unless `--no-encrypt`.
 fn encryption_choice(args: &Args) -> Result<bool> {
     match (args.flag("encrypt"), args.flag("no-encrypt")) {
         (true, true) => Err(RoduError::invalid("Choose one of --encrypt and --no-encrypt")),
-        (true, false) => Ok(true),
-        (false, true) => Ok(false),
-        (false, false) => Err(RoduError::invalid("Choose --encrypt or --no-encrypt").with_hint(
-            "--no-encrypt keeps the sync files readable to anyone with access to the folder",
-        )),
+        (_, no) => Ok(!no),
     }
 }
 
@@ -1209,19 +1293,50 @@ fn save_config(dir: &Path, config: &Config) -> Result<()> {
         .map_err(|e| RoduError::invalid(format!("Cannot write {}: {e}", path.display())))
 }
 
-/// `rodu team create --folder <path> --encrypt|--no-encrypt`: makes this workspace a team
-/// workspace.
+/// `rodu team create [--folder <path> | --drive <n>] [--no-encrypt] [--unsigned]`: makes this
+/// workspace a team workspace, encrypted and signed unless told otherwise (ADR 0004). With no workspace
+/// here, one is made first.
 pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
-    let folder_path = folder_arg(io, args)?;
     let encrypted = encryption_choice(args)?;
-    let signed = args.flag("signed");
+    // A new team signs its files, so the owner admits each machine, unless `--unsigned`: kept for
+    // a team that wants anyone with the invite code in, as teams made before signing were.
+    let signed = match (args.flag("signed"), args.flag("unsigned")) {
+        (true, true) => return Err(RoduError::invalid("Choose one of --signed and --unsigned")),
+        (_, unsigned) => !unsigned,
+    };
+    // Where the files go is settled before anything is written here, so a create that finds no
+    // Google Drive leaves no workspace behind.
+    let folder_path = if has_workspace(io) {
+        let ws = open(io, false)?;
+        if let Some(team) = &ws.config.team {
+            return Err(RoduError::conflict(format!(
+                "This workspace already syncs through {}",
+                team.folder
+            )));
+        }
+        create_folder(io, args, &ws.config.collection)?
+    } else {
+        let name = match args.value("name") {
+            Some(name) => name.to_owned(),
+            None => system_user(io).ok_or_else(|| {
+                RoduError::invalid("team create needs --name <you> here")
+                    .with_hint("No workspace here yet: team create makes one for you, by that name")
+            })?,
+        };
+        let key = args.value("key").map_or_else(|| key_from(&io.cwd), str::to_uppercase);
+        let folder_path = create_folder(io, args, &key)?;
+        let title = args
+            .value("title")
+            .map(str::to_owned)
+            .or_else(|| io.cwd.file_name().map(|n| n.to_string_lossy().into_owned()));
+        init_workspace(io, &name, &key, title.as_deref())?;
+        (io.out)(&format!(
+            "You are {name} on this board (another name: --name), and its cards are {key}-1, \
+             {key}-2, … (another key: --key)"
+        ));
+        folder_path
+    };
     let ws = open(io, false)?;
-    if let Some(team) = &ws.config.team {
-        return Err(RoduError::conflict(format!(
-            "This workspace already syncs through {}",
-            team.folder
-        )));
-    }
     let dir = ws.dir.clone();
     let mut config = ws.config.clone();
     // A create that stopped half way left the document, and maybe its first file: carry on.
@@ -1252,7 +1367,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
             )));
         }
         if resumed.is_some() && info.root().is_some() != signed {
-            let was = if signed { "without --signed" } else { "with --signed" };
+            let was = if signed { "with --unsigned" } else { "without --unsigned" };
             return Err(RoduError::conflict(format!(
                 "A team create stopped half way here: run it again {was}"
             )));
@@ -1424,6 +1539,11 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
     // and other users' process lists.
     let read;
     let code = match code.map(String::as_str) {
+        // No code given: read it as with `-`, when someone is there to paste it.
+        None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => Some("-"),
+        other => other,
+    };
+    let code = match code {
         Some("-") => {
             if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 (io.err)("Paste the invite code, then press Enter:");
@@ -1441,6 +1561,7 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
         RoduError::invalid("team join needs an invite code such as rodu1-0190…")
             .with_hint("The teammate who created the team sees it in: rodu team --show-invite")
     })?;
+    let system = system_user(io);
     let who = match (args.value("name"), args.value("as")) {
         (Some(name), None) => Joining::New(name),
         (None, Some(name)) => Joining::As(name),
@@ -1450,12 +1571,15 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
                  not both",
             ));
         }
-        (None, None) => {
-            return Err(RoduError::invalid("team join needs --name <you>")
-                .with_hint("Joining from a second machine? Use --as <your name on the team>"));
-        }
+        (None, None) => match system.as_deref() {
+            Some(name) => Joining::New(name),
+            None => {
+                return Err(RoduError::invalid("team join needs --name <you>")
+                    .with_hint("Joining from a second machine? Use --as <your name on the team>"));
+            }
+        },
     };
-    let folder_path = folder_arg(io, args)?;
+    let folder_path = join_folder(io, args, &workspace_id)?;
     let info = TeamFolder::new(&folder_path).info()?;
     if info.workspace_id != workspace_id {
         return Err(RoduError::invalid(format!(
