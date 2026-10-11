@@ -3,7 +3,8 @@
 Local-first, AI-first work tracking: kanban and sprints for small teams. Your data lives on your
 machine, and agents are first-class users through MCP.
 
-> Status: v0. Single-user, local SQLite. CLI, MCP over stdio and a local web board. Sync comes later.
+> Status: v0. Local SQLite, CLI, MCP over stdio and a local web board. Teams sync through a shared
+> folder, optionally encrypted and with each machine admitted by the team's owner.
 
 ## Install
 
@@ -11,8 +12,8 @@ One self-contained `rodu` binary (SQLite and the web board are inside); nothing 
 
 | | |
 |---|---|
-| macOS | `curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.3.0/packaging/install.sh \| sh` |
-| Windows (PowerShell) | `irm https://raw.githubusercontent.com/TheDevper/rodu/v0.3.0/packaging/install.ps1 \| iex` |
+| macOS | `curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.4.0/packaging/install.sh \| sh` |
+| Windows (PowerShell) | `irm https://raw.githubusercontent.com/TheDevper/rodu/v0.4.0/packaging/install.ps1 \| iex` |
 
 The script URLs name a release tag, so they run that release's reviewed script. Builds exist for
 macOS (Apple silicon and Intel) and Windows x64, which also runs on Windows on ARM. Other
@@ -63,6 +64,24 @@ With `--encrypt`, every file in the folder is sealed with a team key, so the fol
 cannot read the board. The invite code holds that key: share it like a password, and see it
 again with `rodu team --show-invite`. Anyone with the code and the folder can read and change
 the board. With `--no-encrypt`, anyone with access to the folder can read it.
+
+With `--signed`, every machine signs what it writes, and the team takes in changes only from
+machines its owner or an admin admitted. A machine that joins prints its code; check it with the
+person, then admit it:
+
+```sh
+rodu team create --folder ~/Drive/our-board --encrypt --signed
+rodu team admit                 # machines asking to join
+rodu team admit bob <code>      # the code bob's machine printed
+rodu team members               # who is on the team
+rodu team remove bob --yes      # refuse what bob's machines write from now on
+```
+
+On an encrypted signed team, `team remove` also changes the team key. What each machine writes
+once it has the new key is closed to the removed machine. What the folder held before stays
+readable to it, and so does what a machine writes before it next syncs. A team made without `--signed` cannot be switched to it
+later. `rodu team admin` lets another person admit machines, and `rodu team transfer-owner`
+hands the team over.
 
 ## Use it from an agent (MCP)
 
