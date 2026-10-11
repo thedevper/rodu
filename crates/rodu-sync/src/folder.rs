@@ -1931,22 +1931,15 @@ impl TeamFolder {
         // leaves a key nobody holds, and the next sync finishes publishing it.
         store.set_local_note(NOTE_MADE_KEY, &format!("{generation}.{check}"))?;
         self.keep_keys(&[Held { generation, check: check.clone(), key: new }])?;
-        // The record is sealed with the new key, out of reach of a machine just removed; if it
-        // does not go out, this process goes back to the key it sealed with, and the next push
-        // or pull finishes publishing it.
-        let before = self.seal_key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // The record is sealed with the new key, out of reach of a machine just removed. If it
+        // does not go out, the new key stays the one this process seals with: what it seals then
+        // waits for the team rather than reaching the removed machine, and the next push (which
+        // refuses until then) or pull finishes publishing it.
         self.set_seal_key(Some((generation, check.clone())));
         let record = Record::team_key(self.team_id(&info), key, generation, &check);
-        let published = self
-            .write_authority(store, &info, &record)
-            .and_then(|()| self.share_keys(store, &info))
-            .and_then(|()| {
-                store.set_local_note(NOTE_PUBLISHED_KEY, &format!("{generation}.{check}"))
-            });
-        if let Err(e) = published {
-            self.set_seal_key(before);
-            return Err(e);
-        }
+        self.write_authority(store, &info, &record)?;
+        self.share_keys(store, &info)?;
+        store.set_local_note(NOTE_PUBLISHED_KEY, &format!("{generation}.{check}"))?;
         Ok(generation)
     }
 
@@ -1992,6 +1985,9 @@ impl TeamFolder {
             )));
         }
         if made_here {
+            // Never the older key meanwhile, even in a process that settled on it long ago: a
+            // machine just removed may hold it.
+            self.set_seal_key(Some(named.clone()));
             // Wrapped first: a teammate holding the wrap takes the key the moment its record
             // lands.
             self.share_keys(store, info)?;
@@ -2004,7 +2000,6 @@ impl TeamFolder {
                 self.write_authority(store, info, &record)?;
             }
             store.set_local_note(NOTE_PUBLISHED_KEY, &pair)?;
-            self.set_seal_key(Some(named));
             return Ok(());
         }
         let usable = held
