@@ -4,7 +4,7 @@ members = ["crates/*", "xtask"]
 default-members = ["crates/rodu-core", "crates/rodu-store", "crates/rodu-sync", "crates/rodu-api", "crates/rodu-mcp", "crates/rodu-http", "crates/rodu"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
