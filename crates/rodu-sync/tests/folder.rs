@@ -2714,18 +2714,30 @@ fn an_invite_admits_one_machine_only() {
 }
 
 #[test]
-fn two_machines_with_one_invite_in_the_same_pull_get_one_admission() {
+fn an_invite_two_machines_joined_with_in_the_same_pull_admits_neither() {
     let root = tempfile::tempdir().unwrap();
     let ann_folder = inviting_at(root.path());
     let a = first(&ann_folder);
     let secret = ann_folder.invite(a.store(), "bob", 7).unwrap();
+    let _cat = ann_folder.invite(a.store(), "cat", 7).unwrap();
     let b1 = join_invited(&signed_at(root.path(), &key_hex()), "bob", &secret);
-    let b2 = join_invited(&signed_at(root.path(), &key_hex()), "bob", &secret);
+    // The second machine is not on the board yet as bob: it only syncs and asks.
+    let dir = tempfile::tempdir().unwrap();
+    let b2 = LoroStore::open(dir.path()).unwrap();
+    let b2_folder = signed_at(root.path(), &key_hex());
+    b2_folder.pull(&b2, &checker()).unwrap();
+    b2_folder.write_invited_request(b2.peer(), "bob", Some(&secret)).unwrap();
     let report = a.sync(&ann_folder);
-    assert_eq!(report.invited.len(), 1, "{report:?}");
-    assert_eq!(report.awaiting.len(), 1, "{report:?}");
-    assert_eq!(ann_folder.admissions(a.store()).unwrap().len(), 1);
-    drop((b1, b2));
+    assert!(report.invited.is_empty(), "{report:?}");
+    let note = report.batch.notes.iter().find(|n| n.contains("more than one machine joined"));
+    assert!(note.is_some_and(|n| n.contains("invite for bob")), "{report:?}");
+    assert!(ann_folder.admissions(a.store()).unwrap().is_empty());
+    // bob's invite is used up; cat's is untouched.
+    let pending = ann_folder.pending_invites().unwrap();
+    assert_eq!(pending.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["cat"]);
+    // Next time, neither comes in on its own either.
+    assert!(a.sync(&ann_folder).invited.is_empty());
+    drop(b1);
 }
 
 #[test]
@@ -2735,8 +2747,8 @@ fn a_wrong_expired_or_revoked_invite_leaves_the_request_waiting_for_admit() {
     let a = first(&ann_folder);
     let bob = ann_folder.invite(a.store(), "bob", 7).unwrap();
     let cat = ann_folder.invite(a.store(), "cat", 7).unwrap();
-    assert!(ann_folder.revoke_invite("cat").unwrap());
-    assert!(!ann_folder.revoke_invite("cat").unwrap(), "nothing left to revoke");
+    assert!(ann_folder.revoke_invite(a.store(), "cat").unwrap());
+    assert!(!ann_folder.revoke_invite(a.store(), "cat").unwrap(), "nothing left to revoke");
     // A secret no invite holds, bob's secret under another name, and a revoked invite.
     let guessed = [7u8; sign::JOIN_SECRET_LEN];
     let w1 = join_invited(&signed_at(root.path(), &key_hex()), "dan", &guessed);
@@ -2775,6 +2787,12 @@ fn an_expired_invite_admits_no_one() {
     let line = format!("{}.{}.bob\n", past + 3600, hex::encode(secret));
     std::fs::write(root.path().join("ann-invites"), line).unwrap();
     assert_eq!(a.sync(&ann_folder).invited.len(), 1);
+    // An expired invite's secret is dropped with the next change.
+    let line = format!("{past}.{}.dan\n", hex::encode(secret));
+    std::fs::write(root.path().join("ann-invites"), line).unwrap();
+    ann_folder.invite(a.store(), "eve", 7).unwrap();
+    let kept = std::fs::read_to_string(root.path().join("ann-invites")).unwrap();
+    assert!(!kept.contains(&hex::encode(secret)) && kept.ends_with(".eve\n"), "{kept}");
 }
 
 #[test]
@@ -2863,4 +2881,57 @@ fn the_invites_file_is_private() {
     let bytes = folder_bytes(&ann_folder);
     let hexed = hex::encode(*secret);
     assert!(!bytes.windows(hexed.len()).any(|w| w == hexed.as_bytes()));
+}
+
+#[test]
+fn an_invite_used_up_by_one_process_is_never_written_back_by_another() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_folder = inviting_at(root.path());
+    let a = first(&ann_folder);
+    for round in 0..12 {
+        let name = format!("bob{round}");
+        let secret = ann_folder.invite(a.store(), &name, 7).unwrap();
+        let b = join_invited(&signed_at(root.path(), &key_hex()), &name, &secret);
+        // A second process on ann's workspace invites someone else while the first pulls.
+        let other = LoroStore::open(a.dir.path()).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let pulling = LoroStore::open(a.dir.path()).unwrap();
+                barrier.wait();
+                ann_folder.pull(&pulling, &checker()).unwrap();
+            });
+            barrier.wait();
+            ann_folder.invite(&other, &format!("cat{round}"), 7).unwrap();
+        });
+        let now = LoroStore::open(a.dir.path()).unwrap();
+        let admitted = ann_folder.admissions(&now).unwrap().contains_key(&b.store().peer());
+        let pending = ann_folder.pending_invites().unwrap();
+        assert!(admitted, "round {round}");
+        assert!(!pending.iter().any(|p| p.name == name), "round {round}: {name}'s came back");
+    }
+}
+
+#[test]
+fn an_admin_demoted_in_the_same_pull_admits_no_one_and_its_invites_end() {
+    let root = tempfile::tempdir().unwrap();
+    let (ann_folder, a, bob_key, _, b) = ann_and_bob(root.path());
+    let bob_folder = signed_at(root.path(), &bob_key).invites(root.path().join("bob-invites"));
+    ann_folder.set_admin(a.store(), &public(&bob_key), true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    let secret = bob_folder.invite(b.store(), "cat", 7).unwrap();
+    let c = join_invited(&signed_at(root.path(), &key_hex()), "cat", &secret);
+    // ann takes bob's admin away; bob's next pull brings that in along with cat's request.
+    // (Without the authority files, it comes only in ann's update, read in that same pull.)
+    ann_folder.set_admin(a.store(), &public(&bob_key), false).unwrap();
+    a.sync(&ann_folder);
+    let report = unheard(root.path(), || b.sync(&bob_folder));
+    assert!(report.invited.is_empty(), "{report:?}");
+    assert!(!ann_folder.admissions(a.store()).unwrap().contains_key(&c.store().peer()));
+    assert!(bob_folder.pending_invites().unwrap().is_empty(), "bob's invites ended");
+    // Made an admin again, bob's old invite does not come back.
+    ann_folder.set_admin(a.store(), &public(&bob_key), true).unwrap();
+    a.sync(&ann_folder);
+    assert!(b.sync(&bob_folder).invited.is_empty());
 }

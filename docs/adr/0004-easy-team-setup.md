@@ -219,37 +219,52 @@ Each step ships alone.
 - **Where it is kept.** The machine that made the invite keeps it in `.rodu/invites`, a private
   file (mode 0600 on Unix) with one `<expires>.<secret>.<name>` line per invite. The secret is in
   no team file. Only that machine admits with it: an admin's invite is not known to the owner's
-  machine.
+  machine. Every change to the file (inviting, cancelling, using an invite up) runs under the
+  workspace's write lock, the SQLite write transaction every process on the workspace takes, and
+  reads the file inside it. So `rodu web` pulling while a CLI command invites or cancels never
+  writes back an invite the other used up or cancelled. Expired invites are dropped with the next
+  change.
 - **The proof.** `join` with a personal invite asks under the invite's name, and refuses another
   `--name` or `--as` before writing anything. Its request carries a proof, HMAC-SHA256 under the
   join secret over a domain string (`rodu-join-1`), the workspace id, the peer id, the machine's
   public key and the name, each with its length where it varies. The request is signed and, on an
   encrypted team, sealed, as before. A request with no proof is read as before, and older versions
   ignore the proof.
-- **Admitting.** Each pull on the machine holding invites, once its keys are settled and before it
-  reads the other machines' files, looks at every request with a proof from a machine not yet
-  admitted or removed. It admits one when the name matches a held invite, the invite has not
-  expired, and the proof checks in constant time. The invite is removed from the file before the
-  admission is written, so a crash in between uses the invite up rather than leaving it to admit a
-  second machine. The admitted machine's files land in that same pull. The CLI says so as `note:
+- **Admitting.** Each pull on the machine holding invites, after its first pass over the folder
+  (so a demotion or removal on its way counts), looks at every request with a proof from a machine
+  not yet admitted or removed. A request holds an invite when the name matches, the invite has not
+  expired, and the proof checks in constant time. Under the write lock, each invite held by exactly
+  one request is used up and that machine is admitted. An invite held by two machines or more was
+  shared or leaked: it is used up, none of them is admitted, and the pull says so, leaving the
+  owner to check each with its person and `rodu team admit` the right one. The invite is removed
+  from the file before the admission is written, so a crash in between uses the invite up rather
+  than leaving it to admit a second machine. One failed admission does not stop the others. The
+  admitted machine's files land in the second pass of that same pull. The CLI says so as `note:
   sync: admitted bob's machine …`; `rodu web` and `rodu mcp` write it with their other sync lines.
-  A machine that may no longer admit (an admin who was revoked) admits no one through its invites.
+  A machine that may no longer admit (an admin who was revoked, or an owner who handed the team
+  on) admits no one, and empties its invites file, so they do not come back if it is made an admin
+  again.
 - **Listing and cancelling.** `rodu team invites` lists the invites not used yet, with the UTC day
   each ends, and shows expired ones as expired. `rodu team invite --revoke <name>` cancels one.
-  Expired invites stay listed until cancelled or replaced.
+  Expired invites stay listed, as expired, until the next change to the file.
 - **Fallback.** A request whose proof does not check (a wrong secret, another name, an expired or
   cancelled invite, a proof made for another workspace) waits for `rodu team admit`, as before.
 - **Tests.** `rodu-sync` covers admission in the owner's pull with the files landing at once, an
   admin's own invite, one admission per invite (also with two machines in the same pull), and
   refusal for a wrong secret, another name, a revoked, expired or replaced invite, and a proof for
   another workspace. It also checks that only the owner or an admin invites, the name and days
-  checks, and the private mode of the invites file. `tests/team.rs` covers the CLI on an encrypted
+  checks, the private mode of the invites file, an invite two machines join with in one pull, an
+  admin demoted in the same pull that would admit, and two processes on one workspace inviting
+  and pulling at once. `tests/team.rs` covers the CLI on an encrypted
   team end to end, the name check at join, revoking, and who may invite. Each check was confirmed
   by removing it and watching a test fail.
 - **Known limits.**
   - The invite holds the join secret next to the team key, so anyone who sees it before the
     teammate uses it can join in their place. Single use, the expiry and `rodu team members` bound
     this, as the decision says.
+  - On Windows, `.rodu/invites` gets the folder's inherited permissions, as `team.key` and
+    `team-keys` do: keep the workspace in your own user folder.
+  - The SHA-256 state inside the MAC is not wiped after use; the key block and pads are.
   - Admission happens when the inviting machine pulls. If that machine is off, the teammate waits.
     The request also waits in the folder, so the owner or an admin can admit it by hand with
     `rodu team admit`.

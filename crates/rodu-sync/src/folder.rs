@@ -32,6 +32,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use rodu_core::store::{Store, TxMode};
 use rodu_core::{Result, RoduError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -377,6 +378,10 @@ struct HeldInvite {
     secret: Zeroizing<[u8; sign::JOIN_SECRET_LEN]>,
     expires: u64,
 }
+
+/// The machines a pull admitted through invites, as (name, peer), and the first admission that
+/// failed.
+type Invited = (Vec<(String, u64)>, Option<RoduError>);
 
 /// The most pending invites kept.
 const MAX_INVITES: usize = 256;
@@ -1004,22 +1009,46 @@ impl TeamFolder {
         if !(1..=90).contains(&days) {
             return Err(RoduError::invalid("An invite lasts from 1 to 90 days"));
         }
-        let mut held = self.read_invites()?;
-        held.retain(|h| h.name != name);
-        if held.len() >= MAX_INVITES {
-            return Err(RoduError::invalid("Too many invites wait to be used")
-                .with_hint("Cancel some: rodu team invite --revoke <name>"));
-        }
         let mut secret = Zeroizing::new([0u8; sign::JOIN_SECRET_LEN]);
         getrandom::fill(secret.as_mut())
             .map_err(|e| RoduError::internal(format!("no randomness for the invite: {e}")))?;
-        held.push(HeldInvite {
-            name: name.to_owned(),
-            secret: secret.clone(),
-            expires: unix_now().saturating_add(days * 24 * 60 * 60),
-        });
-        self.write_invites(&held)?;
+        self.change_invites(store, |held| {
+            held.retain(|h| h.name != name);
+            if held.len() >= MAX_INVITES {
+                return Err(RoduError::invalid("Too many invites wait to be used")
+                    .with_hint("Cancel some: rodu team invite --revoke <name>"));
+            }
+            held.push(HeldInvite {
+                name: name.to_owned(),
+                secret: secret.clone(),
+                expires: unix_now().saturating_add(days * 24 * 60 * 60),
+            });
+            Ok(((), true))
+        })?;
         Ok(secret)
+    }
+
+    /// Reads the invites file, lets `change` change what it holds, and writes it back when
+    /// `change` says it changed something. It runs under the workspace's write lock, which every
+    /// process on this workspace takes, so that an invite another process used up at the same
+    /// moment is never written back.
+    fn change_invites<T>(
+        &self,
+        store: &LoroStore,
+        change: impl FnOnce(&mut Vec<HeldInvite>) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        store.transaction(TxMode::Write, || {
+            let mut held = self.read_invites()?;
+            // An expired invite admits no one: its secret goes with the next change.
+            let now = unix_now();
+            let before = held.len();
+            held.retain(|h| now < h.expires);
+            let (value, changed) = change(&mut held)?;
+            if changed || held.len() != before {
+                self.write_invites(&held)?;
+            }
+            Ok(value)
+        })
     }
 
     /// The personal invites this machine made that were not used yet, expired ones included.
@@ -1034,60 +1063,101 @@ impl TeamFolder {
     }
 
     /// Cancels the personal invite for `name`; whether there was one.
-    pub fn revoke_invite(&self, name: &str) -> Result<bool> {
-        let mut held = self.read_invites()?;
-        let before = held.len();
-        held.retain(|h| h.name != name);
-        if held.len() == before {
-            return Ok(false);
-        }
-        self.write_invites(&held)?;
-        Ok(true)
+    pub fn revoke_invite(&self, store: &LoroStore, name: &str) -> Result<bool> {
+        self.change_invites(store, |held| {
+            let before = held.len();
+            held.retain(|h| h.name != name);
+            let found = held.len() != before;
+            Ok((found, found))
+        })
     }
 
     /// Owner's or admin's machine: admits each machine asking to join whose request carries a
     /// proof of a personal invite this machine holds, for the name it asks under, before the
-    /// invite expires. The invite is used up first, so it admits one machine at most.
-    fn admit_invited(&self, store: &LoroStore, info: &TeamInfo) -> Result<Vec<(String, u64)>> {
-        let Some((key, _)) = &self.signing else { return Ok(Vec::new()) };
-        if self.invites.is_none() {
-            return Ok(Vec::new());
+    /// invite expires. The invite is used up first, under the workspace's write lock, so it admits
+    /// one machine at most even with several processes pulling at once. Returns the machines
+    /// admitted, and the first admission that failed, whose invite is used up all the same.
+    fn admit_invited(&self, store: &LoroStore, info: &TeamInfo) -> Result<Invited> {
+        let Some((key, _)) = &self.signing else { return Ok((Vec::new(), None)) };
+        if self.invites.is_none() || self.read_invites()?.is_empty() {
+            return Ok((Vec::new(), None));
         }
-        let mut held = self.read_invites()?;
-        if held.is_empty() || !self.authority_of(store, info)?.may_admit(&key.public()) {
-            return Ok(Vec::new());
+        if !self.authority_of(store, info)?.may_admit(&key.public()) {
+            // No longer an owner or admin: its invites end with that, rather than coming back
+            // if it is made an admin again.
+            self.change_invites(store, |held| {
+                held.clear();
+                Ok(((), true))
+            })?;
+            return Ok((Vec::new(), None));
         }
-        let now = unix_now();
         let trusted = self.trusted(store, info)?;
         let team = self.team_id(info);
-        let mut admitted = Vec::new();
-        for request in self.requests()? {
-            let Some(proof) = &request.proof else { continue };
-            if trusted.admitted.contains_key(&request.peer)
-                || trusted.cut.contains_key(&request.peer)
-            {
-                continue;
-            }
-            let Some(at) = held.iter().position(|h| {
-                h.name == request.name
-                    && now < h.expires
-                    && sign::check_join_proof(
-                        &h.secret,
-                        team,
-                        request.peer,
-                        &request.key,
-                        &request.name,
-                        proof,
-                    )
-            }) else {
-                continue;
-            };
-            held.remove(at);
-            self.write_invites(&held)?;
-            self.admit(store, &request)?;
-            admitted.push((request.name, request.peer));
+        let asking: Vec<JoinRequest> = self
+            .requests()?
+            .into_iter()
+            .filter(|r| {
+                r.proof.is_some()
+                    && !trusted.admitted.contains_key(&r.peer)
+                    && !trusted.cut.contains_key(&r.peer)
+            })
+            .collect();
+        if asking.is_empty() {
+            return Ok((Vec::new(), None));
         }
-        Ok(admitted)
+        let now = unix_now();
+        let (claimed, doubled) = self.change_invites(store, |held| {
+            // The requests each invite's proof holds for.
+            let mut holding: Vec<Vec<JoinRequest>> = held.iter().map(|_| Vec::new()).collect();
+            for request in asking {
+                let Some(proof) = &request.proof else { continue };
+                let at = held.iter().position(|h| {
+                    h.name == request.name
+                        && now < h.expires
+                        && sign::check_join_proof(
+                            &h.secret,
+                            team,
+                            request.peer,
+                            &request.key,
+                            &request.name,
+                            proof,
+                        )
+                });
+                if let Some(at) = at {
+                    holding[at].push(request);
+                }
+            }
+            // Each invite that holds is used up. One held by two machines or more was shared or
+            // leaked: none of them is admitted, and the owner picks with `admit`.
+            let mut claimed = Vec::new();
+            let mut doubled = Vec::new();
+            let mut kept = Vec::new();
+            for (invite, mut requests) in held.drain(..).zip(holding) {
+                match requests.len() {
+                    0 => kept.push(invite),
+                    1 => claimed.extend(requests.pop()),
+                    _ => doubled.push(invite.name.clone()),
+                }
+            }
+            let changed = !claimed.is_empty() || !doubled.is_empty();
+            *held = kept;
+            Ok(((claimed, doubled), changed))
+        })?;
+        let mut admitted = Vec::new();
+        let mut failed = doubled.into_iter().next().map(|name| {
+            RoduError::invalid(format!(
+                "more than one machine joined with the invite for {name}, so none was let in"
+            ))
+        });
+        for request in claimed {
+            match self.admit(store, &request) {
+                Ok(()) => admitted.push((request.name, request.peer)),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        Ok((admitted, failed))
     }
 
     /// The invites in the invites file that read: a line that does not is skipped.
@@ -1123,7 +1193,10 @@ impl TeamFolder {
         for invite in held {
             text.push_str(&invite.expires.to_string());
             text.push('.');
-            text.push_str(&hex::encode(invite.secret.as_ref()));
+            for byte in invite.secret.iter() {
+                // Writing into a String cannot fail.
+                let _ = std::fmt::Write::write_fmt(&mut *text, format_args!("{byte:02x}"));
+            }
             text.push('.');
             text.push_str(&invite.name);
             text.push('\n');
@@ -1141,10 +1214,11 @@ impl TeamFolder {
         self.take_keys(store, &info)?;
         // Before anything is sealed: what it writes opens for the team.
         let settled = self.settle_seal_key(store, &info);
-        // Before the files are read: those of a machine admitted now land in this pull.
-        let invited = self.admit_invited(store, &info);
         let trusted = self.trusted(store, &info)?;
         let first = self.pull_once(store, checker, &info, &trusted)?;
+        // Once the authority the folder holds is in, so that a demotion or removal on its way
+        // counts; the files of a machine admitted now are read in the pass below.
+        let invited = self.admit_invited(store, &info);
         let now = self.trusted(store, &info)?;
         let mut report = if now == trusted {
             first
@@ -1152,7 +1226,16 @@ impl TeamFolder {
             first.then(self.pull_once(store, checker, &info, &now)?)
         };
         match invited {
-            Ok(invited) => report.invited = invited,
+            Ok((invited, failed)) => {
+                report.invited = invited;
+                if let Some(e) = failed {
+                    report.batch.notes.push(format!(
+                        "admitting a machine through its invite: {}; the invite is used up, so \
+                         check the machine with its person and run rodu team admit",
+                        e.message
+                    ));
+                }
+            }
             Err(e) => report.batch.notes.push(format!(
                 "admitting a machine through its invite: {}; tried again next time",
                 e.message
