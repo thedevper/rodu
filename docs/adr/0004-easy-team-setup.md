@@ -1,6 +1,6 @@
 # ADR 0004: Team setup in as few steps as possible
 
-- Status: accepted 2026-10-11; steps 1, 2 and 3a built 2026-10-11
+- Status: accepted 2026-10-11; steps 1, 2, 3a and 3b part 1 built 2026-10-11
 
 ## Context
 
@@ -152,7 +152,8 @@ Each step ships alone.
    - **3b. Before there is a team.** "Share with a team" in a plain workspace, picking a Google
      Drive from the list, and joining by pasting an invite from `rodu web` started where there is
      no workspace yet. Both change what the running server serves (a plain store becomes a team
-     store, with live sync), so they come after 3a.
+     store, with live sync), so they come after 3a. They ship as two parts: sharing a plain board
+     (part 1), then joining from `rodu web` with no workspace (part 2).
 
 ### Step 1 as built
 
@@ -332,6 +333,55 @@ Each step ships alone.
     `rodu team remove <name> --machine <id>`.
   - Admin roles and handing the team on stay in the CLI.
   - `rodu web` still prints an admission through an invite as a `warning: sync:` line.
+
+### Step 3b part 1 as built
+
+- **Routes.** In a plain workspace, `GET /api/team/places` lists this machine's Google Drive
+  folders, as `rodu team create` finds them, and `POST /api/team/share {path}` shares the board
+  in one of them. Both sit behind the same token, Host check and body limits as the rest of the
+  API, with unknown fields refused. In a team workspace they answer 409. The board does not offer
+  `--no-encrypt`, `--unsigned` or a folder of another app: those stay in the CLI.
+- **One code path.** The share runs `rodu team create --folder <place>/Rodu/<collection key>
+  --yes` under the server's one service lock, with the folder and environment `rodu web` started
+  with, so every check of the CLI applies, including carrying on a create that stopped half way.
+  The place must be one of the Google Drive folders found at the moment of the share, so a list
+  that changed since the page showed it is refused rather than misread, and the folder is the one
+  `--drive` would pick. `--yes` because the board shares the workspace it shows. Nothing the
+  create prints is kept, neither on the page nor in the terminal: it holds the invite code, and
+  people are invited one by one from the Team panel.
+- **Reopening.** A plain workspace keeps its board in SQLite and a team's in a Loro document, so
+  the server cannot keep serving the store it opened. A share changed the workspace when it went
+  through, or when it made the team document before stopping: that is read from the disk, not
+  from the result. A document left from an earlier create is already what the server holds, so a
+  share that fails again changes nothing. When the workspace changed, every API call answers 503
+  (`reopening`) from then on, including one that waited behind the share, and `rodu web` closes
+  the server and starts it again for the workspace as it is now, on the same port with the same
+  token. A share that changed nothing keeps the server as it was. Ctrl+C pressed while the board
+  reopens still stops it.
+- **The page.** After a share that went through, it waits for the board to come back and reloads
+  on the same link. After one that stopped half way, the board reopens but the page does not
+  reload: it keeps the reason on screen with a Reload button, since sharing again carries on
+  from where it stopped. A board that does not come back within a minute is said so, pointing to
+  the terminal.
+- **Output.** `rodu` no longer stops when its standard output goes away (`rodu web | head`):
+  printing errors are ignored, since the board prints again when it reopens.
+- **Tests.**
+  - `rodu-http`, with a stand-in: the share answers, then the API answers 503 and the reopen is
+    asked for; a request waiting behind the share gets 503; a share that stopped half way also
+    reopens; one that changed nothing keeps serving; the token, method and body checks; 409 on a
+    team board; 404 with no sharing.
+  - `tests/team.rs`, through a real `rodu web` with a stand-in Google Drive home: a plain board
+    with a card shares itself, the answer holds no invite code, and the same link and token reach
+    a team board that still has the card and invites from the board; no invite code is printed to
+    the terminal either. A share that stops half way (a file where the team's folder goes) reopens
+    the board; sharing again before the fix changes nothing and does not reopen; after the fix, a
+    share carries on.
+  - The built board was driven in headless Chrome against a stand-in home with two accounts: the
+    places with the shared drive first, sharing into it, the reload into the team panel, the card
+    still there, no CSP violations and no page errors besides the expected 404 of a plain board.
+    A second run with a share that stops half way checks the reason stays on screen with Reload.
+- **Known limits.** The board offers Google Drive only; other folder apps use `rodu team create
+  --folder`. A server taken by a test through `on_web_server` is not reopened.
 
 ## What this does not do
 

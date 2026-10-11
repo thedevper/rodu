@@ -7,14 +7,14 @@ use std::process::Command;
 use std::time::Duration;
 
 use rodu_api::{
-    AskingView, InviteCreated, InviteView, MachineView, PersonView, TeamDone, TeamView,
+    AskingView, InviteCreated, InviteView, MachineView, PersonView, PlaceView, TeamDone, TeamView,
 };
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{
     Actor, ErrorCode, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService,
 };
-use rodu_http::TeamPanel;
+use rodu_http::{Sharing, TeamPanel};
 use rodu_sync::folder::{Admitted, JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::seal::TeamKey;
 use rodu_sync::sign::{self, MachineKey, PublicKey};
@@ -438,6 +438,93 @@ pub(crate) fn panel(ws: &Workspace) -> Option<std::sync::Arc<dyn TeamPanel<AnySt
     let team = ws.config.team.clone()?;
     ws.service.store.team()?;
     Some(std::sync::Arc::new(FolderPanel { dir: ws.dir.clone(), team }))
+}
+
+/// Shares a plain board from `rodu web` (ADR 0004, step 3b), with the folder and environment
+/// `rodu web` was started with.
+pub(crate) struct Sharer {
+    cwd: PathBuf,
+    env: std::collections::HashMap<String, String>,
+    dir: PathBuf,
+    collection: String,
+}
+
+/// Sharing for a plain workspace; `None` for one that already syncs with a team.
+pub(crate) fn sharing(
+    io: &Io<'_>,
+    ws: &Workspace,
+) -> Option<std::sync::Arc<dyn Sharing<AnyStore>>> {
+    if ws.config.team.is_some() {
+        return None;
+    }
+    Some(std::sync::Arc::new(Sharer {
+        cwd: io.cwd.clone(),
+        env: io.env.clone(),
+        dir: ws.dir.clone(),
+        collection: ws.config.collection.clone(),
+    }))
+}
+
+impl Sharing<AnyStore> for Sharer {
+    fn places(&self) -> Result<Vec<PlaceView>> {
+        let found = drive::locations(&self.env);
+        Ok(found
+            .into_iter()
+            .map(|l| PlaceView {
+                label: l.label,
+                path: l.path.display().to_string(),
+                shared: l.shared,
+            })
+            .collect())
+    }
+
+    /// Runs `rodu team create --folder <place>/Rodu/<collection key> --yes`, the folder `rodu team
+    /// create --drive` picks, once `path` is found among the places on this machine now: the list
+    /// may have changed since the board showed it. `--yes` because the board shares the workspace
+    /// it shows, whichever folder `rodu web` started in.
+    fn share(&self, _service: &RoduService<AnyStore>, path: &str) -> (Result<TeamDone>, bool) {
+        let found = drive::locations(&self.env);
+        let Some(place) = found.iter().find(|l| l.path.display().to_string() == path) else {
+            let refused = RoduError::invalid("That Google Drive folder is not on this machine now")
+                .with_hint("Choose again from the list");
+            return (Err(refused), false);
+        };
+        let folder = place.path.join("Rodu").join(&self.collection);
+        // Nothing create prints goes anywhere: it holds the invite code, which stays out of the
+        // page (each person gets their own invite from the Team panel).
+        let mut out = |_: &str| {};
+        let mut err = |_: &str| {};
+        let mut io = Io {
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            out: &mut out,
+            err: &mut err,
+            open_url: None,
+            on_web_server: None,
+        };
+        let mut args = Args::default();
+        args.values.insert("folder".to_owned(), folder.display().to_string());
+        args.flags.push("yes".to_owned());
+        let document = self.dir.join("rodu.loro");
+        let existed = document.exists();
+        let made = create(&mut io, &args);
+        drop(io);
+        // The store the server holds stops being the workspace's when create made the team
+        // document, which a create that stopped half way may have done too: read from the disk,
+        // not from the result. A document left from before is already what the server holds; only
+        // a create that went through changes the workspace then.
+        let changed = made.is_ok() || (!existed && document.exists());
+        let next = if place.shared {
+            "Everyone in that shared drive sees it: invite each person from the Team panel"
+        } else {
+            "Share that folder with your team in Google Drive, then invite each person from the \
+             Team panel"
+        };
+        let done = made.map(|()| TeamDone {
+            message: format!("This board now syncs through {}. {next}", folder.display()),
+        });
+        (done, changed)
+    }
 }
 
 impl FolderPanel {

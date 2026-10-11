@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -18,8 +18,8 @@ use axum::response::Response;
 use rodu_api::{
     AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
     InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, NewCollectionRequest,
-    PatchRequest, PrincipalView, RemoveRequest, RevisionView, RevokeRequest, StateView, TeamDone,
-    TeamView, TransitionRequest,
+    PatchRequest, PlaceView, PrincipalView, RemoveRequest, RevisionView, RevokeRequest,
+    ShareRequest, StateView, TeamDone, TeamView, TransitionRequest,
 };
 use rodu_core::query::parse_query;
 use rodu_core::service::Placement;
@@ -31,7 +31,7 @@ use rodu_store::compile::{CompileContext, to_sql};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -69,6 +69,19 @@ pub struct WebServerOptions<S: Store> {
     pub token: Option<String>,
     /// The team panel, for a workspace that syncs with a team.
     pub team: Option<Arc<dyn TeamPanel<S>>>,
+    /// Sharing a plain board with a team, for a workspace that does not sync with one yet.
+    pub sharing: Option<Arc<dyn Sharing<S>>>,
+}
+
+/// How the board shares a plain workspace with a team (ADR 0004, step 3b). The CLI's crate
+/// implements it with the code of `rodu team create`, under the server's one service lock.
+pub trait Sharing<S: Store>: Send + Sync {
+    /// The places on this machine the board can be shared from.
+    fn places(&self) -> rodu_core::Result<Vec<PlaceView>>;
+    /// Shares the board with its files in `path`. The flag says whether the workspace changed,
+    /// even when the share failed part way: the server then stops serving the store it holds,
+    /// which is no longer the workspace's, and asks to be reopened.
+    fn share(&self, service: &RoduService<S>, path: &str) -> (rodu_core::Result<TeamDone>, bool);
 }
 
 /// What the board's Team panel can see and do (ADR 0004, step 3a). The CLI's crate implements it
@@ -103,9 +116,17 @@ pub struct RunningServer {
     pub token: String,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<std::io::Result<()>>,
+    reopen: Arc<Notify>,
 }
 
 impl RunningServer {
+    /// Resolves once the workspace changed under the server, as a share does: the caller closes
+    /// this server and starts one for the workspace as it is now.
+    pub fn reopen_wanted(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let reopen = Arc::clone(&self.reopen);
+        async move { reopen.notified().await }
+    }
+
     /// Stops accepting connections and lets in-flight requests finish, for up to five seconds;
     /// a client that stalls longer is cut off so Ctrl+C always exits.
     pub async fn close(self) -> std::io::Result<()> {
@@ -157,6 +178,11 @@ struct App<S: Store> {
     files: Option<HashMap<String, Bytes>>,
     live: Option<Live<S>>,
     team: Option<Arc<dyn TeamPanel<S>>>,
+    sharing: Option<Arc<dyn Sharing<S>>>,
+    /// Set once the workspace changed under the server: the store it holds is no longer the
+    /// workspace's, so every API call is refused until the server is reopened.
+    reopening: AtomicBool,
+    reopen: Arc<Notify>,
     /// Raised by every pull that took something in and every write, so the board can ask
     /// cheaply whether to reload.
     revision: AtomicU64,
@@ -177,6 +203,7 @@ where
     let listener =
         tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], options.port))).await?;
     let port = listener.local_addr()?.port();
+    let reopen = Arc::new(Notify::new());
     let app = Arc::new(App {
         service: Mutex::new(options.service),
         actor: options.actor,
@@ -186,6 +213,9 @@ where
         files: options.files,
         live: options.live.as_ref().map(|live| Live::new(Arc::clone(&live.sync))),
         team: options.team,
+        sharing: options.sharing,
+        reopening: AtomicBool::new(false),
+        reopen: Arc::clone(&reopen),
         revision: AtomicU64::new(0),
     });
     // The live sync timer runs in the server's own task, so it stops with the server.
@@ -204,7 +234,8 @@ where
             },
         }
     });
-    Ok(RunningServer { url: format!("http://127.0.0.1:{port}/"), port, token, shutdown, task })
+    let url = format!("http://127.0.0.1:{port}/");
+    Ok(RunningServer { url, port, token, shutdown, task, reopen })
 }
 
 /// Pulls and pushes every `every` while the server runs, under the service lock like a request.
@@ -309,6 +340,8 @@ enum Endpoint {
     TeamRevoke,
     TeamAdmit,
     TeamRemove,
+    TeamPlaces,
+    TeamShare,
 }
 
 fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
@@ -328,6 +361,8 @@ fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
         "/api/team/invites/revoke" => return Some((Endpoint::TeamRevoke, None, POST)),
         "/api/team/admit" => return Some((Endpoint::TeamAdmit, None, POST)),
         "/api/team/remove" => return Some((Endpoint::TeamRemove, None, POST)),
+        "/api/team/places" => return Some((Endpoint::TeamPlaces, None, GET)),
+        "/api/team/share" => return Some((Endpoint::TeamShare, None, POST)),
         _ => {}
     }
     let rest = path.strip_prefix("/api/items/")?;
@@ -389,6 +424,10 @@ where
             .service
             .lock()
             .map_err(|_| Failure::Domain(RoduError::internal("service lock poisoned")))?;
+        // Checked under the lock, so a request that waited behind a share sees what it did.
+        if app.reopening.load(Ordering::SeqCst) {
+            return Err(reopening());
+        }
         let ctx = Ctx { service: &service, actor: &app.actor };
         let key = key.as_deref().unwrap_or_default();
         let body = body.unwrap_or(serde_json::Value::Null);
@@ -473,6 +512,30 @@ where
                 let revision = app.revision.load(Ordering::SeqCst).wrapping_add(others);
                 ok(StatusCode::OK, &RevisionView { revision })
             }
+            Endpoint::TeamPlaces | Endpoint::TeamShare => {
+                if app.team.is_some() {
+                    return Err(Failure::Domain(RoduError::conflict(
+                        "This board already syncs with a team",
+                    )));
+                }
+                let Some(sharing) = &app.sharing else {
+                    return Err(Failure::Domain(
+                        RoduError::not_found("This board cannot be shared from here")
+                            .with_hint("Share it with: rodu team create"),
+                    ));
+                };
+                if endpoint == Endpoint::TeamPlaces {
+                    ok(StatusCode::OK, &sharing.places()?)
+                } else {
+                    let input: ShareRequest = parse_body(body)?;
+                    let (done, changed) = sharing.share(&service, &input.path);
+                    if changed {
+                        app.reopening.store(true, Ordering::SeqCst);
+                        app.reopen.notify_one();
+                    }
+                    answer_with(done)
+                }
+            }
             Endpoint::Team
             | Endpoint::TeamInvite
             | Endpoint::TeamRevoke
@@ -527,6 +590,14 @@ where
     })
     .await
     .map_err(|e| Failure::Domain(RoduError::internal(format!("request task failed: {e}"))))?
+}
+
+fn reopening() -> Failure {
+    http(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "reopening",
+        "The board is reopening: try again in a moment",
+    )
 }
 
 /// A team change's result as the answer to send.
