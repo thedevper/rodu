@@ -12,8 +12,8 @@ One self-contained `rodu` binary (SQLite and the web board are inside); nothing 
 
 | | |
 |---|---|
-| macOS | `curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.4.0/packaging/install.sh \| sh` |
-| Windows (PowerShell) | `irm https://raw.githubusercontent.com/TheDevper/rodu/v0.4.0/packaging/install.ps1 \| iex` |
+| macOS | `curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.5.0/packaging/install.sh \| sh` |
+| Windows (PowerShell) | `irm https://raw.githubusercontent.com/TheDevper/rodu/v0.5.0/packaging/install.ps1 \| iex` |
 
 The script URLs name a release tag, so they run that release's reviewed script. Builds exist for
 macOS (Apple silicon and Intel) and Windows x64, which also runs on Windows on ARM. Other
