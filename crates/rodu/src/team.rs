@@ -30,6 +30,9 @@ const INVITE_PREFIX: &str = "rodu1-";
 const KEY_FILE: &str = "team.key";
 /// A signed team: this machine's private signing key (ADR 0002, step 2a).
 const IDENTITY_FILE: &str = "identity.key";
+/// An encrypted signed team: the team keys this machine received after a re-key (ADR 0002, step
+/// 3b), one per line; never in `config.json`.
+const KEYRING_FILE: &str = "team-keys";
 const SIGNED_INVITE_PREFIX: &str = "rodu2-";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,7 +143,8 @@ fn team_folder(dir: &Path, team: &TeamConfig) -> Result<TeamFolder> {
                 dir.join(IDENTITY_FILE).display()
             ))
         })?;
-    Ok(folder.signed(identity, root))
+    let folder = folder.signed(identity, root);
+    Ok(if team.encrypted { folder.keyring(dir.join(KEYRING_FILE)) } else { folder })
 }
 
 /// `rodu1-<workspace id>`, then `.<key>` for an encrypted team; a signed team's is
@@ -560,6 +564,9 @@ pub(crate) fn status(io: &mut Io<'_>, args: &Args) -> Result<()> {
             (io.out)(&format!("This machine: {:016x}", store.peer()));
             if team.signing.is_some() {
                 (io.out)(&format!("Signing: on; {}", signing_state(&ws.dir, team, store)));
+            }
+            if let Some(line) = key_state(&ws.dir, team, store) {
+                (io.out)(&line);
             }
             (io.out)(if store.readable_copy()? {
                 "Readable copy: on (plain Markdown in the folder's readable/, never encrypted)"
@@ -1039,8 +1046,8 @@ pub(crate) fn remove(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
              rodu team remove {name}{} --yes",
             if machines.len() == 1 { "machine" } else { "machines" },
             if encrypted {
-                "They keep the team key, so they can still read the board as it is in the folder; \
-                 a new team with a new key keeps them out. "
+                "The team key is changed too: they can still read what the folder holds now, but \
+                 not what each machine writes once it has the new key. "
             } else {
                 ""
             },
@@ -1050,6 +1057,9 @@ pub(crate) fn remove(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
     for peer in &machines {
         folder.remove(store, *peer)?;
     }
+    let encrypted = ws.config.team.as_ref().is_some_and(|t| t.encrypted);
+    // After the removals, so the new key is wrapped for nobody removed.
+    let rekeyed = if encrypted { Some(folder.rekey(store)) } else { None };
     after(io, &ws);
     let shown: Vec<String> = machines.iter().map(|peer| format!("{peer:016x}")).collect();
     (io.out)(&format!(
@@ -1058,6 +1068,44 @@ pub(crate) fn remove(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Res
         shown.join(", "),
         if machines.len() == 1 { "it" } else { "they" }
     ));
+    match rekeyed {
+        Some(Ok(_)) => (io.out)(REKEYED),
+        Some(Err(e)) => {
+            return Err(RoduError::invalid(format!(
+                "Removed, but the team key was not changed: {}",
+                e.message
+            ))
+            .with_hint("Change it with: rodu team rekey --yes"));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+const REKEYED: &str = "Changed the team key: each machine still on the team gets the new one from \
+                       this machine and seals with it once it next syncs";
+
+/// `rodu team rekey --yes`: on an encrypted signed team, the owner or an admin changes the team
+/// key. Every machine admitted and not removed gets the new key; a removed person, or anyone who
+/// holds only the invite code, cannot open what is written with it.
+pub(crate) fn rekey(io: &mut Io<'_>, args: &Args) -> Result<()> {
+    let ws = open(io, false)?;
+    let (store, folder) = signed_team(io, &ws)?;
+    if !ws.config.team.as_ref().is_some_and(|t| t.encrypted) {
+        return Err(RoduError::invalid(
+            "This team's files are not encrypted, so it has no team key to change",
+        ));
+    }
+    if !args.flag("yes") {
+        return Err(RoduError::invalid("Changing the team key needs --yes").with_hint(
+            "Each machine admitted and not removed gets the new key from this machine when both \
+             have synced; what is written with it stays closed to anyone who holds only an older \
+             key. Then run: rodu team rekey --yes",
+        ));
+    }
+    folder.rekey(store)?;
+    after(io, &ws);
+    (io.out)(REKEYED);
     Ok(())
 }
 
@@ -1112,6 +1160,21 @@ fn signing_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> String {
         ),
         Err(e) => format!("could not read the team folder ({}) (code {code})", e.message),
     }
+}
+
+/// Whether an encrypted signed team changed its key, and whether this machine has the newest.
+fn key_state(dir: &Path, team: &TeamConfig, store: &LoroStore) -> Option<String> {
+    let state = team_folder(dir, team).and_then(|folder| folder.key_state(store)).ok()??;
+    Some(match (state.held, state.newest) {
+        (0, 0) => return None,
+        (held, newest) if held >= newest => format!(
+            "Team key: changed {}; this machine has the newest",
+            if held == 1 { "once".to_owned() } else { format!("{held} times") }
+        ),
+        _ => "Team key: changed; this machine waits for the newest, which the owner's or an \
+              admin's machine passes on when both have synced"
+            .to_owned(),
+    })
 }
 
 fn folder_arg(io: &Io<'_>, args: &Args) -> Result<PathBuf> {

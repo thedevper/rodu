@@ -1858,3 +1858,412 @@ fn a_damaged_authority_file_is_written_again_whole_from_what_this_machine_checke
     assert!(after.contains(&cat), "{after}");
     assert!(after.contains(&format!("remove.{:016x}.", c.store().peer())), "{after}");
 }
+
+// --- re-keying an encrypted signed team (ADR 0002, step 3b) -----------------------------------
+
+use rodu_sync::folder::KeyState;
+
+/// The folder of an encrypted signed team as the machine holding `key` sees it, keeping the team
+/// keys it receives in `keys-<name>` beside the shared folder.
+fn rekeying_at(root: &std::path::Path, key: &str, name: &str) -> TeamFolder {
+    TeamFolder::sealed(root.join("Shared/Team"), TeamKey::from_hex(KEY).unwrap())
+        .signed(MachineKey::from_hex(key).unwrap(), root_public())
+        .keyring(root.join(format!("keys-{name}")))
+}
+
+/// [`with_cat`] on an encrypted signed team.
+fn sealed_with_cat(root: &std::path::Path) -> Three {
+    let ann_folder = rekeying_at(root, ROOT_KEY, "ann");
+    let a = first(&ann_folder);
+    let me = rodu_sync::folder::JoinRequest {
+        peer: a.store().peer(),
+        name: "ann".to_owned(),
+        key: root_public(),
+    };
+    ann_folder.admit(a.store(), &me).unwrap();
+    let bob_key = key_hex();
+    let bob_folder = rekeying_at(root, &bob_key, "bob");
+    let b = join_signed(&bob_folder, "bob");
+    ann_folder.admit(a.store(), &request_of(&ann_folder, "bob")).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    let cat_folder = rekeying_at(root, &key_hex(), "cat");
+    let c = join_signed(&cat_folder, "cat");
+    ann_folder.admit(a.store(), &request_of(&ann_folder, "cat")).unwrap();
+    a.sync(&ann_folder);
+    c.sync(&cat_folder);
+    c.svc.create_items(&c.me, "DEMO", &[json!({ "title": "Before" })], None).unwrap();
+    c.sync(&cat_folder);
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    assert!(b.titles().contains(&"Before".to_owned()));
+    Three { ann_folder, a, bob_key, bob_folder, b, cat_folder, c }
+}
+
+/// Whether the invite code's key opens `peer`'s newest file.
+fn opens_with_first_key(folder: &TeamFolder, peer: u64) -> bool {
+    let path = numbered(folder, peer).pop().unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let Frame::Complete(body) = unframe_sealed(&bytes) else { panic!() };
+    rodu_sync::seal::open(&TeamKey::from_hex(KEY).unwrap(), TEAM_ID, peer, body).is_some()
+}
+
+fn write(m: &Machine, folder: &TeamFolder, title: &str) {
+    m.svc.create_items(&m.me, "DEMO", &[json!({ "title": title })], None).unwrap();
+    m.sync(folder);
+}
+
+fn has(m: &Machine, title: &str) -> bool {
+    m.titles().contains(&title.to_owned())
+}
+
+fn keys_json(root: &std::path::Path, peer: u64) -> String {
+    std::fs::read_to_string(root.join(format!("Shared/Team/sync/{peer:016x}/keys.json")))
+        .unwrap_or_default()
+}
+
+/// dan joins with the invite code's key, and ann admits him.
+fn dan_joins(
+    root: &std::path::Path,
+    ann_folder: &TeamFolder,
+    a: &Machine,
+) -> (TeamFolder, Machine) {
+    let dan_folder = rekeying_at(root, &key_hex(), "dan");
+    let d = join_signed(&dan_folder, "dan");
+    ann_folder.admit(a.store(), &request_of(ann_folder, "dan")).unwrap();
+    // Admitting him wraps for him every newer key ann holds, there and then.
+    let held = ann_folder.key_state(a.store()).unwrap().unwrap().held;
+    let wrapped =
+        keys_json(root, a.store().peer()).contains(&format!("{:016x}.", d.store().peer()));
+    assert_eq!(wrapped, held > 0);
+    a.sync(ann_folder);
+    d.sync(&dan_folder);
+    (dan_folder, d)
+}
+
+#[test]
+fn after_a_removal_the_new_key_reaches_every_member_and_never_the_removed_machine() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let (ann, bob, cat) = (a.store().peer(), b.store().peer(), c.store().peer());
+    let newest = |held, newest| Some(KeyState { held, newest });
+    assert_eq!(ann_folder.key_state(a.store()).unwrap(), newest(0, 0));
+    // Only the owner or an admin changes the key.
+    assert!(bob_folder.rekey(b.store()).is_err());
+    assert!(ann_folder.remove(a.store(), cat).unwrap());
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    write(&a, &ann_folder, "Ann after");
+    assert!(!opens_with_first_key(&ann_folder, ann), "sealed with the new key");
+    assert_eq!(ann_folder.key_state(a.store()).unwrap(), newest(1, 1));
+    // bob takes the new key in the same pull that brings ann's file sealed with it.
+    b.sync(&bob_folder);
+    assert!(has(&b, "Ann after"));
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), newest(1, 1));
+    write(&b, &bob_folder, "Bob after");
+    assert!(!opens_with_first_key(&bob_folder, bob));
+    a.sync(&ann_folder);
+    assert!(has(&a, "Bob after"));
+    // cat never gets it: nothing written since opens for cat, which says so once.
+    let keys = keys_json(root.path(), ann);
+    assert!(keys.contains(&format!("{bob:016x}.1.")), "{keys}");
+    assert!(!keys.contains(&format!("{cat:016x}.")), "{keys}");
+    let report = cat_folder.pull(c.store(), &checker()).unwrap();
+    let unopened = report.damaged.iter().filter(|d| d.contains("does not open with any team key"));
+    assert_eq!(unopened.count(), 2, "{report:?}");
+    assert!(!has(&c, "Ann after") && !has(&c, "Bob after"));
+    // Nor can it read the record naming the new key, sealed with it as well.
+    assert_eq!(cat_folder.key_state(c.store()).unwrap(), newest(0, 0));
+    assert!(cat_folder.pull(c.store(), &checker()).unwrap().damaged.is_empty(), "said once");
+    // But it still hears of its removal, and stops writing work nobody takes in.
+    assert!(cat_folder.removed(c.store()).unwrap().contains_key(&cat));
+    assert!(cat_folder.push(c.store()).is_err());
+    // dan joins later with the invite code's key: once admitted, he reads everything, and what
+    // he writes is sealed with the new key.
+    let (dan_folder, d) = dan_joins(root.path(), &ann_folder, &a);
+    for title in ["Made alone", "Before", "Ann after", "Bob after"] {
+        assert!(has(&d, title), "{title}");
+    }
+    write(&d, &dan_folder, "Dan");
+    assert!(!opens_with_first_key(&dan_folder, d.store().peer()));
+    b.sync(&bob_folder);
+    assert!(has(&b, "Dan"));
+}
+
+#[test]
+fn a_key_nobody_with_authority_named_never_seals_and_a_forged_exchange_key_gets_no_key() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key, bob_folder, b, c, cat_folder, .. } =
+        sealed_with_cat(root.path());
+    let (ann, bob) = (a.store().peer(), b.store().peer());
+    // eve, who holds the invite code but was never admitted, makes a key of her own; cat, a
+    // member, names it in a record eve signed; eve wraps it for bob.
+    let eve = MachineKey::generate().unwrap();
+    let eve_peer = 0x0e0e_0e0e_0e0e_0e0e_u64;
+    let planted = TeamKey::generate().unwrap();
+    let record = Record::team_key(TEAM_ID, &eve, 7, &planted.check());
+    let doc_key = rodu_sync::authority::key_of(record.text());
+    c.store().set_authority(&doc_key, record.text()).unwrap();
+    c.sync(&cat_folder);
+    let exchange = MachineKey::from_hex(&bob_key).unwrap().exchange_public();
+    let wrapped = rodu_sync::seal::wrap(&planted, &exchange, TEAM_ID, bob, 7).unwrap();
+    let eve_dir = root.path().join(format!("Shared/Team/sync/{eve_peer:016x}"));
+    std::fs::create_dir_all(&eve_dir).unwrap();
+    let entry = format!("{bob:016x}.7.{}.{}", planted.check(), hex::encode(wrapped));
+    let file = json!({ "format": 1, "keys": [entry] });
+    std::fs::write(eve_dir.join("keys.json"), file.to_string()).unwrap();
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 0, newest: 0 }));
+    write(&b, &bob_folder, "Still the first key");
+    assert!(opens_with_first_key(&bob_folder, bob));
+    // eve swaps bob's exchange file for one with her own key, signed by her: ann's re-key is not
+    // wrapped for it.
+    let bob_exchange = root.path().join(format!("Shared/Team/sync/{bob:016x}/exchange.sealed"));
+    let real = std::fs::read(&bob_exchange).unwrap();
+    let forged_key = eve.exchange_public();
+    let forged = json!({
+        "format": 1,
+        "publicKey": eve.public().to_hex(),
+        "exchangeKey": hex::encode(forged_key),
+        "signature": eve.sign_exchange(TEAM_ID, bob, &forged_key),
+    });
+    let first = TeamKey::from_hex(KEY).unwrap();
+    let sealed = rodu_sync::seal::seal(&first, TEAM_ID, bob, forged.to_string().as_bytes());
+    std::fs::write(&bob_exchange, sealed.unwrap()).unwrap();
+    ann_folder.rekey(a.store()).unwrap();
+    a.sync(&ann_folder);
+    assert!(!keys_json(root.path(), ann).contains(&format!("{bob:016x}.")));
+    // bob's next sync puts its own exchange file back, and ann's next one wraps the key for it.
+    b.sync(&bob_folder);
+    assert_eq!(std::fs::read(&bob_exchange).unwrap().len(), real.len());
+    a.sync(&ann_folder);
+    assert!(keys_json(root.path(), ann).contains(&format!("{bob:016x}.1.")));
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+}
+
+#[test]
+fn the_key_a_revoked_admin_made_still_reaches_machines_joining_later() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key: bob_hex, bob_folder, b, cat_folder, c } =
+        sealed_with_cat(root.path());
+    let bob_key = request_of(&ann_folder, "bob").key;
+    ann_folder.set_admin(a.store(), &bob_key, true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.rekey(b.store()).unwrap(), 1);
+    write(&b, &bob_folder, "By bob");
+    for (folder, m) in [(&ann_folder, &a), (&cat_folder, &c)] {
+        m.sync(folder);
+        assert!(has(m, "By bob"));
+    }
+    ann_folder.set_admin(a.store(), &bob_key, false).unwrap();
+    a.sync(&ann_folder);
+    // Revoked, bob names the last generation there is: it counts for nothing, so it never stops
+    // the owner changing the key.
+    let bob_machine = MachineKey::from_hex(&bob_hex).unwrap();
+    let last = Record::team_key(TEAM_ID, &bob_machine, u32::MAX as u64, &"ab".repeat(32));
+    b.store().set_authority(&rodu_sync::authority::key_of(last.text()), last.text()).unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    a.sync(&ann_folder);
+    // bob's key record no longer counts by itself; the owner signed it again, so dan, joining
+    // after, takes the key and reads what was sealed with it.
+    let (_, d) = dan_joins(root.path(), &ann_folder, &a);
+    assert!(has(&d, "By bob"));
+}
+
+#[test]
+fn a_wrapped_key_someone_changed_is_wrapped_afresh() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let (ann, bob) = (a.store().peer(), b.store().peer());
+    ann_folder.rekey(a.store()).unwrap();
+    a.sync(&ann_folder);
+    // Someone swaps the bytes of bob's wrap for others of the same length.
+    let path = root.path().join(format!("Shared/Team/sync/{ann:016x}/keys.json"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let start = text.find(&format!("{bob:016x}.1.")).unwrap();
+    let end = start + text[start..].find('"').unwrap();
+    let (head, wrapped) = text[start..end].rsplit_once('.').unwrap();
+    let changed = format!("{head}.{}", "0".repeat(wrapped.len()));
+    std::fs::write(&path, text.replace(&text[start..end], &changed)).unwrap();
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.key_state(b.store()).unwrap().unwrap().held, 0);
+    // ann's next sync wraps the key for bob again, and bob takes it.
+    a.sync(&ann_folder);
+    assert!(!keys_json(root.path(), ann).contains(&changed));
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.key_state(b.store()).unwrap().unwrap().held, 1);
+}
+
+#[test]
+fn a_key_wrapped_under_another_keys_name_is_never_taken() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key, bob_folder, b, .. } = sealed_with_cat(root.path());
+    let bob = b.store().peer();
+    ann_folder.rekey(a.store()).unwrap();
+    a.sync(&ann_folder);
+    // eve wraps a key of her own for bob under the generation and check ann's record names, in a
+    // replica folder read before ann's.
+    let real = std::fs::read_to_string(root.path().join("keys-ann")).unwrap();
+    let check = real.split('.').nth(1).unwrap();
+    let planted = TeamKey::generate().unwrap();
+    let exchange = MachineKey::from_hex(&bob_key).unwrap().exchange_public();
+    let wrapped = rodu_sync::seal::wrap(&planted, &exchange, TEAM_ID, bob, 1).unwrap();
+    let eve_dir = root.path().join("Shared/Team/sync/0000000000000001");
+    std::fs::create_dir_all(&eve_dir).unwrap();
+    let entry = format!("{bob:016x}.1.{check}.{}", hex::encode(wrapped));
+    std::fs::write(eve_dir.join("keys.json"), json!({ "format": 1, "keys": [entry] }).to_string())
+        .unwrap();
+    b.sync(&bob_folder);
+    assert_eq!(std::fs::read_to_string(root.path().join("keys-bob")).unwrap(), real);
+    write(&b, &bob_folder, "Sealed with ann's key");
+    a.sync(&ann_folder);
+    assert!(has(&a, "Sealed with ann's key"));
+}
+
+/// The key of `generation` in the keyring file `name`.
+fn kept_key(root: &std::path::Path, name: &str, generation: u64) -> TeamKey {
+    let text = std::fs::read_to_string(root.join(format!("keys-{name}"))).unwrap();
+    let line = text.lines().find(|l| l.starts_with(&format!("{generation}."))).unwrap();
+    TeamKey::from_hex(line.rsplit('.').next().unwrap()).unwrap()
+}
+
+#[test]
+fn the_newest_key_seals_and_the_keyring_is_readable_by_this_user_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, .. } = sealed_with_cat(root.path());
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    write(&a, &ann_folder, "Twice");
+    let ann = a.store().peer();
+    let bytes = std::fs::read(numbered(&ann_folder, ann).pop().unwrap()).unwrap();
+    let Frame::Complete(body) = unframe_sealed(&bytes) else { panic!() };
+    let opens = |g| rodu_sync::seal::open(&kept_key(root.path(), "ann", g), TEAM_ID, ann, body);
+    assert!(opens(2).is_some() && opens(1).is_none());
+    let path = root.path().join("keys-ann");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn a_machine_publishing_an_unusable_exchange_key_holds_up_nobody_else() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key, bob_folder, b, cat_folder, c } =
+        sealed_with_cat(root.path());
+    let (ann, bob, cat) = (a.store().peer(), b.store().peer(), c.store().peer());
+    // bob's machine signs a low-order point as its exchange key: no wrap can be made for it.
+    let bob_machine = MachineKey::from_hex(&bob_key).unwrap();
+    let zero = [0u8; 32];
+    let file = json!({
+        "format": 1,
+        "publicKey": bob_machine.public().to_hex(),
+        "exchangeKey": hex::encode(zero),
+        "signature": bob_machine.sign_exchange(TEAM_ID, bob, &zero),
+    });
+    let sealed = rodu_sync::seal::seal(
+        &TeamKey::from_hex(KEY).unwrap(),
+        TEAM_ID,
+        bob,
+        file.to_string().as_bytes(),
+    )
+    .unwrap();
+    let path = root.path().join(format!("Shared/Team/sync/{bob:016x}/exchange.sealed"));
+    std::fs::write(&path, sealed).unwrap();
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    a.sync(&ann_folder);
+    let keys = keys_json(root.path(), ann);
+    assert!(keys.contains(&format!("{cat:016x}.1.")) && !keys.contains(&format!("{bob:016x}.")));
+    c.sync(&cat_folder);
+    assert_eq!(cat_folder.key_state(c.store()).unwrap().unwrap().held, 1);
+    // bob's own next pull puts a usable key back, and ann wraps for it.
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    assert_eq!(bob_folder.key_state(b.store()).unwrap().unwrap().held, 1);
+}
+
+#[test]
+fn a_key_record_that_jumps_ahead_is_never_taken_nor_uses_up_the_generations() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_key: bob_hex, bob_folder, b, cat_folder, c } =
+        sealed_with_cat(root.path());
+    let bob_key = request_of(&ann_folder, "bob").key;
+    ann_folder.set_admin(a.store(), &bob_key, true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // bob, an admin, names a key of the last generation there is and wraps it for ann.
+    let bob_machine = MachineKey::from_hex(&bob_hex).unwrap();
+    let last = TeamKey::generate().unwrap();
+    let record = Record::team_key(TEAM_ID, &bob_machine, u32::MAX as u64, &last.check());
+    b.store().set_authority(&rodu_sync::authority::key_of(record.text()), record.text()).unwrap();
+    b.sync(&bob_folder);
+    let ann = a.store().peer();
+    let exchange = MachineKey::from_hex(ROOT_KEY).unwrap().exchange_public();
+    let wrapped = rodu_sync::seal::wrap(&last, &exchange, TEAM_ID, ann, u32::MAX as u64).unwrap();
+    let dir = root.path().join("Shared/Team/sync/0000000000000001");
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = format!("{ann:016x}.{}.{}.{}", u32::MAX, last.check(), hex::encode(wrapped));
+    std::fs::write(dir.join("keys.json"), json!({ "format": 1, "keys": [entry] }).to_string())
+        .unwrap();
+    a.sync(&ann_folder);
+    let state = ann_folder.key_state(a.store()).unwrap().unwrap();
+    assert_eq!(
+        (state.held, state.newest),
+        (0, 0),
+        "not taken: the generations before it are missing"
+    );
+    // ann changes the key all the same, revokes bob, and changes it again; cat follows.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    ann_folder.set_admin(a.store(), &bob_key, false).unwrap();
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    write(&a, &ann_folder, "Sealed with generation 2");
+    c.sync(&cat_folder);
+    assert!(has(&c, "Sealed with generation 2"));
+    assert_eq!(cat_folder.key_state(c.store()).unwrap().unwrap().held, 2);
+}
+
+#[test]
+fn a_re_key_follows_every_key_record_that_counts_even_one_this_machine_lacks() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let bob_key = request_of(&ann_folder, "bob").key;
+    ann_folder.set_admin(a.store(), &bob_key, true).unwrap();
+    a.sync(&ann_folder);
+    b.sync(&bob_folder);
+    // bob, an admin, changes the key, and cat takes it; ann has heard of bob's record but never
+    // got the key itself.
+    assert_eq!(bob_folder.rekey(b.store()).unwrap(), 1);
+    b.sync(&bob_folder);
+    c.sync(&cat_folder);
+    let records = b.store().authority().unwrap();
+    let (doc_key, text) = records.iter().find(|(_, t)| t.starts_with("key.1.")).unwrap();
+    a.store().set_authority(doc_key, text).unwrap();
+    assert_eq!(ann_folder.key_state(a.store()).unwrap(), Some(KeyState { held: 0, newest: 1 }));
+    // Removing cat, ann's new key goes past bob's, which cat holds: never one of the same
+    // generation that might win on its check.
+    assert!(ann_folder.remove(a.store(), c.store().peer()).unwrap());
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 2);
+    // ann never gets bob's key: her wrap is gone from bob's keys file.
+    let bob_keys =
+        root.path().join(format!("Shared/Team/sync/{:016x}/keys.json", b.store().peer()));
+    let mut file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&bob_keys).unwrap()).unwrap();
+    let ann = format!("{:016x}.", a.store().peer());
+    file["keys"].as_array_mut().unwrap().retain(|e| !e.as_str().unwrap().starts_with(&ann));
+    std::fs::write(&bob_keys, file.to_string()).unwrap();
+    a.sync(&ann_folder);
+    assert_eq!(ann_folder.key_state(a.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
+    assert!(!std::fs::read_to_string(root.path().join("keys-ann")).unwrap().starts_with("1."));
+    // dan joins and gets only ann's key, never bob's: he takes it all the same, since bob's
+    // record reaches him in ann's authority file.
+    let (dan_folder, d) = dan_joins(root.path(), &ann_folder, &a);
+    assert_eq!(dan_folder.key_state(d.store()).unwrap(), Some(KeyState { held: 2, newest: 2 }));
+}

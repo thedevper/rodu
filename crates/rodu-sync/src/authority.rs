@@ -1,5 +1,5 @@
-//! Who may admit machines to a signed team, who owns it (ADR 0002, step 2b), and which machines
-//! it removed (step 3).
+//! Who may admit machines to a signed team, who owns it (ADR 0002, step 2b), which machines it
+//! removed (step 3a), and which team keys an encrypted team changed to (step 3b).
 //!
 //! Authority records sit in the team document's `authority` map, keyed by the hex SHA-256 of
 //! their text, and each is signed by the key it names:
@@ -9,6 +9,7 @@
 //! admin.<epoch>.<n>.<target key>.on.<signer key>.<signature>
 //! admin.<epoch>.<n>.<target key>.off.<kept admissions>.<signer key>.<signature>
 //! remove.<peer, 16 hex>.<end>.<signer key>.<signature>
+//! key.<generation>.<key check, 64 hex>.<signer key>.<signature>
 //! ```
 //!
 //! `kept admissions` is `-` or a comma-separated list of `<peer, 16 hex>:<admitted key>`;
@@ -28,6 +29,9 @@
 //!   so ([`Seen`]), and the cut moves up to the most any member saw: whatever a member built on
 //!   reaches every replica, so the team never splits over it. That claim travels outside the
 //!   document, because there it would depend on the very operations it lets in.
+//! - A key record names a new team key of an encrypted team by its generation (1 and up; the
+//!   invite code's key is 0) and its check ([`crate::seal::TeamKey::check`]). It counts while its
+//!   signer may admit. The key itself travels wrapped for each machine, never in a record.
 //!
 //! Everything here is pure: no document, no files.
 
@@ -52,6 +56,7 @@ enum Kind {
     Owner { epoch: u64, new: PublicKey, carried: BTreeSet<Hash> },
     Admin { epoch: u64, n: u64, target: PublicKey, on: bool, kept: BTreeSet<Admission> },
     Remove { peer: u64, end: u64 },
+    Key { generation: u64, check: String },
 }
 
 /// What a machine says it holds of a removed peer, signed by its key in its own replica folder.
@@ -95,6 +100,14 @@ fn end(text: &str) -> Option<u64> {
         .then(|| text.parse().ok())
         .flatten()
         .filter(|end| *end <= i32::MAX as u64)
+}
+
+/// A team key's generation: 1 and up, as many digits as a `u32` holds.
+pub fn generation(text: &str) -> Option<u64> {
+    (!text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+        .filter(|g| (1..=u32::MAX as u64).contains(g))
 }
 
 fn peer(text: &str) -> Option<u64> {
@@ -177,6 +190,10 @@ impl Record {
                 kept: parse_kept(kept)?,
             },
             ["remove", p, e] => Kind::Remove { peer: peer(p).filter(|p| *p != 0)?, end: end(e)? },
+            ["key", g, c] => Kind::Key {
+                generation: generation(g)?,
+                check: parse_hash(c).map(|_| (*c).to_owned())?,
+            },
             _ => return None,
         };
         sign::check_authority(&signer, workspace_id, signed, signature).then(|| Record {
@@ -198,6 +215,11 @@ impl Record {
     /// The key that signed it.
     pub fn signer(&self) -> PublicKey {
         self.signer
+    }
+
+    /// Whether it names a team key.
+    pub fn is_team_key(&self) -> bool {
+        matches!(self.kind, Kind::Key { .. })
     }
 
     fn sign(workspace_id: &str, key: &MachineKey, body: String) -> Record {
@@ -247,10 +269,15 @@ impl Record {
     pub fn removal(workspace_id: &str, key: &MachineKey, peer: u64, end: u64) -> Record {
         Self::sign(workspace_id, key, format!("remove.{peer:016x}.{end}"))
     }
+
+    /// The team key of `generation` whose check is `check`, signed by `key`.
+    pub fn team_key(workspace_id: &str, key: &MachineKey, generation: u64, check: &str) -> Record {
+        Self::sign(workspace_id, key, format!("key.{generation}.{check}"))
+    }
 }
 
 /// The records worth keeping: those signed by `root`, or by a key some kept transfer hands the
-/// team to; removals also when a kept grant names their signer. A record signed by any other key
+/// team to; removals and key records also when a kept grant names their signer. A record signed by any other key
 /// can never count, and keeping it would let anyone who can write to the folder make a replica's
 /// notes grow without end.
 pub fn worth_keeping(root: PublicKey, records: Vec<Record>) -> Vec<Record> {
@@ -259,7 +286,8 @@ pub fn worth_keeping(root: PublicKey, records: Vec<Record>) -> Vec<Record> {
         .into_iter()
         .filter(|r| {
             owners.contains(&r.signer)
-                || (matches!(r.kind, Kind::Remove { .. }) && granted.contains(&r.signer))
+                || (matches!(r.kind, Kind::Remove { .. } | Kind::Key { .. })
+                    && granted.contains(&r.signer))
         })
         .collect()
 }
@@ -501,6 +529,35 @@ impl Authority {
             .collect()
     }
 
+    /// The key records that count, as (signer, generation, check): signed by a key that may
+    /// admit now.
+    fn key_records<'a>(
+        &'a self,
+        records: &'a [Record],
+    ) -> impl Iterator<Item = (PublicKey, u64, &'a str)> + 'a {
+        records.iter().filter_map(move |r| match &r.kind {
+            Kind::Key { generation, check } if self.may_admit(&r.signer) => {
+                Some((r.signer, *generation, check.as_str()))
+            }
+            _ => None,
+        })
+    }
+
+    /// The team keys an encrypted team changed to, as (generation, check), from the key records
+    /// that count.
+    pub fn team_keys(&self, records: &[Record]) -> BTreeSet<(u64, String)> {
+        self.key_records(records).map(|(_, g, check)| (g, check.to_owned())).collect()
+    }
+
+    /// The key records `signer` signed that count now, as (generation, check): what the owner
+    /// signs again when it revokes `signer`, so every machine keeps taking those keys.
+    pub fn keys_by(&self, records: &[Record], signer: &PublicKey) -> Vec<(u64, String)> {
+        self.key_records(records)
+            .filter(|(by, _, _)| by == signer)
+            .map(|(_, g, check)| (g, check.to_owned()))
+            .collect()
+    }
+
     /// The `n` the next admin record for `target` takes in the current epoch: one more than the
     /// highest among those the current owner signed.
     pub fn next_n(&self, records: &[Record], target: &PublicKey) -> u64 {
@@ -717,6 +774,59 @@ mod tests {
             (".2147483647.", ".-1."),
             (".00000000000000ab.", ".0000000000000000."),
             (".00000000000000ab.", ".00000000000000AB."),
+        ] {
+            let changed = text.replacen(from, to, 1);
+            assert_ne!(changed, text);
+            let (signed, _) = changed.rsplit_once('.').unwrap();
+            let resigned = format!("{signed}.{}", root.sign_authority(TEAM, signed));
+            assert!(Record::parse(TEAM, &resigned).is_none(), "{to}");
+        }
+    }
+
+    #[test]
+    fn a_key_record_counts_while_its_signer_may_admit() {
+        let (root, bob, cat) = (key(), key(), key());
+        let check = |b: u8| hex::encode([b; 32]);
+        let grant = Record::grant(TEAM, &root, 0, 1, &bob.public());
+        let by_root = Record::team_key(TEAM, &root, 1, &check(1));
+        let by_bob = Record::team_key(TEAM, &bob, 2, &check(2));
+        let by_cat = Record::team_key(TEAM, &cat, 9, &check(9));
+        let records = [grant.clone(), by_root.clone(), by_bob.clone(), by_cat.clone()];
+        let auth = resolve(root.public(), &records);
+        assert_eq!(
+            auth.team_keys(&records),
+            BTreeSet::from([(1, check(1)), (2, check(2))]),
+            "cat is no admin"
+        );
+        assert_eq!(auth.keys_by(&records, &bob.public()), vec![(2, check(2))]);
+        // Once bob is revoked, his key record no longer counts (the owner signs it again).
+        let revoke = Record::revoke(TEAM, &root, 0, 2, &bob.public(), &BTreeSet::new());
+        let records = [grant, revoke, by_root, by_bob];
+        let auth = resolve(root.public(), &records);
+        assert_eq!(auth.team_keys(&records), BTreeSet::from([(1, check(1))]));
+        assert!(auth.keys_by(&records, &bob.public()).is_empty());
+        // Key records are kept when a kept grant names their signer, like removals.
+        let kept = worth_keeping(root.public(), vec![by_cat.clone()]);
+        assert!(kept.is_empty(), "cat was never granted admin");
+        let cat_grant = Record::grant(TEAM, &root, 0, 1, &cat.public());
+        let kept = worth_keeping(root.public(), vec![by_cat.clone(), cat_grant.clone()]);
+        assert_eq!(kept, vec![by_cat, cat_grant]);
+    }
+
+    #[test]
+    fn a_key_record_is_read_only_when_well_formed() {
+        let root = key();
+        let check = hex::encode([0xab; 32]);
+        let record = Record::team_key(TEAM, &root, 4_294_967_295, &check);
+        assert_eq!(Record::parse(TEAM, record.text()), Some(record.clone()));
+        let text = record.text();
+        for (from, to) in [
+            (".4294967295.", ".4294967296."),
+            (".4294967295.", ".0."),
+            (".4294967295.", ".-1."),
+            (".4294967295.", ".04294967295."),
+            ("abab.", "ABAB."),
+            ("abab.", "ab."),
         ] {
             let changed = text.replacen(from, to, 1);
             assert_ne!(changed, text);
