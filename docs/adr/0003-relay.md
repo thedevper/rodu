@@ -88,9 +88,12 @@ The signature is the machine key's signature over a message with its own domain,
 be confused with a file or an authority record:
 
 ```
-"rodu-relay-1\0" || len(workspace) || workspace || peer (u64 BE) || unix seconds (u64 BE)
+"rodu-relay-1\0" || len(workspace) (u32 BE) || workspace || peer (u64 BE) || unix seconds (u64 BE)
   || nonce (16 bytes) || method || "\0" || path and query || "\0" || SHA-256(body)
 ```
+
+The workspace, method, path and query are UTF-8 bytes exactly as sent, with the path not
+decoded, and the method in upper case.
 
 The relay accepts a request only when all of these hold:
 
@@ -132,8 +135,14 @@ signed and, on an encrypted team, sealed, so TLS is not what keeps the board pri
   the command, since the folder already has the file.
 - **Reading.** Files fetched from the relay go into a cache, `.rodu/relay/<workspace>/`, laid out
   like the team folder. `pull` reads the folder and the cache as one, so every file goes through
-  the same checks (signature, peer, seal, authority) whichever way it came. A file with the same
-  name in both places must have the same bytes, or it is refused as a conflict. Rodu never writes
+  the same checks (signature, peer, seal, authority) whichever way it came. An update file
+  (`*.update`) is never rewritten, so one with the same name in both places must have the same
+  bytes, or it is refused as a conflict. The other files (`seen.*`, `authority.*`,
+  `removed.sealed`, `exchange.sealed`, `keys.json`) are rewritten in place, so the relay's copy is
+  often newer than the folder's for a while. `pull` reads both copies and checks each on its own.
+  It combines what they say the way it already combines files from different machines: authority
+  and removal records are a union, seen claims keep the highest, and wrapped keys are tried from
+  both. A stale copy therefore adds nothing and is never a conflict. Rodu never writes
   relay files into the shared folder, because the provider would sync them a second time and could
   make conflicting copies.
 - **Live.** `rodu web` and `rodu mcp` hold one `changes` call open and pull as soon as it returns,
