@@ -730,10 +730,7 @@ impl TeamFolder {
         }
         // Before anything is sealed: a key this machine changed to reaches the team first, so
         // what it seals with that key opens for them.
-        self.mirror_if_behind(store, &info)?;
-        if self.rekeys() {
-            self.share_keys(store, &info)?;
-        }
+        let mut warnings = self.publish_newest_key(store, &info)?;
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         let mut written = None;
         store.export_own(|payload| {
@@ -743,10 +740,9 @@ impl TeamFolder {
             written = Some(path);
             Ok(())
         })?;
-        let warnings = match self.compact(store, &info, &dir) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format!("compacting this machine's sync files: {}", e.message)],
-        };
+        if let Err(e) = self.compact(store, &info, &dir) {
+            warnings.push(format!("compacting this machine's sync files: {}", e.message));
+        }
         Ok(Pushed { written, warnings })
     }
 
@@ -941,11 +937,12 @@ impl TeamFolder {
                 e.message
             ));
         }
-        if let Err(e) = self.mirror_if_behind(store, &info) {
-            report.batch.notes.push(format!(
-                "writing this machine's authority file: {}; tried again next time",
+        match self.publish_newest_key(store, &info) {
+            Ok(warnings) => report.batch.notes.extend(warnings),
+            Err(e) => report.batch.notes.push(format!(
+                "publishing the team key this machine changed to: {}; tried again next time",
                 e.message
-            ));
+            )),
         }
         if let Err(e) = self.share_keys(store, &info) {
             report.batch.notes.push(format!(
@@ -1095,23 +1092,6 @@ impl TeamFolder {
     /// damaged, grew too large or was changed loses nothing), with `also`, and whatever the file
     /// held that still reads.
     fn mirror(&self, store: &LoroStore, info: &TeamInfo, also: Option<&Record>) -> Result<()> {
-        self.mirror_when(store, info, also, true)
-    }
-
-    /// Signed team: [`Self::mirror`] when the authority file lacks something it should hold,
-    /// such as a key record a write that failed never put there. Until it is there, no machine
-    /// takes the key it names, so nothing sealed with that key would open for them.
-    fn mirror_if_behind(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
-        self.mirror_when(store, info, None, false)
-    }
-
-    fn mirror_when(
-        &self,
-        store: &LoroStore,
-        info: &TeamInfo,
-        also: Option<&Record>,
-        always: bool,
-    ) -> Result<()> {
         let Some((key, _)) = &self.signing else { return Ok(()) };
         let me = key.public();
         let mut file = self
@@ -1121,11 +1101,9 @@ impl TeamFolder {
         // Every key record too, whoever signed it: a machine that never got an earlier key still
         // learns its record here, sealed with a key it can get, and so takes the keys after it.
         let signed = records.iter().chain(also).filter(|r| r.signer() == me || r.is_team_key());
-        let mut changed = false;
         for text in signed.map(|r| r.text().to_owned()) {
             if !file.records.contains(&text) {
                 file.records.push(text);
-                changed = true;
             }
         }
         for (peer, member, signer) in self.checked_admissions(store, info)? {
@@ -1138,12 +1116,8 @@ impl TeamFolder {
                 );
                 if !file.admissions.contains(&entry) {
                     file.admissions.push(entry);
-                    changed = true;
                 }
             }
-        }
-        if !always && !changed {
-            return Ok(());
         }
         let json = serde_json::to_vec(&file).expect("an authority file serializes");
         let (name, bytes) = match &self.key {
@@ -1918,6 +1892,59 @@ impl TeamFolder {
         self.write_authority(store, &info, &record)?;
         self.share_keys(store, &info)?;
         Ok(generation)
+    }
+
+    /// Encrypted signed team, on the owner's or an admin's machine: makes sure the newest key this
+    /// machine holds has reached the team, so that what it seals with that key opens for them. A
+    /// [`Self::rekey`] whose writes failed, or that stopped after keeping its key, left it
+    /// unpublished: its record (signed again, which gives the same record) goes into the document
+    /// and this machine's authority file, and the key is wrapped for the team, wraps first. An
+    /// error means it is not published yet; a failure to wrap it for one more machine, once it
+    /// reached others, is only a warning.
+    fn publish_newest_key(&self, store: &LoroStore, info: &TeamInfo) -> Result<Vec<String>> {
+        let Some((key, _)) = &self.signing else { return Ok(Vec::new()) };
+        if !self.rekeys() {
+            return Ok(Vec::new());
+        }
+        let Some(newest) = self.held(false)?.into_iter().next().filter(|h| h.generation > 0) else {
+            return Ok(Vec::new());
+        };
+        let records = self.authority_records(store, info)?;
+        let authority = self.resolve(store, &records)?;
+        let me = key.public();
+        if !authority.may_admit(&me) {
+            return Ok(Vec::new());
+        }
+        let mut warnings = Vec::new();
+        let generation = newest.generation.to_string();
+        let wrapped = store.local_note(NOTE_WRAPPED_FOR)?.unwrap_or_default().lines().any(|l| {
+            let mut parts = l.split('.').skip(1);
+            parts.next() == Some(generation.as_str()) && parts.next() == Some(&newest.check)
+        });
+        match self.share_keys(store, info) {
+            Ok(()) => {}
+            Err(e) if !wrapped => return Err(e),
+            Err(e) => warnings.push(format!(
+                "passing the team keys on to the team's machines: {}; tried again next time",
+                e.message
+            )),
+        }
+        let named = (newest.generation, newest.check.clone());
+        // Named by another admin's record: that admin's file carries it.
+        if authority.team_keys(&records).contains(&named)
+            && !authority.keys_by(&records, &me).contains(&named)
+        {
+            return Ok(warnings);
+        }
+        let record = Record::team_key(self.team_id(info), key, newest.generation, &newest.check);
+        let published = authority.keys_by(&records, &me).contains(&named)
+            && self
+                .authority_file(info, store.peer())?
+                .is_some_and(|file| file.records.iter().any(|text| text == record.text()));
+        if !published {
+            self.write_authority(store, info, &record)?;
+        }
+        Ok(warnings)
     }
 
     /// Encrypted signed team: the newest team key this machine holds, and the newest one the team
