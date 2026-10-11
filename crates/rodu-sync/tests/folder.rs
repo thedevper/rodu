@@ -2594,3 +2594,47 @@ fn after_a_re_key_that_did_not_go_out_an_admin_change_waits_too() {
     assert_eq!(bob_folder.key_state(b.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
     assert!(bob_folder.rekey(b.store()).is_ok(), "bob is an admin now");
 }
+
+#[test]
+fn a_re_key_that_did_not_go_out_never_lets_the_removed_machine_read_what_follows() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, cat_folder, c, .. } = sealed_with_cat(root.path());
+    let (ann, cat) = (a.store().peer(), c.store().peer());
+    // Every machine has generation 1, cat's too, and ann's web board settles on it. Her terminal
+    // then removes cat, and the next re-key's wraps cannot be written.
+    assert_eq!(ann_folder.rekey(a.store()).unwrap(), 1);
+    a.sync(&ann_folder);
+    c.sync(&cat_folder);
+    assert_eq!(cat_folder.key_state(c.store()).unwrap(), Some(KeyState { held: 1, newest: 1 }));
+    let web = rekeying_at(root.path(), ROOT_KEY, "ann");
+    a.sync(&web);
+    assert!(ann_folder.remove(a.store(), cat).unwrap());
+    let saved = block(root.path(), ann, "keys.json");
+    assert!(ann_folder.rekey(a.store()).is_err());
+    // The web board's next pull rewrites its small files: none opens with the key cat holds.
+    let dir = root.path().join(format!("Shared/Team/sync/{ann:016x}"));
+    let files = || -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .map(|p| {
+                (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap())
+            })
+            .collect()
+    };
+    let before = files();
+    std::fs::remove_file(dir.join("exchange.sealed")).unwrap();
+    let report = web.pull(a.store(), &checker()).unwrap();
+    assert!(report.batch.notes.iter().any(|n| n.contains("publishing the team key")), "{report:?}");
+    assert!(web.push(a.store()).is_err());
+    let first = kept_key(root.path(), "ann", 1);
+    let written: Vec<(String, Vec<u8>)> =
+        files().into_iter().filter(|(name, bytes)| before.get(name) != Some(bytes)).collect();
+    assert!(written.iter().any(|(name, _)| name == "exchange.sealed"), "{written:?}");
+    for (name, bytes) in &written {
+        let opens = rodu_sync::seal::open(&first, TEAM_ID, ann, bytes).is_some();
+        assert!(!opens, "{name} opens with cat's key");
+    }
+    unblock(root.path(), ann, "keys.json", saved);
+}
