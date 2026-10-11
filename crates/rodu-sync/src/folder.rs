@@ -207,6 +207,9 @@ pub struct PullReport {
     /// Replicas whose files this machine dealt with are gone, with no newer file in their place
     /// yet: a compacted file still arriving. Said on every pull until it arrives.
     pub missing: Vec<String>,
+    /// Owner's or admin's machine: the machines this pull admitted through a personal invite, as
+    /// (name, peer).
+    pub invited: Vec<(String, u64)>,
     pub batch: BatchReport,
 }
 
@@ -218,6 +221,9 @@ struct RequestFile {
     name: String,
     public_key: String,
     signature: String,
+    /// A personal invite's proof ([`sign::join_proof`]); older versions ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof: Option<String>,
 }
 
 /// What a seen file holds: `seen` is `<removed peer, 16 hex>:<end>` entries, comma-separated.
@@ -353,6 +359,30 @@ pub struct JoinRequest {
     pub peer: u64,
     pub name: String,
     pub key: PublicKey,
+    /// A personal invite's proof, unchecked.
+    pub proof: Option<String>,
+}
+
+/// A personal invite this machine made and that was not used yet (ADR 0004, step 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInvite {
+    pub name: String,
+    /// Unix seconds after which it no longer admits anyone.
+    pub expires: u64,
+}
+
+/// A personal invite as the invites file keeps it.
+struct HeldInvite {
+    name: String,
+    secret: Zeroizing<[u8; sign::JOIN_SECRET_LEN]>,
+    expires: u64,
+}
+
+/// The most pending invites kept.
+const MAX_INVITES: usize = 256;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// A name a person can have: what `rodu_core` accepts for a principal.
@@ -492,6 +522,10 @@ pub struct TeamFolder {
     /// The team key to seal with, as (generation, check), once a push or pull settled it
     /// ([`TeamFolder::settle_seal_key`]); until then the newest held.
     seal_key: Mutex<Option<(u64, String)>>,
+    /// A signed team, on the owner's or an admin's machine: the private file holding the
+    /// personal invites it made and that were not used yet, one `<expires>.<secret>.<name>` per
+    /// line.
+    invites: Option<PathBuf>,
 }
 
 /// The path holds untrusted names from the folder and ends up in a terminal: control
@@ -565,6 +599,7 @@ impl TeamFolder {
             keyring: None,
             pending: Mutex::new(Vec::new()),
             seal_key: Mutex::new(None),
+            invites: None,
         }
     }
 
@@ -572,6 +607,12 @@ impl TeamFolder {
     /// `path`, and seals with the newest. Without it, only the invite code's key is used.
     pub fn keyring(mut self, path: impl Into<PathBuf>) -> Self {
         self.keyring = Some(path.into());
+        self
+    }
+
+    /// A signed team: keeps the personal invites this machine makes in the private file `path`.
+    pub fn invites(mut self, path: impl Into<PathBuf>) -> Self {
+        self.invites = Some(path.into());
         self
     }
 
@@ -823,15 +864,28 @@ impl TeamFolder {
 
     /// Signed team: writes this machine's request to join under `name` into its replica folder.
     pub fn write_request(&self, peer: u64, name: &str) -> Result<()> {
+        self.write_invited_request(peer, name, None)
+    }
+
+    /// [`Self::write_request`], with the proof of a personal invite's join `secret`, so that the
+    /// owner's or an admin's machine admits it on its own.
+    pub fn write_invited_request(
+        &self,
+        peer: u64,
+        name: &str,
+        secret: Option<&[u8; sign::JOIN_SECRET_LEN]>,
+    ) -> Result<()> {
         let info = self.checked_info()?;
         let Some((key, _)) = &self.signing else {
             return Err(RoduError::internal("only a signed team takes requests to join"));
         };
+        let team = self.team_id(&info);
         let request = RequestFile {
             format: 1,
             name: name.to_owned(),
             public_key: key.public().to_hex(),
-            signature: key.sign_request(self.team_id(&info), peer, name),
+            signature: key.sign_request(team, peer, name),
+            proof: secret.map(|secret| sign::join_proof(secret, team, peer, &key.public(), name)),
         };
         let json = serde_json::to_vec(&request).expect("a request serializes");
         let (file, bytes) = match &self.key {
@@ -884,7 +938,7 @@ impl TeamFolder {
                     &request.signature,
                 )
             {
-                found.push(JoinRequest { peer, name: request.name, key });
+                found.push(JoinRequest { peer, name: request.name, key, proof: request.proof });
             }
         }
         found.sort_by(|a, b| (&a.name, a.peer).cmp(&(&b.name, b.peer)));
@@ -923,6 +977,161 @@ impl TeamFolder {
         }
     }
 
+    /// Signed team, on the owner's or an admin's machine: a personal invite for `name`, valid for
+    /// `days`. Returns its join secret, which goes in the invite and nowhere else. A machine
+    /// whose request to join carries a proof of it is admitted on this machine's next pull, once
+    /// ([`Self::pull`]). An earlier invite for the same name is replaced.
+    pub fn invite(
+        &self,
+        store: &LoroStore,
+        name: &str,
+        days: u64,
+    ) -> Result<Zeroizing<[u8; sign::JOIN_SECRET_LEN]>> {
+        let info = self.checked_info()?;
+        match &self.signing {
+            Some((key, _)) if self.authority_of(store, &info)?.may_admit(&key.public()) => {}
+            Some(_) => {
+                return Err(RoduError::invalid(
+                    "Only the team owner's machine, or an admin's, can invite",
+                ));
+            }
+            None => return Err(RoduError::invalid("Only a team that signs its files invites")),
+        }
+        if !is_person_name(name) {
+            return Err(RoduError::invalid(format!("Invalid name \"{name}\""))
+                .with_hint("Use 1-40 letters, digits, dots, dashes or underscores"));
+        }
+        if !(1..=90).contains(&days) {
+            return Err(RoduError::invalid("An invite lasts from 1 to 90 days"));
+        }
+        let mut held = self.read_invites()?;
+        held.retain(|h| h.name != name);
+        if held.len() >= MAX_INVITES {
+            return Err(RoduError::invalid("Too many invites wait to be used")
+                .with_hint("Cancel some: rodu team invite --revoke <name>"));
+        }
+        let mut secret = Zeroizing::new([0u8; sign::JOIN_SECRET_LEN]);
+        getrandom::fill(secret.as_mut())
+            .map_err(|e| RoduError::internal(format!("no randomness for the invite: {e}")))?;
+        held.push(HeldInvite {
+            name: name.to_owned(),
+            secret: secret.clone(),
+            expires: unix_now().saturating_add(days * 24 * 60 * 60),
+        });
+        self.write_invites(&held)?;
+        Ok(secret)
+    }
+
+    /// The personal invites this machine made that were not used yet, expired ones included.
+    pub fn pending_invites(&self) -> Result<Vec<PendingInvite>> {
+        let mut found: Vec<PendingInvite> = self
+            .read_invites()?
+            .into_iter()
+            .map(|h| PendingInvite { name: h.name, expires: h.expires })
+            .collect();
+        found.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(found)
+    }
+
+    /// Cancels the personal invite for `name`; whether there was one.
+    pub fn revoke_invite(&self, name: &str) -> Result<bool> {
+        let mut held = self.read_invites()?;
+        let before = held.len();
+        held.retain(|h| h.name != name);
+        if held.len() == before {
+            return Ok(false);
+        }
+        self.write_invites(&held)?;
+        Ok(true)
+    }
+
+    /// Owner's or admin's machine: admits each machine asking to join whose request carries a
+    /// proof of a personal invite this machine holds, for the name it asks under, before the
+    /// invite expires. The invite is used up first, so it admits one machine at most.
+    fn admit_invited(&self, store: &LoroStore, info: &TeamInfo) -> Result<Vec<(String, u64)>> {
+        let Some((key, _)) = &self.signing else { return Ok(Vec::new()) };
+        if self.invites.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut held = self.read_invites()?;
+        if held.is_empty() || !self.authority_of(store, info)?.may_admit(&key.public()) {
+            return Ok(Vec::new());
+        }
+        let now = unix_now();
+        let trusted = self.trusted(store, info)?;
+        let team = self.team_id(info);
+        let mut admitted = Vec::new();
+        for request in self.requests()? {
+            let Some(proof) = &request.proof else { continue };
+            if trusted.admitted.contains_key(&request.peer)
+                || trusted.cut.contains_key(&request.peer)
+            {
+                continue;
+            }
+            let Some(at) = held.iter().position(|h| {
+                h.name == request.name
+                    && now < h.expires
+                    && sign::check_join_proof(
+                        &h.secret,
+                        team,
+                        request.peer,
+                        &request.key,
+                        &request.name,
+                        proof,
+                    )
+            }) else {
+                continue;
+            };
+            held.remove(at);
+            self.write_invites(&held)?;
+            self.admit(store, &request)?;
+            admitted.push((request.name, request.peer));
+        }
+        Ok(admitted)
+    }
+
+    /// The invites in the invites file that read: a line that does not is skipped.
+    fn read_invites(&self) -> Result<Vec<HeldInvite>> {
+        let Some(path) = &self.invites else { return Ok(Vec::new()) };
+        let bytes = match fs::read(path) {
+            Ok(bytes) => Zeroizing::new(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(folder_error(path, e)),
+        };
+        let text = std::str::from_utf8(&bytes).unwrap_or_default();
+        Ok(text
+            .lines()
+            .filter_map(|line| {
+                let (expires, rest) = line.split_once('.')?;
+                let (secret, name) = rest.split_once('.')?;
+                Some(HeldInvite {
+                    name: is_person_name(name).then(|| name.to_owned())?,
+                    secret: sign::join_secret_from_hex(secret)?,
+                    expires: expires.parse().ok()?,
+                })
+            })
+            .take(MAX_INVITES)
+            .collect())
+    }
+
+    fn write_invites(&self, held: &[HeldInvite]) -> Result<()> {
+        let Some(path) = &self.invites else {
+            return Err(RoduError::internal("this workspace has no file for invites"));
+        };
+        // Sized up front, so no copy of a secret is left behind by a reallocation.
+        let mut text = Zeroizing::new(String::with_capacity(held.len() * 96));
+        for invite in held {
+            text.push_str(&invite.expires.to_string());
+            text.push('.');
+            text.push_str(&hex::encode(invite.secret.as_ref()));
+            text.push('.');
+            text.push_str(&invite.name);
+            text.push('\n');
+        }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        write_private(dir, path, text.as_bytes())
+    }
+
     /// Imports every complete file other replicas wrote that this one has not dealt with yet. In
     /// a signed team, a pull that brings in an admission for a machine whose files were waiting
     /// reads the folder once more, so they land now rather than on the next command.
@@ -932,6 +1141,8 @@ impl TeamFolder {
         self.take_keys(store, &info)?;
         // Before anything is sealed: what it writes opens for the team.
         let settled = self.settle_seal_key(store, &info);
+        // Before the files are read: those of a machine admitted now land in this pull.
+        let invited = self.admit_invited(store, &info);
         let trusted = self.trusted(store, &info)?;
         let first = self.pull_once(store, checker, &info, &trusted)?;
         let now = self.trusted(store, &info)?;
@@ -940,6 +1151,13 @@ impl TeamFolder {
         } else {
             first.then(self.pull_once(store, checker, &info, &now)?)
         };
+        match invited {
+            Ok(invited) => report.invited = invited,
+            Err(e) => report.batch.notes.push(format!(
+                "admitting a machine through its invite: {}; tried again next time",
+                e.message
+            )),
+        }
         if let Err(e) = settled {
             report.batch.notes.push(format!(
                 "publishing the team key this machine changed to: {}; tried again next time",

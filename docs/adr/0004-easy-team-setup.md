@@ -1,6 +1,6 @@
 # ADR 0004: Team setup in as few steps as possible
 
-- Status: accepted 2026-10-11; step 1 built 2026-10-11
+- Status: accepted 2026-10-11; steps 1 and 2 built 2026-10-11
 
 ## Context
 
@@ -209,6 +209,51 @@ Each step ships alone.
     workspace id. The join then finds two and asks for `--folder`; an encrypted or signed team's
     files would not open or check in the planted folder anyway.
 
+### Step 2 as built
+
+- **The invite.** `rodu team invite <name> [--days N]` runs on the owner's or an admin's machine
+  of a signed team. It prints the team's invite code, with the team key on an encrypted team, then
+  `+<join secret>.<name>`: 32 hex digits of a random 128-bit secret, then the name. It lasts 7 days
+  by default, and from 1 to 90. Inviting the same name again replaces the earlier invite, so only
+  the newest works. At most 256 invites wait at once.
+- **Where it is kept.** The machine that made the invite keeps it in `.rodu/invites`, a private
+  file (mode 0600 on Unix) with one `<expires>.<secret>.<name>` line per invite. The secret is in
+  no team file. Only that machine admits with it: an admin's invite is not known to the owner's
+  machine.
+- **The proof.** `join` with a personal invite asks under the invite's name, and refuses another
+  `--name` or `--as` before writing anything. Its request carries a proof, HMAC-SHA256 under the
+  join secret over a domain string (`rodu-join-1`), the workspace id, the peer id, the machine's
+  public key and the name, each with its length where it varies. The request is signed and, on an
+  encrypted team, sealed, as before. A request with no proof is read as before, and older versions
+  ignore the proof.
+- **Admitting.** Each pull on the machine holding invites, once its keys are settled and before it
+  reads the other machines' files, looks at every request with a proof from a machine not yet
+  admitted or removed. It admits one when the name matches a held invite, the invite has not
+  expired, and the proof checks in constant time. The invite is removed from the file before the
+  admission is written, so a crash in between uses the invite up rather than leaving it to admit a
+  second machine. The admitted machine's files land in that same pull. The CLI says so as `note:
+  sync: admitted bob's machine …`; `rodu web` and `rodu mcp` write it with their other sync lines.
+  A machine that may no longer admit (an admin who was revoked) admits no one through its invites.
+- **Listing and cancelling.** `rodu team invites` lists the invites not used yet, with the UTC day
+  each ends, and shows expired ones as expired. `rodu team invite --revoke <name>` cancels one.
+  Expired invites stay listed until cancelled or replaced.
+- **Fallback.** A request whose proof does not check (a wrong secret, another name, an expired or
+  cancelled invite, a proof made for another workspace) waits for `rodu team admit`, as before.
+- **Tests.** `rodu-sync` covers admission in the owner's pull with the files landing at once, an
+  admin's own invite, one admission per invite (also with two machines in the same pull), and
+  refusal for a wrong secret, another name, a revoked, expired or replaced invite, and a proof for
+  another workspace. It also checks that only the owner or an admin invites, the name and days
+  checks, and the private mode of the invites file. `tests/team.rs` covers the CLI on an encrypted
+  team end to end, the name check at join, revoking, and who may invite. Each check was confirmed
+  by removing it and watching a test fail.
+- **Known limits.**
+  - The invite holds the join secret next to the team key, so anyone who sees it before the
+    teammate uses it can join in their place. Single use, the expiry and `rodu team members` bound
+    this, as the decision says.
+  - Admission happens when the inviting machine pulls. If that machine is off, the teammate waits.
+    The request also waits in the folder, so the owner or an admin can admit it by hand with
+    `rodu team admit`.
+
 ## What this does not do
 
 - **Faster sync.** Changes still arrive as fast as the folder app moves them. Sync between machines
@@ -218,9 +263,9 @@ Each step ships alone.
 
 ## Dependencies
 
-None expected. Finding Google Drive's folders uses the standard library. The join secret's MAC uses
-HMAC over SHA-256 from `sha2`, which Rodu already ships, unless step 2 finds a reason to add `hmac`
-(MIT OR Apache-2.0) instead. Anything new must pass `about.toml`, `cargo audit` and `cargo xtask
+None. Finding Google Drive's folders uses the standard library. The join secret's MAC is HMAC
+(RFC 2104) built on `sha2`, which Rodu already ships, and checked against RFC 4231's test vectors,
+so no `hmac` crate was added. Anything new must pass `about.toml`, `cargo audit` and `cargo xtask
 notices`, across its whole tree.
 
 ## Open questions

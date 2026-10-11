@@ -13,7 +13,7 @@ use rodu_core::{
 };
 use rodu_sync::folder::{Admitted, JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
 use rodu_sync::seal::TeamKey;
-use rodu_sync::sign::{MachineKey, PublicKey};
+use rodu_sync::sign::{self, MachineKey, PublicKey};
 use rodu_sync::{Checker, LoroStore};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +36,11 @@ const IDENTITY_FILE: &str = "identity.key";
 /// 3b), one per line; never in `config.json`.
 const KEYRING_FILE: &str = "team-keys";
 const SIGNED_INVITE_PREFIX: &str = "rodu2-";
+/// A signed team, on the owner's or an admin's machine: the personal invites it made and that
+/// were not used yet (ADR 0004, step 2); never in `config.json`.
+const INVITES_FILE: &str = "invites";
+/// How long a personal invite lasts unless told otherwise.
+const INVITE_DAYS: u64 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,7 +150,7 @@ fn team_folder(dir: &Path, team: &TeamConfig) -> Result<TeamFolder> {
                 dir.join(IDENTITY_FILE).display()
             ))
         })?;
-    let folder = folder.signed(identity, root);
+    let folder = folder.signed(identity, root).invites(dir.join(INVITES_FILE));
     Ok(if team.encrypted { folder.keyring(dir.join(KEYRING_FILE)) } else { folder })
 }
 
@@ -166,6 +171,20 @@ fn invite_code(
     code
 }
 
+/// A personal invite: the team's invite code, then `+<join secret>.<name>`.
+fn personal_code(
+    code: &str,
+    secret: &[u8; sign::JOIN_SECRET_LEN],
+    name: &str,
+) -> zeroize::Zeroizing<String> {
+    let mut hex = zeroize::Zeroizing::new(String::with_capacity(2 * sign::JOIN_SECRET_LEN));
+    for byte in secret {
+        // Writing into a String cannot fail.
+        let _ = std::fmt::Write::write_fmt(&mut *hex, format_args!("{byte:02x}"));
+    }
+    secret_line(&[code, "+", hex.as_str(), ".", name])
+}
+
 /// What an invite code holds.
 struct Invite {
     workspace_id: String,
@@ -173,10 +192,23 @@ struct Invite {
     root: Option<PublicKey>,
     /// An encrypted team's key.
     key: Option<TeamKey>,
+    /// A personal invite's join secret, and the name it is for.
+    personal: Option<(zeroize::Zeroizing<[u8; sign::JOIN_SECRET_LEN]>, String)>,
 }
 
 fn parse_invite(code: &str) -> Option<Invite> {
     let code = code.trim();
+    let (code, personal) = match code.split_once('+') {
+        Some((code, personal)) => {
+            let (secret, name) = personal.split_once('.')?;
+            let secret = sign::join_secret_from_hex(secret)?;
+            if !rodu_core::service::valid_principal_name(name) {
+                return None;
+            }
+            (code, Some((secret, name.to_owned())))
+        }
+        None => (code, None),
+    };
     let (root, rest) = match code.strip_prefix(SIGNED_INVITE_PREFIX) {
         Some(rest) => {
             let (id, after) = rest.split_once('.')?;
@@ -196,7 +228,11 @@ fn parse_invite(code: &str) -> Option<Invite> {
         Some(key) => Some(TeamKey::from_hex(key)?),
         None => None,
     };
-    is_uuid(id).then(|| Invite { workspace_id: id.to_owned(), root, key })
+    // Only a signed team admits through a personal invite.
+    if personal.is_some() && root.is_none() {
+        return None;
+    }
+    is_uuid(id).then(|| Invite { workspace_id: id.to_owned(), root, key, personal })
 }
 
 /// Runs the import check in a child process of this very executable.
@@ -355,6 +391,22 @@ fn warn_report(io: &mut Io<'_>, report: &PullReport) {
     for line in report_lines(report) {
         warn(io, &line);
     }
+    for line in invited_lines(report) {
+        (io.err)(&format!("note: sync: {line}"));
+    }
+}
+
+/// The machines a pull admitted through a personal invite, which is news rather than a problem.
+fn invited_lines(report: &PullReport) -> Vec<String> {
+    report
+        .invited
+        .iter()
+        .map(|(name, peer)| {
+            format!(
+                "admitted {name}'s machine {peer:016x}, which joined with the invite for {name}"
+            )
+        })
+        .collect()
 }
 
 /// What a pull found that the user should hear about.
@@ -396,8 +448,10 @@ impl LiveSync<AnyStore> for FolderLive {
     fn pull(&self, service: &RoduService<AnyStore>) -> Result<Pulled> {
         let Some(store) = service.store.team() else { return Ok(Pulled::default()) };
         let report = team_folder(&self.dir, &self.team)?.pull(store, &checker())?;
-        let mut pulled =
-            Pulled { changed: !report.batch.imported.is_empty(), warnings: report_lines(&report) };
+        let mut warnings = report_lines(&report);
+        warnings.extend(invited_lines(&report));
+        let changed = !report.batch.imported.is_empty() || !report.invited.is_empty();
+        let mut pulled = Pulled { changed, warnings };
         // The pull above worked, or this returned its error.
         match settle_numbering(&self.dir, &self.config, service, true) {
             Ok(moved) => pulled.warnings.extend(moved),
@@ -827,6 +881,85 @@ pub(crate) fn admit(io: &mut Io<'_>, name: Option<&String>, code: Option<&String
         "Admitted {}'s machine {:016x}; each machine takes in its changes when it next syncs",
         request.name, request.peer
     ));
+    Ok(())
+}
+
+/// `rodu team invite <name> [--days N]`: a personal invite for one person, which admits the
+/// first machine joining with it, on this machine's next sync. `--revoke <name>` cancels one.
+pub(crate) fn invite(io: &mut Io<'_>, args: &Args, name: Option<&String>) -> Result<()> {
+    let ws = open(io, false)?;
+    let (store, folder) = signed_team(io, &ws)?;
+    if let Some(revoke) = args.value("revoke") {
+        if name.is_some() || args.value("days").is_some() {
+            return Err(RoduError::invalid("Give only the name to cancel: --revoke <name>"));
+        }
+        if !folder.revoke_invite(revoke)? {
+            return Err(RoduError::not_found(format!(
+                "No invite for {} is waiting",
+                revoke.escape_debug()
+            ))
+            .with_hint("rodu team invites lists them"));
+        }
+        (io.out)(&format!("Cancelled the invite for {revoke}"));
+        return Ok(());
+    }
+    let Some(name) = name else {
+        return Err(RoduError::invalid("team invite needs the person's name")
+            .with_hint("rodu team invite <name> [--days 7]"));
+    };
+    let days = match args.value("days") {
+        None => INVITE_DAYS,
+        Some(days) => days
+            .parse()
+            .map_err(|_| RoduError::invalid(format!("--days takes a number, not \"{days}\"")))?,
+    };
+    let team = ws.config.team.as_ref().expect("a signed team");
+    let key = if team.encrypted {
+        Some(load_key(&ws.dir)?.ok_or_else(|| {
+            RoduError::invalid("This workspace's team key is missing, so it cannot invite")
+        })?)
+    } else {
+        None
+    };
+    let secret = folder.invite(store, name, days)?;
+    let expires =
+        folder.pending_invites()?.into_iter().find(|p| p.name == *name).map_or(0, |p| p.expires);
+    let code = invite_code(&team.workspace_id, team.signing.as_deref(), key.as_ref());
+    (io.out)(&format!(
+        "Invite for {name}, until {} (UTC), for one machine:",
+        rodu_core::clock::utc_day(expires)
+    ));
+    (io.out)(&personal_code(&code, &secret, name));
+    (io.out)(&format!(
+        "Send it to {name} only, not through the team folder: whoever joins with it first is \
+         admitted when this machine next syncs.{} They run: rodu team join, then paste it",
+        if key.is_some() { " It holds the team key." } else { "" }
+    ));
+    Ok(())
+}
+
+/// `rodu team invites`: the personal invites this machine made that were not used yet.
+pub(crate) fn invites(io: &mut Io<'_>) -> Result<()> {
+    let ws = open(io, false)?;
+    let (_, folder) = signed_team(io, &ws)?;
+    let pending = folder.pending_invites()?;
+    if pending.is_empty() {
+        (io.out)("No invite is waiting to be used");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for invite in &pending {
+        let day = rodu_core::clock::utc_day(invite.expires);
+        (io.out)(&if invite.expires > now {
+            format!("{}  until {day}", invite.name)
+        } else {
+            format!("{}  expired {day}", invite.name)
+        });
+    }
+    if !pending.is_empty() {
+        (io.out)("Cancel one with: rodu team invite --revoke <name>");
+    }
     Ok(())
 }
 
@@ -1466,7 +1599,7 @@ pub(crate) fn create(io: &mut Io<'_>, args: &Args) -> Result<()> {
     if let Some(root) = root.as_deref().and_then(PublicKey::from_hex) {
         // The root admits its own machine too, so every machine of a signed team is listed the
         // same way.
-        let me = JoinRequest { peer: store.peer(), name: String::new(), key: root };
+        let me = JoinRequest { peer: store.peer(), name: String::new(), key: root, proof: None };
         folder.admit(&store, &me)?;
     }
     store.set_numbering_peer(store.peer())?;
@@ -1601,11 +1734,29 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
         }
         other => other,
     };
-    let Invite { workspace_id, root, key } = code.and_then(parse_invite).ok_or_else(|| {
-        RoduError::invalid("team join needs an invite code such as rodu1-0190…")
-            .with_hint("The teammate who created the team sees it in: rodu team --show-invite")
-    })?;
+    let Invite { workspace_id, root, key, personal } =
+        code.and_then(parse_invite).ok_or_else(|| {
+            RoduError::invalid("team join needs an invite code such as rodu1-0190…")
+                .with_hint("The teammate who created the team sees it in: rodu team --show-invite")
+        })?;
     let system = system_user(io);
+    // A personal invite is for one name: the machine asks under it, or the proof does not hold.
+    let (secret, invited) = personal.map_or((None, None), |(s, name)| (Some(s), Some(name)));
+    if let Some(invited) = &invited {
+        let given = args.value("name").or(args.value("as"));
+        if let Some(given) = given.filter(|given| given != invited) {
+            return Err(RoduError::invalid(format!(
+                "This invite is for {invited}, not {}",
+                given.escape_debug()
+            ))
+            .with_hint(format!(
+                "Join without --name, or ask for an invite in your own name: rodu team invite \
+                 {}",
+                given.escape_debug()
+            )));
+        }
+    }
+    let invited = invited.as_deref();
     let who = match (args.value("name"), args.value("as")) {
         (Some(name), None) => Joining::New(name),
         (None, Some(name)) => Joining::As(name),
@@ -1615,7 +1766,7 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
                  not both",
             ));
         }
-        (None, None) => match system.as_deref() {
+        (None, None) => match invited.or(system.as_deref()) {
             Some(name) => Joining::New(name),
             None => {
                 return Err(RoduError::invalid("team join needs --name <you>")
@@ -1699,7 +1850,8 @@ pub(crate) fn join(io: &mut Io<'_>, args: &Args, code: Option<&String>) -> Resul
         Some(root) => Some((MachineKey::generate()?, root)),
         None => None,
     };
-    let result = join_into(io, &dir, folder, &folder_path, who, workspace_id, key_hex, signing);
+    let result =
+        join_into(io, &dir, folder, &folder_path, who, workspace_id, key_hex, signing, secret);
     if result.is_err() {
         // Only what this join made, so it can simply be run again.
         let made = [
@@ -1787,6 +1939,7 @@ fn join_into(
     workspace_id: String,
     key_hex: Option<zeroize::Zeroizing<String>>,
     signing: Option<(MachineKey, PublicKey)>,
+    secret: Option<zeroize::Zeroizing<[u8; sign::JOIN_SECRET_LEN]>>,
 ) -> Result<()> {
     if let Some(hex) = &key_hex {
         let key = TeamKey::from_hex(hex).expect("a key from the invite code");
@@ -1834,7 +1987,7 @@ fn join_into(
     folder.push(store)?;
     let (Joining::New(name) | Joining::As(name)) = who;
     if signed.is_some() {
-        folder.write_request(store.peer(), name)?;
+        folder.write_invited_request(store.peer(), name, secret.as_deref())?;
     }
     save_config(dir, &config)?;
     (io.out)(&format!(
@@ -1844,6 +1997,13 @@ fn join_into(
     ));
     if let Some((_, code)) = signed {
         (io.out)(&format!("This machine's code: {code}"));
+        if secret.is_some() {
+            (io.out)(
+                "Your invite admits this machine the next time the machine that made it syncs; \
+                 until then the team does not take in your changes. Nothing else to do.",
+            );
+            return Ok(());
+        }
         (io.out)(&format!(
             "The team does not take in your changes until its owner or an admin admits this \
              machine. Tell them your code yourself (not through the team folder) and ask them to \
@@ -1872,6 +2032,35 @@ mod tests {
         };
         let store = AnyStore::Team(Box::new(LoroStore::open(dir).unwrap()));
         (config, RoduService::new(store).with_numbering(numbering))
+    }
+
+    #[test]
+    fn a_personal_invite_reads_back_and_only_on_a_signed_teams_code() {
+        let id = "0190aaaa-0000-7000-8000-00000000000a";
+        let root = MachineKey::generate().unwrap().public().to_hex();
+        let key = TeamKey::generate().unwrap();
+        let secret = [0xabu8; sign::JOIN_SECRET_LEN];
+        let code = invite_code(id, Some(&root), Some(&key));
+        let personal = personal_code(&code, &secret, "bob.smith");
+        assert_eq!(personal.as_str(), format!("{}+{}.bob.smith", code.as_str(), "ab".repeat(16)));
+        let invite = parse_invite(&personal).unwrap();
+        let (got, name) = invite.personal.unwrap();
+        assert_eq!((*got, name.as_str()), (secret, "bob.smith"));
+        assert_eq!(invite.root.unwrap().to_hex(), root);
+        assert!(invite.key.unwrap().to_hex().as_str() == key.to_hex().as_str());
+        // A plain code is still read, with no personal part.
+        assert!(parse_invite(&code).unwrap().personal.is_none());
+        let short = format!("{}+{}.bob", code.as_str(), "ab".repeat(15));
+        let unsigned = invite_code(id, None, None);
+        for bad in [
+            short.as_str(),
+            &format!("{}+{}.", code.as_str(), "ab".repeat(16)),
+            &format!("{}+{}.bad name", code.as_str(), "ab".repeat(16)),
+            &format!("{}+{}", code.as_str(), "ab".repeat(16)),
+            &personal_code(&unsigned, &secret, "bob"),
+        ] {
+            assert!(parse_invite(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
