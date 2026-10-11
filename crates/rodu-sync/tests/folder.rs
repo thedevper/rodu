@@ -1520,8 +1520,8 @@ fn a_former_owner_cannot_take_the_team_back_or_name_admins_afterwards() {
     b.sync(&bob_folder);
     a.sync(&ann_folder);
     // ann signs, as owner of epoch 0, a grant for a key she controls, and as owner of epoch 0
-    // a second transfer, to that key. Try many keys: one of them has a lower hash than the
-    // transfer to bob.
+    // a second transfer, to that key. Forty such pairs, and more keys tried until one transfer
+    // has a lower hash than the one to bob: a fixed number of tries fails now and then.
     let (to_bob, _) = b
         .store()
         .authority()
@@ -1530,11 +1530,18 @@ fn a_former_owner_cannot_take_the_team_back_or_name_admins_afterwards() {
         .find(|(_, text)| text.starts_with("owner."))
         .unwrap();
     let mut lowest_beaten = false;
-    for _ in 0..40 {
+    for tried in 0..1_000_000 {
+        if tried >= 40 && lowest_beaten {
+            break;
+        }
         let mine = MachineKey::generate().unwrap();
-        let grant = Record::grant(TEAM_ID, &ann, 0, 50, &mine.public());
         let back = Record::transfer(TEAM_ID, &ann, 1, &mine.public(), &BTreeSet::new());
-        lowest_beaten |= rodu_sync::authority::key_of(back.text()) < to_bob;
+        let beats = rodu_sync::authority::key_of(back.text()) < to_bob;
+        if tried >= 40 && !beats {
+            continue;
+        }
+        lowest_beaten |= beats;
+        let grant = Record::grant(TEAM_ID, &ann, 0, 50, &mine.public());
         for record in [grant, back] {
             a.store()
                 .set_authority(&rodu_sync::authority::key_of(record.text()), record.text())
