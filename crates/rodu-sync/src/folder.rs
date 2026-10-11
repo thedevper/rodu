@@ -409,6 +409,12 @@ const NOTE_WRAPPED: &str = "wrapped";
 /// `<peer>.<generation>.<check>` per line, kept after the wrap leaves its keys file: a key wrapped
 /// for a machine removed since is changed ([`TeamFolder::rekey_if_exposed`]).
 const NOTE_WRAPPED_FOR: &str = "wrapped-for";
+/// The local note naming the team key this machine last made, `<generation>.<check>`: the only
+/// key it signs a record for again ([`TeamFolder::publish_newest_key`]).
+const NOTE_MADE_KEY: &str = "made-key";
+/// The local note naming the newest team key this machine knows has reached the team,
+/// `<generation>.<check>`.
+const NOTE_PUBLISHED_KEY: &str = "published-key";
 /// The most refused authority entries noted.
 const MAX_REFUSED: usize = 4096;
 /// The local note listing the hashes of the transfers this replica follows, epoch 1 first.
@@ -730,7 +736,8 @@ impl TeamFolder {
         }
         // Before anything is sealed: a key this machine changed to reaches the team first, so
         // what it seals with that key opens for them.
-        let mut warnings = self.publish_newest_key(store, &info)?;
+        self.publish_newest_key(store, &info)?;
+        let mut warnings = Vec::new();
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         let mut written = None;
         store.export_own(|payload| {
@@ -937,12 +944,11 @@ impl TeamFolder {
                 e.message
             ));
         }
-        match self.publish_newest_key(store, &info) {
-            Ok(warnings) => report.batch.notes.extend(warnings),
-            Err(e) => report.batch.notes.push(format!(
+        if let Err(e) = self.publish_newest_key(store, &info) {
+            report.batch.notes.push(format!(
                 "publishing the team key this machine changed to: {}; tried again next time",
                 e.message
-            )),
+            ));
         }
         if let Err(e) = self.share_keys(store, &info) {
             report.batch.notes.push(format!(
@@ -1886,65 +1892,73 @@ impl TeamFolder {
         }
         let new = TeamKey::generate()?;
         let check = new.check();
-        // Kept before anything names it, so a stop in between never leaves a key nobody holds.
+        // Noted as made here, then kept before anything names it, so a stop in between never
+        // leaves a key nobody holds, and the next sync finishes publishing it.
+        store.set_local_note(NOTE_MADE_KEY, &format!("{generation}.{check}"))?;
         self.keep_keys(&[Held { generation, check: check.clone(), key: new }])?;
         let record = Record::team_key(self.team_id(&info), key, generation, &check);
         self.write_authority(store, &info, &record)?;
         self.share_keys(store, &info)?;
+        store.set_local_note(NOTE_PUBLISHED_KEY, &format!("{generation}.{check}"))?;
         Ok(generation)
     }
 
-    /// Encrypted signed team, on the owner's or an admin's machine: makes sure the newest key this
-    /// machine holds has reached the team, so that what it seals with that key opens for them. A
-    /// [`Self::rekey`] whose writes failed, or that stopped after keeping its key, left it
-    /// unpublished: its record (signed again, which gives the same record) goes into the document
-    /// and this machine's authority file, and the key is wrapped for the team, wraps first. An
-    /// error means it is not published yet; a failure to wrap it for one more machine, once it
-    /// reached others, is only a warning.
-    fn publish_newest_key(&self, store: &LoroStore, info: &TeamInfo) -> Result<Vec<String>> {
-        let Some((key, _)) = &self.signing else { return Ok(Vec::new()) };
+    /// Encrypted signed team: makes sure the newest key this machine holds may seal, and has
+    /// reached the team, so that what it seals with that key opens for them.
+    ///
+    /// A key no record that counts names never seals, unless this machine made it in a
+    /// [`Self::rekey`] whose writes failed, or that stopped after keeping it: then, on the owner's
+    /// or an admin's machine, its record (signed again, which gives the same record) goes into the
+    /// document and this machine's authority file, and the key is wrapped for the team, wraps
+    /// first. Once both are done the key is noted as published, and a later failure is only a
+    /// warning. An error means nothing may be sealed with it yet.
+    fn publish_newest_key(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        let Some((key, _)) = &self.signing else { return Ok(()) };
         if !self.rekeys() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let Some(newest) = self.held(false)?.into_iter().next().filter(|h| h.generation > 0) else {
-            return Ok(Vec::new());
+            return Ok(());
         };
+        let pair = format!("{}.{}", newest.generation, newest.check);
+        if store.local_note(NOTE_PUBLISHED_KEY)?.as_deref() == Some(pair.as_str()) {
+            return Ok(());
+        }
         let records = self.authority_records(store, info)?;
         let authority = self.resolve(store, &records)?;
         let me = key.public();
-        if !authority.may_admit(&me) {
-            return Ok(Vec::new());
-        }
-        let mut warnings = Vec::new();
-        let generation = newest.generation.to_string();
-        let wrapped = store.local_note(NOTE_WRAPPED_FOR)?.unwrap_or_default().lines().any(|l| {
-            let mut parts = l.split('.').skip(1);
-            parts.next() == Some(generation.as_str()) && parts.next() == Some(&newest.check)
-        });
-        match self.share_keys(store, info) {
-            Ok(()) => {}
-            Err(e) if !wrapped => return Err(e),
-            Err(e) => warnings.push(format!(
-                "passing the team keys on to the team's machines: {}; tried again next time",
-                e.message
-            )),
-        }
         let named = (newest.generation, newest.check.clone());
+        let counts = authority.team_keys(&records).contains(&named);
+        let made_here = store.local_note(NOTE_MADE_KEY)?.as_deref() == Some(pair.as_str());
+        let may_admit = authority.may_admit(&me);
+        if !counts && !(made_here && may_admit) {
+            return Err(RoduError::invalid(format!(
+                "This machine's newest team key (generation {}) is named by no record that \
+                 counts: nothing is sealed with it",
+                newest.generation
+            ))
+            .with_hint("Ask the team owner or an admin to change the team key: rodu team rekey"));
+        }
+        if !may_admit {
+            return Ok(());
+        }
+        // Wrapped first: a teammate holding the wrap takes the key the moment its record lands.
+        self.share_keys(store, info)?;
         // Named by another admin's record: that admin's file carries it.
-        if authority.team_keys(&records).contains(&named)
-            && !authority.keys_by(&records, &me).contains(&named)
-        {
-            return Ok(warnings);
+        let mine = authority.keys_by(&records, &me).contains(&named);
+        if counts && !mine {
+            store.set_local_note(NOTE_PUBLISHED_KEY, &pair)?;
+            return Ok(());
         }
         let record = Record::team_key(self.team_id(info), key, newest.generation, &newest.check);
-        let published = authority.keys_by(&records, &me).contains(&named)
-            && self
-                .authority_file(info, store.peer())?
-                .is_some_and(|file| file.records.iter().any(|text| text == record.text()));
-        if !published {
+        let in_file = self
+            .authority_file(info, store.peer())?
+            .is_some_and(|file| file.records.iter().any(|text| text == record.text()));
+        if !mine || !in_file {
             self.write_authority(store, info, &record)?;
         }
-        Ok(warnings)
+        store.set_local_note(NOTE_PUBLISHED_KEY, &pair)?;
+        Ok(())
     }
 
     /// Encrypted signed team: the newest team key this machine holds, and the newest one the team
