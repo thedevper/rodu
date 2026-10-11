@@ -1,6 +1,6 @@
 # ADR 0004: Team setup in as few steps as possible
 
-- Status: proposed 2026-10-11
+- Status: accepted 2026-10-11; step 1 built 2026-10-11
 
 ## Context
 
@@ -144,6 +144,70 @@ Each step ships alone.
    and automatic admission on owner and admin machines. Tests cover a wrong, expired, reused and
    revoked invite, and a request carrying a proof from another workspace.
 3. **The team screen in `rodu web`.**
+
+### Step 1 as built
+
+- **Defaults.** `rodu team create` with no flags makes an encrypted, signed team. Unlike the
+  decision above, `--unsigned` stays as an explicit opt-out, next to `--no-encrypt`: unsigned teams
+  made before this step are still supported, and the opt-out keeps their behaviour reachable and
+  tested. `--signed` is still accepted. `--signed` and `--unsigned` together are refused.
+- **No workspace yet.** `create` runs `init` first. The name comes from `--name`, else `USER` or
+  `USERNAME` (letters, digits, `.`, `_` and `-` kept). The key comes from `--key`, else from the
+  folder's name (its letters and digits in capitals, starting with a letter, at most 10, else
+  `TEAM`). The title comes from `--title`, else the folder's name. It says which name and key it
+  used. A system user name is cut to 34 characters, so that `<name>-agent` fits. The name, key and
+  title are checked, and the chosen Drive folder is checked for another team, before anything is
+  written, so a create that cannot finish leaves no workspace behind.
+- **Inside a workspace.** Run from a folder below a workspace, `create` would share all of that
+  workspace, so it refuses unless given `--yes` (or `RODU_DIR`).
+- **Finding Google Drive** (`crates/rodu/src/drive.rs`) looks at names on disk only:
+  - macOS: `~/Library/CloudStorage/GoogleDrive-<account>/`;
+  - Windows: drive letters D to Z whose root holds `My Drive`, or holds one folder per account
+    that does;
+  - a mirrored `My Drive` in the home folder.
+
+  Under an account it offers `My Drive` and each `Shared drives/<drive>`, with shared drives
+  first. An account whose folders have other names, as in another language, has each of its
+  folders offered as it is, except `Other computers`.
+- **Choosing.** With one location, `create` uses it and says so. With several, it lists them and
+  asks for `--drive <number>`, rather than prompting, so that the same command works in scripts and
+  tests. A prompt can come with the web screen (step 3). Files go in `Rodu/<collection key>`.
+- **Joining.** With no code and a terminal, `join` asks for the code, as `-` does. With no
+  `--name`, it uses the system user name. With no `--folder`, it searches every location
+  breadth-first, at most 4 levels deep and in at most 5,000 folders. It skips hidden folders and
+  `Other computers`, and follows shortcuts. It looks in each location's `Rodu/` folder first, where
+  `create` puts teams, and stops there when the team is found. It looks for a `rodu-team.json`
+  holding the invite's workspace id, and never looks inside a team's folder, unless that file does
+  not read. A match counts only once its real path, with links followed, is inside a location, and
+  a folder reached two ways counts once. None found means a message saying how to get the folder
+  into Drive. Several found means a list and a request for `--folder`. A search cut short by the
+  folder limit never takes a single match on its own, because another could be past the limit: it
+  asks for `--folder`. The join prints the folder it used, so a teammate can see it is the right one.
+  A name already on the team gets a hint to use `--as` from a second machine.
+- **Windows in another language.** An account root is recognised by `My Drive` or by Drive's own
+  `.shortcut-targets-by-id` folder, which keeps its name in every language.
+- **Tests.** The tests use stand-in homes laid out like Drive for desktop's, with no real account.
+  `drive.rs` has unit tests for macOS accounts, drive letters, mirror mode, folder names in another
+  language and the bounded search. `tests/team.rs` covers:
+  - create and join with no folder typed, through a shortcut, then admit, then a card from the
+    teammate arriving;
+  - the list and `--drive`;
+  - no Drive at all, the team's folder not synced yet, and no code given.
+- **Not yet checked on a real account.** The Drive for desktop layout comes from Google's help
+  and common knowledge, not a real install on this machine: mirror mode's location, how Windows
+  shows several accounts, and whether `My Drive` and `Shared drives` keep their English names in
+  other languages. Shared-drive roles also come from Google's help pages: Contributors cannot
+  delete or move files, and Content managers can. The owner checks once by hand on a personal
+  account and on a Workspace account with a shared drive, and any difference becomes a fix.
+- **Known limits.**
+  - Looking at drive letters D to Z on Windows can stall for a moment on a disconnected network
+    drive.
+  - On a Windows developer machine, the tests that run `rodu` look at the real drive letters,
+    because those do not come from `HOME`. They find no team there and write nothing, but they
+    can see a real Drive.
+  - Anyone who can write into a teammate's Drive could plant a `rodu-team.json` with the same
+    workspace id. The join then finds two and asks for `--folder`; an encrypted or signed team's
+    files would not open or check in the planted folder anyway.
 
 ## What this does not do
 
