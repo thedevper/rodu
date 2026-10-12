@@ -461,7 +461,7 @@ async fn adds_a_collection_an_agent_can_then_use() {
         "{made}"
     );
 
-    let plain = parsed(&call(&client, "create_collection", json!({ "key": "DOCS" })).await);
+    let plain = parsed(&call(&client, "create_collection", json!({ "key": "docs" })).await);
     assert_eq!(plain["name"], "DOCS");
 
     let listed = parsed(&call(&client, "list_collections", json!({})).await);

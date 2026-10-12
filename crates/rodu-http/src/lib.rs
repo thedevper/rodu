@@ -616,8 +616,10 @@ impl<S: Store> Ctx<'_, S> {
         input: NewCollectionRequest,
     ) -> Outcome<(StatusCode, serde_json::Value)> {
         check_len("key", &input.key, 20)?;
-        let name = input.name.as_deref().unwrap_or(&input.key);
-        check_len("name", name, 200)?;
+        // Unnamed, it is called by its key as stored: in capitals.
+        let upper = input.key.to_uppercase();
+        let name = input.name.as_deref().unwrap_or(&upper);
+        check_len("name", name, 80)?;
         let made = self.service.create_collection(self.actor, &input.key, name)?;
         ok(StatusCode::CREATED, &collection_view(&made))
     }

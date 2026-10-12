@@ -487,7 +487,9 @@ fn item_command(
                     RoduError::invalid("collection add needs a key")
                         .with_hint("e.g. rodu collection add OPS --title \"Operations\"")
                 })?;
-                let name = args.value("title").unwrap_or(key);
+                // Unnamed, it is called by its key as stored: in capitals.
+                let upper = key.to_uppercase();
+                let name = args.value("title").unwrap_or(&upper);
                 let made = ws.service.create_collection(&ws.actor, key, name)?;
                 (io.out)(&format!("Created collection {} ({})", made.key, made.name));
                 Ok(0)
