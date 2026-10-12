@@ -195,6 +195,17 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
                 let target = args.string("target", 1, 2000)?;
                 pretty(&service.link(actor, &reference, &kind, &target)?)
             }
+            "create_collection" => {
+                let key = args.string("key", 1, MAX_COLLECTION)?;
+                let name = args.opt_string("name", 1, 80)?;
+                let made =
+                    service.create_collection(actor, &key, name.as_deref().unwrap_or(&key))?;
+                pretty(&CollectionSummary {
+                    statuses: state_names(&made.workflow),
+                    key: made.key,
+                    name: made.name,
+                })
+            }
             "list_collections" => {
                 let collections: Vec<CollectionSummary> = service
                     .list_collections()?
@@ -635,6 +646,19 @@ fn tools(max_batch: usize) -> Vec<Tool> {
                     "target": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "Item key, or the PR URL for implements_pr" },
                 }),
                 &["ref", "kind", "target"],
+            ),
+            write.clone(),
+        ),
+        tool(
+            "create_collection",
+            "Create collection",
+            "Add a collection: a project with its own card numbers (KEY-1, KEY-2) and the default workflow. Everyone on the workspace's team sees it.".into(),
+            object(
+                json!({
+                    "key": { "type": "string", "minLength": 2, "maxLength": 10, "pattern": "^[A-Za-z][A-Za-z0-9]{1,9}$", "description": "Card key prefix, e.g. OPS; stored in capitals" },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "Shown name; defaults to the key" },
+                }),
+                &["key"],
             ),
             write.clone(),
         ),

@@ -281,6 +281,47 @@ async fn creates_lists_moves_and_comments_on_items() {
 }
 
 #[tokio::test]
+async fn adds_a_collection_and_moves_the_revision() {
+    let f = fixture().await;
+    let s = &f.server;
+    let before = send(s, "GET", "/api/revision", none()).await.json()["revision"].clone();
+    let made =
+        send(s, "POST", "/api/collections", body(json!({ "key": "web", "name": "Website" }))).await;
+    assert_eq!(made.status, 201, "{}", made.body);
+    assert_eq!(made.json()["key"], "WEB");
+    assert_eq!(made.json()["name"], "Website");
+    assert!(made.json()["states"].as_array().is_some_and(|s| !s.is_empty()));
+    let after = send(s, "GET", "/api/revision", none()).await.json()["revision"].clone();
+    assert_ne!(before, after, "the board learns of the new collection");
+
+    let listed = send(s, "GET", "/api/collections", none()).await.json();
+    let keys: Vec<&str> =
+        listed.as_array().unwrap().iter().filter_map(|c| c["key"].as_str()).collect();
+    assert_eq!(keys, ["DEMO", "OPS", "WEB"]);
+    let card = body(json!({ "collection": "WEB", "item": { "title": "Landing page" } }));
+    assert_eq!(send(s, "POST", "/api/items", card).await.json()["key"], "WEB-1");
+
+    let named_by_key = send(s, "POST", "/api/collections", body(json!({ "key": "DOCS" }))).await;
+    assert_eq!(named_by_key.status, 201, "{}", named_by_key.body);
+    assert_eq!(named_by_key.json()["name"], "DOCS");
+
+    let taken =
+        send(s, "POST", "/api/collections", body(json!({ "key": "ops", "name": "x" }))).await;
+    assert_eq!(taken.status, 409, "{}", taken.body);
+    for bad in [
+        json!({ "key": "1x" }),
+        json!({ "key": "TOOLONGKEY1" }),
+        json!({ "name": "no key" }),
+        json!({ "key": "OK", "name": "" }),
+        json!({ "key": "OK", "extra": 1 }),
+    ] {
+        let refused = send(s, "POST", "/api/collections", body(bad.clone())).await;
+        assert_eq!(refused.status, 400, "{bad}: {}", refused.body);
+    }
+    assert_eq!(send(s, "DELETE", "/api/collections", none()).await.status, 405);
+}
+
+#[tokio::test]
 async fn maps_workflow_refusals_to_422_with_the_hint() {
     let f = fixture().await;
     let s = &f.server;

@@ -400,3 +400,42 @@ async fn the_board_keeps_serving_when_nothing_reads_its_output() {
     let _ = child.wait();
     assert!(served.contains("<title>Rodu</title>"), "exited: {exited:?}, served: {served:?}");
 }
+
+#[tokio::test]
+async fn adds_and_lists_collections_after_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    init(cwd).await;
+
+    let made = cli(cwd, &["collection", "add", "ops", "--title", "Operations"]).await;
+    assert_eq!(made.code, 0, "{:?}", made.err);
+    assert_eq!(made.last_out(), "Created collection OPS (Operations)");
+
+    let plain = cli(cwd, &["collection", "add", "WEB"]).await;
+    assert_eq!(plain.code, 0, "{:?}", plain.err);
+    assert_eq!(plain.last_out(), "Created collection WEB (WEB)");
+
+    let listed = cli(cwd, &["collections"]).await;
+    assert_eq!(listed.code, 0);
+    assert_eq!(listed.out, ["DEMO  DEMO", "OPS  Operations", "WEB  WEB"]);
+
+    let added = cli(cwd, &["add", "Rotate", "keys", "--collection", "ops"]).await;
+    assert_eq!(added.code, 0, "{:?}", added.err);
+    assert_eq!(added.last_out(), "OPS-1 [Backlog] Rotate keys");
+
+    let again = cli(cwd, &["collection", "add", "OPS"]).await;
+    assert_ne!(again.code, 0);
+    assert!(again.err.join("\n").contains("Collection OPS already exists"), "{:?}", again.err);
+
+    let bad = cli(cwd, &["collection", "add", "1x"]).await;
+    assert_ne!(bad.code, 0);
+    assert!(bad.err.join("\n").contains("Invalid collection key"), "{:?}", bad.err);
+
+    let missing = cli(cwd, &["collection", "add"]).await;
+    assert_ne!(missing.code, 0);
+    assert!(missing.err.join("\n").contains("collection add needs a key"), "{:?}", missing.err);
+
+    let unknown = cli(cwd, &["collection", "drop", "OPS"]).await;
+    assert_ne!(unknown.code, 0);
+    assert!(unknown.err.join("\n").contains("Unknown collection command"), "{:?}", unknown.err);
+}

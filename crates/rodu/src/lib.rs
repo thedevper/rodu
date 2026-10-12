@@ -35,6 +35,8 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   ls [query] [--limit 50]    list items (JQL-lite, e.g. \"assignee = me() ORDER BY priority\")
   show <key>                 item with its context
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
+  collections                the collections in this workspace, key and name
+  collection add <KEY> [--title <name>]   add a collection (a project with its own card numbers)
   mcp                        serve MCP over stdio for your agent
   web [--port 4870] [--no-open]   open the kanban board in your browser (local only)
   team [--show-invite]       where this workspace syncs, and its invite code
@@ -415,7 +417,7 @@ async fn command_result(
             team::after_reopen(io, true);
             served.map(|()| 0)
         }
-        "add" | "ls" | "show" | "mv" => {
+        "add" | "ls" | "show" | "mv" | "collection" | "collections" => {
             let ws = open(io, false)?;
             team::before(io, &ws);
             let result = item_command(command, rest, args, &ws, io);
@@ -473,6 +475,29 @@ fn item_command(
             }
             Ok(0)
         }
+        "collections" => {
+            for c in ws.service.list_collections()? {
+                (io.out)(&format!("{}  {}", c.key, c.name));
+            }
+            Ok(0)
+        }
+        "collection" => match rest.first().map(String::as_str) {
+            Some("add") => {
+                let key = rest.get(1).ok_or_else(|| {
+                    RoduError::invalid("collection add needs a key")
+                        .with_hint("e.g. rodu collection add OPS --title \"Operations\"")
+                })?;
+                let name = args.value("title").unwrap_or(key);
+                let made = ws.service.create_collection(&ws.actor, key, name)?;
+                (io.out)(&format!("Created collection {} ({})", made.key, made.name));
+                Ok(0)
+            }
+            other => Err(RoduError::invalid(format!(
+                "Unknown collection command \"{}\"",
+                other.unwrap_or_default()
+            ))
+            .with_hint("rodu collections, rodu collection add <KEY> [--title <name>]")),
+        },
         "show" => {
             let key = rest.first().ok_or_else(|| RoduError::invalid("show needs an item key"))?;
             (io.out)(&ws.service.context(key, None)?);

@@ -74,6 +74,12 @@ rodu web        # opens the board in your browser
 `init` creates `.rodu/` (database and `config.json`) in the current directory. Commands use the
 nearest `.rodu/` above the working directory, or `$RODU_DIR`.
 
+A workspace can hold several collections, each with its own card numbers (DEMO-1, OPS-1):
+`rodu collection add OPS --title "Operations"`, the **+** beside the collection list on the board,
+or the `create_collection` MCP tool. `rodu collections` lists them, and `rodu add ... --collection
+OPS` puts a card there. Everyone on a workspace's team sees all of its collections; for work that
+needs different people, make a separate workspace in its own folder.
+
 ## Web board
 
 `rodu web` serves the board on `127.0.0.1` only (port 4870, or `--port`) and opens
@@ -143,7 +149,7 @@ claude mcp add rodu -- rodu mcp
 ```
 
 Tools: `search`, `get_my_work`, `get_context`, `create_items`, `update_item`, `transition`,
-`comment`, `link`, `list_collections`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
+`comment`, `link`, `list_collections`, `create_collection`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
 Every change an agent makes is recorded as "owner via agent". Workflow rules are enforced in the
 domain, and refusals carry a hint the agent can act on.
 
