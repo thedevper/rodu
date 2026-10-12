@@ -94,6 +94,22 @@ fn a_team_shares_one_board_through_a_folder() {
 }
 
 #[test]
+fn a_collection_added_on_one_machine_reaches_the_others() {
+    let team = team();
+    let bob = join(&team, "bob");
+    assert_eq!(
+        ok(&bob, &["collection", "add", "OPS", "--title", "Operations"]).trim(),
+        "Created collection OPS (Operations)"
+    );
+    ok(&bob, &["add", "Rotate keys", "--collection", "OPS"]);
+    // ann takes the collection in with the card and numbers it there.
+    let listed = ok(&team.ann, &["collections"]);
+    assert!(listed.contains("OPS  Operations"), "{listed}");
+    assert!(ok(&team.ann, &["ls"]).contains("OPS-1"), "the card is numbered in OPS");
+    assert!(ok(&bob, &["ls"]).contains("OPS-1"), "bob sees the number");
+}
+
+#[test]
 fn create_refuses_contradicting_choices_and_a_second_team() {
     let root = tempfile::tempdir().unwrap();
     let ann = root.path().join("ann");
@@ -606,9 +622,15 @@ fn a_running_board_stops_numbering_when_the_role_moves() {
         assert!(std::time::Instant::now() < deadline, "ann's board never gave up numbering");
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+    // The note is written just after the config: wait for it before stopping the board.
+    let stderr = team.ann.join("web-stderr.txt");
+    let said = || std::fs::read_to_string(&stderr).unwrap_or_default();
+    while !said().contains("numbering moved to machine") {
+        assert!(std::time::Instant::now() < deadline, "no note: {}", said());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     drop(board);
-    let said = std::fs::read_to_string(team.ann.join("web-stderr.txt")).unwrap();
-    assert_eq!(said.matches("numbering moved to machine").count(), 1, "{said}");
+    assert_eq!(said().matches("numbering moved to machine").count(), 1, "{}", said());
 }
 
 // --- the readable copy ---

@@ -63,6 +63,10 @@ fn Workspace(api: Api) -> impl IntoView {
     let notice = RwSignal::new(None::<ApiError>);
     let selected = RwSignal::new(None::<String>);
     let team_open = RwSignal::new(false);
+    // The small form for a new collection, open beside the collection list.
+    let adding = RwSignal::new(false);
+    let new_key = RwSignal::new(String::new());
+    let new_name = RwSignal::new(String::new());
 
     spawn_local(async move {
         let loaded = async {
@@ -92,6 +96,8 @@ fn Workspace(api: Api) -> impl IntoView {
     let seen = StoredValue::new(None::<u64>);
     // The same, for the open card: it reads itself again when this moves.
     let revision = RwSignal::new(None::<u64>);
+    // The revision the collection list was last read at: a failed read is tried again next time.
+    let listed_at = StoredValue::new(None::<u64>);
     // The open card has a description that is not saved yet.
     let unsaved = RwSignal::new(false);
     let may_leave_card = move || {
@@ -111,6 +117,15 @@ fn Workspace(api: Api) -> impl IntoView {
             seen.set_value(Some(now));
             if revision.get_untracked() != Some(now) {
                 revision.set(Some(now));
+            }
+            // A collection made elsewhere (the CLI, an agent, a teammate) joins the list.
+            if listed_at.get_value() != Some(now)
+                && let Ok(cols) = api.collections().await
+            {
+                listed_at.set_value(Some(now));
+                if collections.with_untracked(|have| *have != cols) {
+                    collections.set(cols);
+                }
             }
         }
         let result = api.board(&collection, &q).await;
@@ -163,6 +178,35 @@ fn Workspace(api: Api) -> impl IntoView {
         remember(LAST_COLLECTION, &key);
         collection_key.set(Some(key));
         selected.set(None);
+    };
+
+    let close_adding = move || {
+        adding.set(false);
+        new_key.set(String::new());
+        new_name.set(String::new());
+    };
+    let add_collection = move |event: ev::SubmitEvent| {
+        event.prevent_default();
+        let key = new_key.get_untracked().trim().to_string();
+        let name = new_name.get_untracked().trim().to_string();
+        if key.is_empty() || !may_leave_card() {
+            return;
+        }
+        spawn_local(async move {
+            let name = (!name.is_empty()).then_some(name.as_str());
+            match api.create_collection(&key, name).await {
+                Ok(made) => {
+                    if let Ok(cols) = api.collections().await {
+                        collections.set(cols);
+                    } else {
+                        collections.update(|cols| cols.push(made.clone()));
+                    }
+                    close_adding();
+                    choose_collection(made.key);
+                }
+                Err(e) => notice.set(Some(e)),
+            }
+        });
     };
 
     let apply_filter = move |event: ev::SubmitEvent| {
@@ -262,6 +306,45 @@ fn Workspace(api: Api) -> impl IntoView {
                             .collect_view()
                     }}
                 </select>
+                <button
+                    type="button"
+                    class="ghost add-collection"
+                    aria-label="New collection"
+                    title="New collection"
+                    aria-expanded=move || adding.get().to_string()
+                    on:click=move |_| {
+                        if adding.get_untracked() { close_adding() } else { adding.set(true) }
+                    }
+                >
+                    "+"
+                </button>
+                <Show when=move || adding.get()>
+                    <form class="new-collection" on:submit=add_collection>
+                        <input
+                            aria-label="Collection key"
+                            placeholder="KEY"
+                            maxlength="10"
+                            autocomplete="off"
+                            spellcheck="false"
+                            autofocus
+                            prop:value=move || new_key.get()
+                            on:input=move |e| new_key.set(event_target_value(&e).to_uppercase())
+                        />
+                        <input
+                            aria-label="Collection name"
+                            placeholder="Name"
+                            maxlength="80"
+                            prop:value=move || new_name.get()
+                            on:input=move |e| new_name.set(event_target_value(&e))
+                        />
+                        <button type="submit" disabled=move || new_key.with(|k| k.trim().is_empty())>
+                            "Create"
+                        </button>
+                        <button type="button" class="ghost" on:click=move |_| close_adding()>
+                            "Cancel"
+                        </button>
+                    </form>
+                </Show>
                 <form class="filter" on:submit=apply_filter>
                     <input
                         aria-label="Filter"
