@@ -602,6 +602,139 @@ fn SharePanel(api: Api, why: ApiError, on_error: Callback<ApiError>) -> impl Int
     }
 }
 
+/// Where a join stands.
+#[derive(Clone)]
+enum Join {
+    Form,
+    Joining,
+    /// Joined, with what the join said; `back` once the board reopened on the new workspace.
+    Joined {
+        message: String,
+        back: bool,
+    },
+    Gone,
+}
+
+/// Joins a team with an invite, where `rodu web` found no workspace (ADR 0004, step 3b).
+#[component]
+pub fn JoinScreen(api: Api) -> impl IntoView {
+    let state = RwSignal::new(Join::Form);
+    let code = RwSignal::new(String::new());
+    let name = RwSignal::new(String::new());
+    let again = RwSignal::new(false);
+    let failed = RwSignal::new(None::<ApiError>);
+
+    let join = move |e: ev::SubmitEvent| {
+        e.prevent_default();
+        let typed = code.get_untracked();
+        if typed.trim().is_empty() {
+            return;
+        }
+        state.set(Join::Joining);
+        failed.set(None);
+        spawn_local(async move {
+            match api.join(&typed, &name.get_untracked(), again.get_untracked()).await {
+                Ok(done) => {
+                    // The invite is not kept on the page once it did its work.
+                    code.try_set(String::new());
+                    // What the join said stays on screen: it holds this machine's code to read
+                    // out to the team's owner, which a reload would lose.
+                    state.try_set(Join::Joined { message: done.message.clone(), back: false });
+                    let next = match wait_for_reopen(api).await {
+                        Reopen::Back | Reopen::Never => {
+                            Join::Joined { message: done.message, back: true }
+                        }
+                        Reopen::Gone => Join::Gone,
+                    };
+                    state.try_set(next);
+                }
+                Err(e) => {
+                    failed.try_set(Some(e));
+                    state.try_set(Join::Form);
+                }
+            }
+        });
+    };
+
+    view! {
+        <main class="empty-state join">
+            <h1>"Rodu"</h1>
+            {move || match state.get() {
+                Join::Form | Join::Joining => {
+                    let busy = matches!(state.get(), Join::Joining);
+                    view! {
+                        <p>"There is no board in this folder yet. Join your team's board with the invite a teammate sent you."</p>
+                        <form class="join-form" on:submit=join>
+                            <label>
+                                <span>"Invite"</span>
+                                <textarea
+                                    rows="3"
+                                    autocomplete="off"
+                                    spellcheck="false"
+                                    placeholder="rodu2-…"
+                                    prop:value=move || code.get()
+                                    on:input=move |e| code.set(event_target_value(&e))
+                                ></textarea>
+                            </label>
+                            <label>
+                                <span>"Your name on the team"</span>
+                                <input
+                                    type="text"
+                                    autocomplete="off"
+                                    placeholder="The invite's name, or this computer's user"
+                                    prop:value=move || name.get()
+                                    on:input=move |e| name.set(event_target_value(&e))
+                                />
+                            </label>
+                            <label class="join-again">
+                                <input
+                                    type="checkbox"
+                                    prop:checked=move || again.get()
+                                    on:change=move |e| again.set(event_target_checked(&e))
+                                />
+                                <span>"I am already on this team, joining from another computer"</span>
+                            </label>
+                            {move || failed.get().map(|e| view! {
+                                <div class="team-none" role="alert">
+                                    <p>{e.message}</p>
+                                    {e.hint.map(|hint| view! { <pre>{hint}</pre> })}
+                                </div>
+                            })}
+                            <button type="submit" disabled=busy>{if busy { "Joining…" } else { "Join" }}</button>
+                        </form>
+                        <p class="muted">"The invite holds the team's key: it stays on this computer. To start a board of your own instead, run in a terminal here: rodu init"</p>
+                    }
+                        .into_any()
+                }
+                Join::Joined { message, back } => {
+                    view! {
+                        <p class="team-done join-done" role="status">{message}</p>
+                        {if back {
+                            view! {
+                                <button type="button" on:click=move |_| {
+                                    let _ = window().location().reload();
+                                }>"Open the board"</button>
+                            }
+                                .into_any()
+                        } else {
+                            view! { <p class="loading">"Opening the board…"</p> }.into_any()
+                        }}
+                    }
+                        .into_any()
+                }
+                Join::Gone => {
+                    view! {
+                        <div class="team-none" role="alert">
+                            <p>"The board did not come back. Check the terminal running rodu web, then start it again if it stopped."</p>
+                        </div>
+                    }
+                        .into_any()
+                }
+            }}
+        </main>
+    }
+}
+
 /// How the server behaved after a share.
 enum Reopen {
     /// It went away and came back: it reopened.

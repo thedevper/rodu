@@ -155,6 +155,7 @@ async fn fixture() -> Fixture {
         live: None,
         team: None,
         sharing: None,
+        joining: None,
     })
     .await
     .unwrap();
@@ -479,6 +480,7 @@ async fn serves_files_held_in_memory_as_the_single_binary_does() {
         live: None,
         team: None,
         sharing: None,
+        joining: None,
     })
     .await
     .unwrap();
@@ -513,6 +515,7 @@ async fn without_a_ui_serves_only_the_api() {
         live: None,
         team: None,
         sharing: None,
+        joining: None,
     })
     .await
     .unwrap();
@@ -576,6 +579,7 @@ async fn live_server(sync: std::sync::Arc<FakeSync>) -> RunningServer {
         live: Some(LiveOptions { sync, every: std::time::Duration::from_millis(40) }),
         team: None,
         sharing: None,
+        joining: None,
     })
     .await
     .unwrap()
@@ -746,6 +750,7 @@ async fn sharing_server(
         live: Some(LiveOptions { sync, every: std::time::Duration::from_secs(3600) }),
         team: team.map(|t| t as std::sync::Arc<dyn rodu_http::TeamPanel<SqliteStore>>),
         sharing: sharing.map(|t| t as std::sync::Arc<dyn rodu_http::Sharing<SqliteStore>>),
+        joining: None,
     })
     .await
     .unwrap()
@@ -837,6 +842,7 @@ async fn the_revision_counts_writes_another_process_makes_to_the_same_workspace(
         live: None,
         team: None,
         sharing: None,
+        joining: None,
     })
     .await
     .unwrap();
@@ -1015,4 +1021,115 @@ async fn a_request_waiting_behind_a_share_is_refused_rather_than_served_from_the
     assert_eq!(share.await.unwrap().status, 200);
     assert_eq!(late.status, 503, "{}", late.body);
     assert_eq!(late.json()["code"], "reopening");
+}
+
+// --- joining a team where there is no workspace yet ---
+
+/// The invite `good` joins; any other is refused with nothing made.
+#[derive(Default)]
+struct FakeJoining {
+    calls: Mutex<Vec<String>>,
+}
+
+impl rodu_http::Joining for FakeJoining {
+    fn join(
+        &self,
+        request: &rodu_api::JoinRequest,
+    ) -> (rodu_core::Result<rodu_api::TeamDone>, bool) {
+        let who = request.name.as_deref().or(request.as_name.as_deref()).unwrap_or("-");
+        self.calls.lock().unwrap().push(format!("join {} {who}", request.code));
+        match request.code.as_str() {
+            "good" => (Ok(rodu_api::TeamDone { message: "Joined the team".into() }), true),
+            _ => (Err(rodu_core::RoduError::invalid("not an invite")), false),
+        }
+    }
+}
+
+async fn joining_server(joining: std::sync::Arc<FakeJoining>) -> RunningServer {
+    start_web_server(WebServerOptions {
+        service: RoduService::new(SqliteStore::memory().unwrap()),
+        actor: Actor { principal_id: String::new(), via_agent_id: None },
+        port: 0,
+        dist_dir: None,
+        files: None,
+        token: Some(TOKEN.into()),
+        live: None,
+        team: None,
+        sharing: None,
+        joining: Some(joining),
+    })
+    .await
+    .unwrap()
+}
+
+fn join_body(body: Value) -> Opts<'static> {
+    Opts { body: Some(body), ..Opts::default() }
+}
+
+#[tokio::test]
+async fn with_no_workspace_only_the_join_is_served() {
+    let joining = std::sync::Arc::new(FakeJoining::default());
+    let s = joining_server(joining.clone()).await;
+    for (method, path) in [
+        ("GET", "/api/me"),
+        ("GET", "/api/collections"),
+        ("GET", "/api/board?collection=X"),
+        ("GET", "/api/revision"),
+        ("GET", "/api/team"),
+        ("GET", "/api/team/places"),
+    ] {
+        let reply = send(&s, method, path, none()).await;
+        assert_eq!(reply.status, 404, "{path}: {}", reply.body);
+        assert_eq!(reply.json()["code"], "no_workspace", "{path}");
+    }
+    let made = Opts { body: Some(json!({"title": "nowhere"})), ..Opts::default() };
+    assert_eq!(send(&s, "POST", "/api/items", made).await.json()["code"], "no_workspace");
+    assert!(joining.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_join_that_went_through_asks_to_reopen_and_a_refused_one_does_not() {
+    let joining = std::sync::Arc::new(FakeJoining::default());
+    let s = joining_server(joining.clone()).await;
+    let reply = send(&s, "POST", "/api/team/join", join_body(json!({"code": "bad"}))).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(!reopen_asked(&s).await);
+    assert_eq!(send(&s, "GET", "/api/me", none()).await.json()["code"], "no_workspace");
+
+    let body = json!({"code": "good", "name": "bob"});
+    let reply = send(&s, "POST", "/api/team/join", join_body(body)).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.json()["message"], "Joined the team");
+    assert!(reopen_asked(&s).await);
+    // Joined once: a second join is not run on top of it.
+    let again = json!({"code": "good", "as": "bob"});
+    let reply = send(&s, "POST", "/api/team/join", join_body(again)).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["code"], "reopening");
+    assert_eq!(*joining.calls.lock().unwrap(), ["join bad -", "join good bob"]);
+}
+
+#[tokio::test]
+async fn the_join_route_needs_the_token_the_right_method_and_a_known_body() {
+    let joining = std::sync::Arc::new(FakeJoining::default());
+    let s = joining_server(joining.clone()).await;
+    let no_token =
+        Opts { headers: vec![("Authorization", "")], ..join_body(json!({"code": "good"})) };
+    assert_eq!(send(&s, "POST", "/api/team/join", no_token).await.status, 401);
+    assert_eq!(send(&s, "GET", "/api/team/join", none()).await.status, 405);
+    for body in
+        [json!({"code": "good", "folder": "/tmp"}), json!({"name": "bob"}), json!({"code": 7})]
+    {
+        assert_eq!(send(&s, "POST", "/api/team/join", join_body(body)).await.status, 400);
+    }
+    assert!(joining.calls.lock().unwrap().is_empty(), "nothing reached the join");
+    assert!(!reopen_asked(&s).await);
+}
+
+#[tokio::test]
+async fn a_board_that_is_there_is_not_joined_over() {
+    let s = sharing_server(None, None, std::sync::Arc::default()).await;
+    let reply = send(&s, "POST", "/api/team/join", join_body(json!({"code": "good"}))).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(!reopen_asked(&s).await);
 }

@@ -1874,3 +1874,63 @@ fn a_share_that_stops_half_way_reopens_the_board_and_a_second_share_carries_on()
     assert!(board.get("/api/board?collection=DEMO").contains("Made before sharing"));
     assert!(my_drive.join("Rodu/DEMO/rodu-team.json").is_file());
 }
+
+// --- joining a team from rodu web where there is no workspace yet (ADR 0004, step 3b) -----------
+
+#[test]
+fn rodu_web_with_no_workspace_joins_a_team_and_reopens_as_its_board_on_the_same_link() {
+    let root = tempfile::tempdir().unwrap();
+    let ann_home = root.path().join("home-ann");
+    let ann_drive = drive_home(&ann_home, "ann@example.com");
+    let board = root.path().join("Board");
+    std::fs::create_dir_all(&board).unwrap();
+    ok_at(&board, &ann_home, "ann", &["team", "create"]);
+    let code = ok_at(&board, &ann_home, "ann", &["team", "--show-invite"])
+        .lines()
+        .find_map(|l| l.strip_prefix("Invite code: ").map(str::to_owned))
+        .expect("an invite code");
+    ok_at(&board, &ann_home, "ann", &["add", "From ann"]);
+    let bob_home = root.path().join("home-bob");
+    let bob_drive = drive_home(&bob_home, "bob@example.org");
+    copy_dir(&ann_drive.join("Rodu/BOARD"), &bob_drive.join("From ann/Rodu/BOARD"));
+
+    let bob = root.path().join("bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    let env =
+        [("HOME", bob_home.as_path()), ("USERPROFILE", &bob_home), ("USER", Path::new("bob"))];
+    let web = start_board_with(&bob, &env);
+    printed_until(&web, "No Rodu board in", 1);
+    assert!(web.get("/api/me").contains("no_workspace"));
+
+    // A code that is not an invite changes nothing, and the page can try again.
+    let body = |code: &str| serde_json::json!({ "code": code }).to_string();
+    let (status, refused) = web.post("/api/team/join", &body("rodu2-not-an-invite"));
+    assert_eq!(status, 400, "{refused}");
+    assert!(!bob.join(".rodu").exists(), "a refused join leaves no workspace");
+    assert!(web.get("/api/me").contains("no_workspace"));
+
+    let (status, joined) = web.post("/api/team/join", &body(&code));
+    assert_eq!(status, 200, "{joined}");
+    let message = json_field(&joined, "message");
+    assert!(message.contains("Joined the team") && message.contains("as bob"), "{message}");
+    assert!(message.contains("This machine's code: "), "to read out to ann: {message}");
+    assert!(!joined.contains(&code), "the invite is never sent back: {joined}");
+
+    // The same link and token reach bob's new board.
+    printed_until(&web, "Reopened the board", 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !web.get("/api/me").contains("bob") {
+        assert!(std::time::Instant::now() < deadline, "the board never came back");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(web.get("/api/board?collection=BOARD").contains("From ann"));
+    let team: serde_json::Value = serde_json::from_str(&web.get("/api/team")).unwrap();
+    assert_eq!(team["signed"], true, "{team}");
+    let (status, again) = web.post("/api/team/join", &body(&code));
+    assert_eq!(status, 409, "{again}");
+    let printed = web.printed.lock().unwrap().join("\n");
+    let errors = std::fs::read_to_string(bob.join("web-stderr.txt")).unwrap();
+    for text in [&printed, &errors] {
+        assert!(!text.contains(&code), "the invite stays out of the terminal: {text}");
+    }
+}
