@@ -473,9 +473,14 @@ fn SharePanel(api: Api, why: ApiError, on_error: Callback<ApiError>) -> impl Int
         }
         state.set(Share::Sharing);
         spawn_local(async move {
-            match api.share(&place.path).await {
-                Ok(done) => {
-                    state.try_set(Share::Reopening(done.message));
+            // A 503 means another tab's share is already reopening the board: wait for it the same way.
+            let shared = match api.share(&place.path).await {
+                Err(e) if e.status == 503 => Ok(e.message),
+                other => other.map(|done| done.message),
+            };
+            match shared {
+                Ok(message) => {
+                    state.try_set(Share::Reopening(message));
                     // Shared: the board comes back on the same link, as a team's.
                     match wait_for_reopen(api).await {
                         Reopen::Back | Reopen::Never => {
