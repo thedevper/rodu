@@ -44,6 +44,7 @@ impl Store for AnyStore {
     delegate! {
         fn insert_principal(&self, principal: &Principal) -> Result<()>;
         fn find_principal(&self, id_or_name: &str) -> Result<Option<Principal>>;
+        fn data_version(&self) -> Result<u64>;
         fn list_principals(&self) -> Result<Vec<Principal>>;
         fn insert_collection(&self, collection: &Collection) -> Result<()>;
         fn find_collection(&self, id_or_key: &str) -> Result<Option<Collection>>;

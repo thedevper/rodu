@@ -1,8 +1,9 @@
 //! Rodu's web board: a Leptos client-side app compiled to WebAssembly and served by `rodu web`.
 //!
-//! [`board`] holds the pure logic and builds anywhere; the UI itself only exists on `wasm32`.
+//! [`board`] and [`markdown`] hold the pure logic and builds anywhere; the UI itself only exists on `wasm32`.
 
 pub mod board;
+pub mod markdown;
 
 #[cfg(target_arch = "wasm32")]
 mod api;

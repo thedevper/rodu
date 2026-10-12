@@ -1633,6 +1633,11 @@ impl Store for LoroStore {
         self.write(|| self.sql.insert_principal(p), |_| Some(Change::Principal(p.clone())))
     }
 
+    fn data_version(&self) -> Result<u64> {
+        // Another process's writes all go through the index, so its counter covers them.
+        self.sql.data_version()
+    }
+
     fn find_principal(&self, id_or_name: &str) -> Result<Option<Principal>> {
         self.sql.find_principal(id_or_name)
     }
