@@ -51,6 +51,9 @@ scoop update rodu    # later, to update
 
 Use one of the two: both on the PATH means two copies to keep up to date.
 
+Joining a team on Windows, step by step: [docs/guides/windows.md](docs/guides/windows.md)
+([ภาษาไทย](docs/guides/windows.th.md)).
+
 ### About the scripts
 
 The script URLs name a release tag, so they run that release's reviewed script; each checks the
