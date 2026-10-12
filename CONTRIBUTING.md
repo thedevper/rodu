@@ -52,3 +52,4 @@ cargo xtask notices  # when dependencies change
 cargo audit --deny warnings
 cargo xtask web      # when the web board changes
 ```
+
