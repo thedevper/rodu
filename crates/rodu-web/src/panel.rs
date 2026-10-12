@@ -127,7 +127,9 @@ pub fn ItemPanel(
     });
     let dirty =
         move || editing.get() && draft.with(|d| *d != draft_base.with_value(|b| b.0.clone()));
-    Effect::new(move |_| unsaved.set(dirty()));
+    // A comment typed but not sent counts too, so leaving the card asks first.
+    let unsent = move || comment.with(|c| !c.trim().is_empty());
+    Effect::new(move |_| unsaved.set(dirty() || unsent()));
     on_cleanup(move || unsaved.set(false));
 
     let key = StoredValue::new(item_key);
@@ -218,7 +220,11 @@ pub fn ItemPanel(
     let close = move || {
         if dirty() {
             leaving.set(true);
-        } else {
+        } else if !unsent()
+            || window()
+                .confirm_with_message("The comment is not sent. Discard it?")
+                .unwrap_or(false)
+        {
             on_close.run(());
         }
     };

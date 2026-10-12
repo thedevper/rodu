@@ -98,7 +98,7 @@ fn Workspace(api: Api) -> impl IntoView {
         !unsaved.get_untracked()
             || window()
                 .confirm_with_message(
-                    "The description has changes that are not saved. Discard them?",
+                    "This card has a description or comment that is not saved. Discard it?",
                 )
                 .unwrap_or(false)
     };
