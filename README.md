@@ -9,17 +9,54 @@ machine, and agents are first-class users through MCP.
 ## Install
 
 One self-contained `rodu` binary (SQLite and the web board are inside); nothing else to install.
+Builds exist for macOS (Apple silicon and Intel) and Windows x64, which also runs on Windows on
+ARM. Other platforms can build from source.
 
-| | |
-|---|---|
-| macOS | `curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.5.0/packaging/install.sh \| sh` |
-| Windows (PowerShell) | `irm https://raw.githubusercontent.com/TheDevper/rodu/v0.5.0/packaging/install.ps1 \| iex` |
+### macOS
 
-The script URLs name a release tag, so they run that release's reviewed script. Builds exist for
-macOS (Apple silicon and Intel) and Windows x64, which also runs on Windows on ARM. Other
-platforms can build from source. The binaries are not signed with a paid certificate: the scripts
-install without a prompt, but a binary downloaded through a browser gets a Gatekeeper or
-SmartScreen warning.
+```sh
+brew install thedevper/tap/rodu
+```
+
+Or without Homebrew:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.5.0/packaging/install.sh | sh
+```
+
+Update with `brew upgrade rodu`, or by running the script again.
+
+### Windows
+
+In PowerShell (5.1 or 7; no administrator needed):
+
+```powershell
+irm https://raw.githubusercontent.com/TheDevper/rodu/v0.5.0/packaging/install.ps1 | iex
+```
+
+It puts `rodu.exe` in `%LOCALAPPDATA%\Programs\rodu` and adds that folder to your PATH. Open a new
+terminal afterwards, then check with `rodu --version`.
+
+To update, run the same command again: it installs the latest release. It works while `rodu web`
+or `rodu mcp` is running; restart them to use the new version. `$env:RODU_VERSION = '0.5.0'`
+before the command installs a given release instead.
+
+Or with [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add thedevper https://github.com/TheDevper/scoop-bucket
+scoop install rodu
+scoop update rodu    # later, to update
+```
+
+Use one of the two: both on the PATH means two copies to keep up to date.
+
+### About the scripts
+
+The script URLs name a release tag, so they run that release's reviewed script; each checks the
+download against the release's `SHA256SUMS`. The binaries are not signed with a paid certificate:
+the scripts, Homebrew and Scoop install without a prompt, but a binary downloaded through a browser
+gets a Gatekeeper or SmartScreen warning.
 
 ## Quick start
 
