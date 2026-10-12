@@ -198,8 +198,10 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
             "create_collection" => {
                 let key = args.string("key", 1, MAX_COLLECTION)?;
                 let name = args.opt_string("name", 1, 80)?;
+                // Unnamed, it is called by its key as stored: in capitals.
+                let upper = key.to_uppercase();
                 let made =
-                    service.create_collection(actor, &key, name.as_deref().unwrap_or(&key))?;
+                    service.create_collection(actor, &key, name.as_deref().unwrap_or(&upper))?;
                 pretty(&CollectionSummary {
                     statuses: state_names(&made.workflow),
                     key: made.key,

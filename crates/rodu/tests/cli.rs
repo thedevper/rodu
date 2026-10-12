@@ -411,7 +411,7 @@ async fn adds_and_lists_collections_after_init() {
     assert_eq!(made.code, 0, "{:?}", made.err);
     assert_eq!(made.last_out(), "Created collection OPS (Operations)");
 
-    let plain = cli(cwd, &["collection", "add", "WEB"]).await;
+    let plain = cli(cwd, &["collection", "add", "web"]).await;
     assert_eq!(plain.code, 0, "{:?}", plain.err);
     assert_eq!(plain.last_out(), "Created collection WEB (WEB)");
 

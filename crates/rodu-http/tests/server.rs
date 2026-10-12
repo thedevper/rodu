@@ -301,7 +301,7 @@ async fn adds_a_collection_and_moves_the_revision() {
     let card = body(json!({ "collection": "WEB", "item": { "title": "Landing page" } }));
     assert_eq!(send(s, "POST", "/api/items", card).await.json()["key"], "WEB-1");
 
-    let named_by_key = send(s, "POST", "/api/collections", body(json!({ "key": "DOCS" }))).await;
+    let named_by_key = send(s, "POST", "/api/collections", body(json!({ "key": "docs" }))).await;
     assert_eq!(named_by_key.status, 201, "{}", named_by_key.body);
     assert_eq!(named_by_key.json()["name"], "DOCS");
 
@@ -314,6 +314,7 @@ async fn adds_a_collection_and_moves_the_revision() {
         json!({ "name": "no key" }),
         json!({ "key": "OK", "name": "" }),
         json!({ "key": "OK", "extra": 1 }),
+        json!({ "key": "OK", "name": "n".repeat(81) }),
     ] {
         let refused = send(s, "POST", "/api/collections", body(bad.clone())).await;
         assert_eq!(refused.status, 400, "{bad}: {}", refused.body);

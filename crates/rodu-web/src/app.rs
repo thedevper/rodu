@@ -96,6 +96,8 @@ fn Workspace(api: Api) -> impl IntoView {
     let seen = StoredValue::new(None::<u64>);
     // The same, for the open card: it reads itself again when this moves.
     let revision = RwSignal::new(None::<u64>);
+    // The revision the collection list was last read at: a failed read is tried again next time.
+    let listed_at = StoredValue::new(None::<u64>);
     // The open card has a description that is not saved yet.
     let unsaved = RwSignal::new(false);
     let may_leave_card = move || {
@@ -115,10 +117,13 @@ fn Workspace(api: Api) -> impl IntoView {
             seen.set_value(Some(now));
             if revision.get_untracked() != Some(now) {
                 revision.set(Some(now));
-                // A collection made elsewhere (the CLI, an agent, a teammate) joins the list.
-                if let Ok(cols) = api.collections().await
-                    && collections.with_untracked(|have| *have != cols)
-                {
+            }
+            // A collection made elsewhere (the CLI, an agent, a teammate) joins the list.
+            if listed_at.get_value() != Some(now)
+                && let Ok(cols) = api.collections().await
+            {
+                listed_at.set_value(Some(now));
+                if collections.with_untracked(|have| *have != cols) {
                     collections.set(cols);
                 }
             }
