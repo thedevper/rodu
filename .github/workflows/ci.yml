@@ -9,10 +9,41 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request makes the older run pointless; main and tags always finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    # Whether the code is touched: a pull request that only changes documentation skips the build.
+    # Pushes to main and tags always count as code.
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then echo code=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          git diff --name-only "$BASE...$HEAD" > changed.txt
+          cat changed.txt
+          # Documentation only: Markdown files outside .github, docs/, LICENSE and NOTICE.
+          if grep -qvE '^(docs/.*|[^.][^/]*\.md|[^.][^/]*/.*\.md|LICENSE|NOTICE)$' changed.txt || [ ! -s changed.txt ]; then
+            echo code=true >> "$GITHUB_OUTPUT"
+          else
+            echo code=false >> "$GITHUB_OUTPUT"
+          fi
+
   dco:
     # Every commit in a pull request certifies the DCO (CONTRIBUTING.md) as its author.
     if: github.event_name == 'pull_request'
@@ -37,35 +68,62 @@ jobs:
           exit $status
 
   lint:
+    # Required for merging, so it always reports; on a documentation-only change its steps skip.
+    needs: changes
     runs-on: ubuntu-latest
+    env:
+      CODE: ${{ needs.changes.outputs.code }}
     steps:
+      - if: env.CODE == 'false'
+        run: echo "Documentation only; nothing to lint."
       - uses: actions/checkout@v5
-      - run: rustup toolchain install stable --profile minimal -c rustfmt,clippy -t wasm32-unknown-unknown && rustup default stable
+        if: env.CODE != 'false'
+      - if: env.CODE != 'false'
+        run: rustup toolchain install stable --profile minimal -c rustfmt,clippy -t wasm32-unknown-unknown && rustup default stable
       - uses: Swatinem/rust-cache@v2
+        if: env.CODE != 'false'
       - uses: taiki-e/install-action@v2
+        if: env.CODE != 'false'
         with:
           tool: cargo-about,cargo-audit
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo clippy -p rodu-web --target wasm32-unknown-unknown --locked -- -D warnings
+      - if: env.CODE != 'false'
+        run: cargo fmt --all --check
+      - if: env.CODE != 'false'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: env.CODE != 'false'
+        run: cargo clippy -p rodu-web --target wasm32-unknown-unknown --locked -- -D warnings
       # Fails on any shipped crate whose licence is not accepted in about.toml.
-      - run: cargo xtask notices
+      - if: env.CODE != 'false'
+        run: cargo xtask notices
       # Fails on any RustSec advisory not accepted, with its reason, in .cargo/audit.toml.
-      - run: cargo audit --deny warnings
+      - if: env.CODE != 'false'
+        run: cargo audit --deny warnings
 
   test:
+    # Required for merging, so it always reports; on a documentation-only change its steps skip.
+    needs: changes
     strategy:
       fail-fast: false
       matrix:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CODE: ${{ needs.changes.outputs.code }}
     steps:
+      - if: env.CODE == 'false'
+        run: echo "Documentation only; nothing to test."
       - uses: actions/checkout@v5
-      - run: rustup toolchain install stable --profile minimal && rustup default stable
+        if: env.CODE != 'false'
+      - if: env.CODE != 'false'
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --locked
+        if: env.CODE != 'false'
+      - if: env.CODE != 'false'
+        run: cargo test --workspace --locked
 
   binaries:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
