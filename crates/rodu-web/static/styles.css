@@ -867,3 +867,32 @@ button.ghost.danger {
 .team-invites li span:first-child {
   flex: 1;
 }
+
+/* Sharing a plain board with a team (ADR 0004, step 3b). */
+.team-share {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.team-share p {
+  margin: 0;
+}
+
+.team-places {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.team-places label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  overflow-wrap: anywhere;
+}
+
+.team-share > button {
+  align-self: flex-start;
+}

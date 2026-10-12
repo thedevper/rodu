@@ -450,6 +450,8 @@ struct Board {
     child: std::process::Child,
     host: String,
     bearer: String,
+    /// Everything `rodu web` printed, read as it comes so the pipe never fills or closes.
+    printed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Drop for Board {
@@ -460,31 +462,49 @@ impl Drop for Board {
 }
 
 fn start_board(dir: &Path) -> Board {
+    start_board_with(dir, &[])
+}
+
+/// `rodu web` in `dir`, with `env` set on top of the test's own.
+fn start_board_with(dir: &Path, env: &[(&str, &Path)]) -> Board {
     use std::io::BufRead;
     // A stand-in board, so the test does not depend on `cargo xtask web` having run (CI does not).
     let dist = dir.join("board-stub");
     std::fs::create_dir_all(&dist).unwrap();
     std::fs::write(dist.join("index.html"), "<!doctype html>").unwrap();
     let errors = dir.join("web-stderr.txt");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rodu"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rodu"));
+    command
         .args(["web", "--port", "0", "--no-open"])
         .current_dir(dir)
         .env_remove("RODU_DIR")
-        .env("RODU_WEB_DIST", &dist)
+        .env("RODU_WEB_DIST", &dist);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::fs::File::create(&errors).unwrap())
         .spawn()
         .unwrap();
     let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
-    for line in stdout.lines() {
-        let line = line.unwrap();
-        if let Some(link) = line.strip_prefix("Open: ") {
-            // The credential rides in the fragment, after the one `=`.
-            let (base, fragment) = link.split_once('#').unwrap();
-            let bearer = fragment.split_once('=').unwrap().1;
-            let host = base.trim_start_matches("http://").trim_end_matches('/').to_owned();
-            return Board { child, host, bearer: bearer.to_owned() };
+    let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (link_tx, link_rx) = std::sync::mpsc::channel();
+    let lines = std::sync::Arc::clone(&printed);
+    std::thread::spawn(move || {
+        for line in stdout.lines().map_while(std::result::Result::ok) {
+            if let Some(link) = line.strip_prefix("Open: ") {
+                let _ = link_tx.send(link.to_owned());
+            }
+            lines.lock().unwrap().push(line);
         }
+    });
+    if let Ok(link) = link_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        // The credential rides in the fragment, after the one `=`.
+        let (base, fragment) = link.split_once('#').unwrap();
+        let bearer = fragment.split_once('=').unwrap().1;
+        let host = base.trim_start_matches("http://").trim_end_matches('/').to_owned();
+        return Board { child, host, bearer: bearer.to_owned(), printed };
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -1740,4 +1760,117 @@ fn team_with_board() -> (Team, Board) {
     let team = team();
     let board = start_board(&team.ann);
     (team, board)
+}
+
+// --- sharing a plain board from rodu web (ADR 0004, step 3b) ---------------------------------
+
+/// Waits until `rodu web` has printed `times` lines holding `text`.
+fn printed_until(board: &Board, text: &str, times: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let count = || board.printed.lock().unwrap().iter().filter(|line| line.contains(text)).count();
+    while count() < times {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rodu web never printed {text:?}: {:?}",
+            board.printed.lock().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_plain_board_is_shared_from_the_board_and_reopens_as_a_team_board_on_the_same_link() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let my_drive = drive_home(&home, "ann@example.com");
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
+    ok(&ann, &["add", "Made before sharing"]);
+    let board = start_board_with(&ann, &[("HOME", &home), ("USERPROFILE", &home)]);
+    assert!(board.get("/api/team").contains("does not sync with a team"));
+
+    // The places are this machine's Google Drive folders; a share names one of them.
+    let places: serde_json::Value = serde_json::from_str(&board.get("/api/team/places")).unwrap();
+    let place = places[0]["path"].as_str().unwrap().to_owned();
+    assert!(place.contains("ann@example.com") && place.ends_with("My Drive"), "{places}");
+    let body = |path: &str| serde_json::json!({ "path": path }).to_string();
+    let (status, refused) = board.post("/api/team/share", &body(&format!("{place}-elsewhere")));
+    assert_eq!(status, 400, "{refused}");
+    assert!(board.get("/api/me").contains("ann"), "a refused share keeps the board serving");
+
+    let (status, shared) = board.post("/api/team/share", &body(&place));
+    assert_eq!(status, 200, "{shared}");
+    let message = json_field(&shared, "message");
+    assert!(message.contains("now syncs through") && message.contains("DEMO"), "{message}");
+    assert!(!shared.contains("rodu2-") && !shared.contains("rodu1-"), "no invite code: {shared}");
+    assert!(my_drive.join("Rodu/DEMO/rodu-team.json").is_file());
+
+    // The same link and token reach the board again, now a team's.
+    printed_until(&board, "Reopened the board", 1);
+    let view = team_until(&board, "the team", |t| t["signed"] == true);
+    let value: serde_json::Value = serde_json::from_str(&view).unwrap();
+    assert_eq!(
+        (value["encrypted"].as_bool(), value["mayAdmit"].as_bool()),
+        (Some(true), Some(true)),
+        "{view}"
+    );
+    assert!(marks_of(&value, "ann").contains(&"team owner".to_owned()), "{view}");
+    assert!(board.get("/api/board?collection=DEMO").contains("Made before sharing"));
+    assert!(board.get("/api/team/places").contains("already syncs with a team"));
+    let (status, made) = board.post("/api/team/invites", r#"{"name":"bob"}"#);
+    assert_eq!(status, 201, "{made}");
+    let status = ok(&ann, &["team"]);
+    assert!(status.contains("Encryption: on"), "{status}");
+    // What the share's create printed went nowhere: not to the terminal either.
+    let printed = board.printed.lock().unwrap().join("\n");
+    let errors = std::fs::read_to_string(ann.join("web-stderr.txt")).unwrap();
+    for text in [&printed, &errors] {
+        assert!(!text.contains("rodu1-") && !text.contains("rodu2-"), "{text}");
+    }
+}
+
+#[test]
+fn a_share_that_stops_half_way_reopens_the_board_and_a_second_share_carries_on() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let my_drive = drive_home(&home, "ann@example.com");
+    // A file where the team's folder goes: the share stops after the board's document is made.
+    std::fs::write(my_drive.join("Rodu"), "not a folder").unwrap();
+    let ann = root.path().join("ann");
+    std::fs::create_dir_all(&ann).unwrap();
+    ok(&ann, &["init", "--name", "ann", "--key", "DEMO", "--title", "Demo"]);
+    ok(&ann, &["add", "Made before sharing"]);
+    let board = start_board_with(&ann, &[("HOME", &home), ("USERPROFILE", &home)]);
+    let places: serde_json::Value = serde_json::from_str(&board.get("/api/team/places")).unwrap();
+    let body = serde_json::json!({ "path": places[0]["path"] }).to_string();
+
+    let (status, failed) = board.post("/api/team/share", &body);
+    assert!(status >= 400, "{failed}");
+    assert!(ann.join(".rodu/rodu.loro").exists(), "the document was made before it stopped");
+    // The board reopens on the workspace as it is now, rather than serving the store it held.
+    printed_until(&board, "Reopened the board", 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !board.get("/api/board?collection=DEMO").contains("Made before sharing") {
+        assert!(std::time::Instant::now() < deadline, "the board never came back");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Shared again before the fix: it stops at the same place, changes nothing, and the board
+    // keeps serving rather than reopening.
+    let (status, failed) = board.post("/api/team/share", &body);
+    assert!(status >= 400, "{failed}");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(board.get("/api/me").contains("ann"));
+    let reopens =
+        || board.printed.lock().unwrap().iter().filter(|l| l.contains("Reopened")).count();
+    assert_eq!(reopens(), 1, "{:?}", board.printed.lock().unwrap());
+
+    std::fs::remove_file(my_drive.join("Rodu")).unwrap();
+    let (status, shared) = board.post("/api/team/share", &body);
+    assert_eq!(status, 200, "{shared}");
+    printed_until(&board, "Reopened the board", 2);
+    team_until(&board, "the team", |t| t["signed"] == true);
+    assert!(board.get("/api/board?collection=DEMO").contains("Made before sharing"));
+    assert!(my_drive.join("Rodu/DEMO/rodu-team.json").is_file());
 }

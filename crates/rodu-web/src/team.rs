@@ -1,11 +1,12 @@
 //! Side panel for the team this workspace syncs with (ADR 0004, step 3a): who is on it, the
-//! machines asking to join, the invites waiting, and inviting, admitting and removing. All text
-//! from the server is rendered as plain text.
+//! machines asking to join, the invites waiting, and inviting, admitting and removing. On a plain
+//! board it shares the board with a team instead (step 3b). All text from the server is rendered
+//! as plain text.
 
 use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rodu_api::{InviteCreated, TeamView};
+use rodu_api::{InviteCreated, PlaceView, TeamView};
 
 use crate::api::{Api, ApiError};
 
@@ -42,6 +43,8 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
         // Only a change rebuilds the panel, so focus and what is being typed are kept.
         let changed = loaded.try_with_untracked(|now| match (now, &next) {
             (Loaded::Team(a), Loaded::Team(b)) => a != b,
+            // Still no team: the share part keeps what it shows, such as why a share stopped.
+            (Loaded::NoTeam(_), Loaded::NoTeam(_)) => false,
             _ => true,
         });
         if changed == Some(true) {
@@ -172,15 +175,7 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
             {move || done.get().map(|message| view! { <p class="team-done" role="status">{message}</p> })}
             {move || match loaded.get() {
                 Loaded::Waiting => view! { <p class="loading">"Loading…"</p> }.into_any(),
-                Loaded::NoTeam(e) => {
-                    view! {
-                        <div class="team-none">
-                            <p>{e.message}</p>
-                            {e.hint.map(|hint| view! { <pre>{hint}</pre> })}
-                        </div>
-                    }
-                        .into_any()
-                }
+                Loaded::NoTeam(e) => view! { <SharePanel api=api why=e on_error=on_error /> }.into_any(),
                 Loaded::Team(team) => {
                     let may_admit = team.may_admit;
                     let encrypted = team.encrypted;
@@ -425,4 +420,210 @@ fn MadeInvite(created: InviteCreated, encrypted: bool) -> impl IntoView {
             </p>
         </div>
     }
+}
+
+/// Where sharing stands on a plain board.
+#[derive(Clone)]
+enum Share {
+    Loading,
+    /// The Google Drive folders this machine has, to choose from.
+    Places(Vec<PlaceView>),
+    /// No sharing from here: the reason, as the server gave it.
+    Unavailable(ApiError),
+    Sharing,
+    /// Shared: the message, while the server reopens as a team board.
+    Reopening(String),
+    /// A share that stopped half way, after which the board reopened: why, and a reload to carry
+    /// on from where it stopped.
+    Stopped(ApiError),
+    /// The board did not come back after a share.
+    Gone,
+}
+
+/// Shares a plain board with a team, its files in one of this machine's Google Drive folders.
+#[component]
+fn SharePanel(api: Api, why: ApiError, on_error: Callback<ApiError>) -> impl IntoView {
+    let state = RwSignal::new(Share::Loading);
+    let chosen = RwSignal::new(None::<PlaceView>);
+    let why = StoredValue::new(why);
+    spawn_local(async move {
+        let next = match api.places().await {
+            Ok(places) => {
+                chosen.try_set(places.first().cloned());
+                Share::Places(places)
+            }
+            Err(e) if e.status == 404 => Share::Unavailable(why.get_value()),
+            Err(e) => Share::Unavailable(e),
+        };
+        state.try_set(next);
+    });
+
+    let share = move |_| {
+        let Some(place) = chosen.get_untracked() else { return };
+        let sure = window()
+            .confirm_with_message(&format!(
+                "Share this board with a team? Its files go in a Rodu folder in {}, encrypted. \
+                 Everyone you invite gets a copy of the whole board, and your machine admits each \
+                 of theirs. The board reopens once it is shared.",
+                place.label
+            ))
+            .unwrap_or(false);
+        if !sure {
+            return;
+        }
+        state.set(Share::Sharing);
+        spawn_local(async move {
+            match api.share(&place.path).await {
+                Ok(done) => {
+                    state.try_set(Share::Reopening(done.message));
+                    // Shared: the board comes back on the same link, as a team's.
+                    match wait_for_reopen(api).await {
+                        Reopen::Back | Reopen::Never => {
+                            let _ = window().location().reload();
+                        }
+                        Reopen::Gone => {
+                            state.try_set(Share::Gone);
+                        }
+                    }
+                }
+                Err(e) => {
+                    on_error.run(e.clone());
+                    // A share that stopped half way reopens the board all the same: the reason
+                    // stays on screen, with a reload to carry on, rather than going with a reload.
+                    let next = match wait_for_reopen(api).await {
+                        Reopen::Back => Share::Stopped(e),
+                        Reopen::Gone => Share::Gone,
+                        Reopen::Never => match api.places().await {
+                            Ok(places) => Share::Places(places),
+                            Err(e) => Share::Unavailable(e),
+                        },
+                    };
+                    state.try_set(next);
+                }
+            }
+        });
+    };
+
+    view! {
+        <div class="team-share">
+            {move || match state.get() {
+                Share::Loading => view! { <p class="loading">"Loading…"</p> }.into_any(),
+                Share::Unavailable(e) => {
+                    view! {
+                        <div class="team-none">
+                            <p>{e.message}</p>
+                            {e.hint.map(|hint| view! { <pre>{hint}</pre> })}
+                        </div>
+                    }
+                        .into_any()
+                }
+                Share::Places(places) if places.is_empty() => {
+                    view! {
+                        <div class="team-none">
+                            <p>"This board is yours alone. To share it, install Google Drive for desktop and sign in, then open this panel again."</p>
+                            <p class="muted">"For another folder app (Dropbox, OneDrive, iCloud Drive, Syncthing), run in a terminal:"</p>
+                            <pre>"rodu team create --folder <the shared folder>"</pre>
+                        </div>
+                    }
+                        .into_any()
+                }
+                Share::Places(places) => {
+                    view! {
+                        <h3>"Share with a team"</h3>
+                        <p class="muted">
+                            "This board is yours alone. Choose where the team's files go: a shared drive suits an organisation, since every member sees it at the same place."
+                        </p>
+                        <ul class="team-places">
+                            {places
+                                .into_iter()
+                                .map(|place| {
+                                    let picked = place.path.clone();
+                                    let label = place.label.clone();
+                                    let place = StoredValue::new(place);
+                                    view! {
+                                        <li>
+                                            <label>
+                                                <input
+                                                    type="radio"
+                                                    name="team-place"
+                                                    prop:checked=move || chosen.with(|c| c.as_ref().is_some_and(|c| c.path == picked))
+                                                    on:change=move |_| chosen.set(Some(place.get_value()))
+                                                />
+                                                <span>{label}</span>
+                                            </label>
+                                        </li>
+                                    }
+                                })
+                                .collect_view()}
+                        </ul>
+                        <p class="muted">
+                            "The board is encrypted and signed: only people you invite can read it, and your machine admits each of theirs. Its files go in a Rodu folder there."
+                        </p>
+                        <button type="button" on:click=share>"Share this board"</button>
+                    }
+                        .into_any()
+                }
+                Share::Sharing => view! { <p class="loading">"Sharing…"</p> }.into_any(),
+                Share::Reopening(message) => {
+                    view! {
+                        <p class="team-done" role="status">{message}</p>
+                        <p class="loading">"Reopening the board…"</p>
+                    }
+                        .into_any()
+                }
+                Share::Stopped(e) => {
+                    view! {
+                        <div class="team-none" role="alert">
+                            <p>{format!("Sharing stopped: {}", e.message)}</p>
+                            {e.hint.map(|hint| view! { <pre>{hint}</pre> })}
+                            <p class="muted">"The board reopened as it is now. Fix that, then reload and share again: it carries on from where it stopped."</p>
+                        </div>
+                        <button type="button" on:click=move |_| {
+                            let _ = window().location().reload();
+                        }>"Reload"</button>
+                    }
+                        .into_any()
+                }
+                Share::Gone => {
+                    view! {
+                        <div class="team-none" role="alert">
+                            <p>"The board did not come back. Check the terminal running rodu web, then start it again if it stopped."</p>
+                        </div>
+                    }
+                        .into_any()
+                }
+            }}
+        </div>
+    }
+}
+
+/// How the server behaved after a share.
+enum Reopen {
+    /// It went away and came back: it reopened.
+    Back,
+    /// It answered as before: it did not reopen.
+    Never,
+    /// It went away and did not come back within a minute.
+    Gone,
+}
+
+/// Watches the server after a share, until it answers as itself again.
+async fn wait_for_reopen(api: Api) -> Reopen {
+    let mut gone = false;
+    for _ in 0..120 {
+        match api.me().await {
+            Err(e) if e.status == 503 || e.status == 0 => gone = true,
+            _ if gone => return Reopen::Back,
+            _ => return Reopen::Never,
+        }
+        sleep(500).await;
+    }
+    Reopen::Gone
+}
+
+async fn sleep(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = window().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
