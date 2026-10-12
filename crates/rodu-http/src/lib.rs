@@ -17,9 +17,9 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use rodu_api::{
     AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
-    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, NewCollectionRequest,
-    PatchRequest, PlaceView, PrincipalView, RemoveRequest, RevisionView, RevokeRequest,
-    ShareRequest, StateView, TeamDone, TeamView, TransitionRequest,
+    InviteCreated, InviteRequest, ItemDetail, ItemView, JoinRequest, MeView, MoveRequest,
+    NewCollectionRequest, PatchRequest, PlaceView, PrincipalView, RemoveRequest, RevisionView,
+    RevokeRequest, ShareRequest, StateView, TeamDone, TeamView, TransitionRequest,
 };
 use rodu_core::query::parse_query;
 use rodu_core::service::Placement;
@@ -71,6 +71,9 @@ pub struct WebServerOptions<S: Store> {
     pub team: Option<Arc<dyn TeamPanel<S>>>,
     /// Sharing a plain board with a team, for a workspace that does not sync with one yet.
     pub sharing: Option<Arc<dyn Sharing<S>>>,
+    /// Joining a team, where there is no workspace yet. The server then serves no board: `service`
+    /// is a stand-in nothing reads, and every API call but the join is answered 404.
+    pub joining: Option<Arc<dyn Joining>>,
 }
 
 /// How the board shares a plain workspace with a team (ADR 0004, step 3b). The CLI's crate
@@ -82,6 +85,14 @@ pub trait Sharing<S: Store>: Send + Sync {
     /// even when the share failed part way: the server then stops serving the store it holds,
     /// which is no longer the workspace's, and asks to be reopened.
     fn share(&self, service: &RoduService<S>, path: &str) -> (rodu_core::Result<TeamDone>, bool);
+}
+
+/// How the board joins a team where there is no workspace yet (ADR 0004, step 3b). The CLI's crate
+/// implements it with the same code as `rodu team join`.
+pub trait Joining: Send + Sync {
+    /// Joins with `request`. The flag says whether a workspace is there now: the server then asks
+    /// to be reopened on it.
+    fn join(&self, request: &JoinRequest) -> (rodu_core::Result<TeamDone>, bool);
 }
 
 /// What the board's Team panel can see and do (ADR 0004, step 3a). The CLI's crate implements it
@@ -179,6 +190,7 @@ struct App<S: Store> {
     live: Option<Live<S>>,
     team: Option<Arc<dyn TeamPanel<S>>>,
     sharing: Option<Arc<dyn Sharing<S>>>,
+    joining: Option<Arc<dyn Joining>>,
     /// Set once the workspace changed under the server: the store it holds is no longer the
     /// workspace's, so every API call is refused until the server is reopened.
     reopening: AtomicBool,
@@ -214,6 +226,7 @@ where
         live: options.live.as_ref().map(|live| Live::new(Arc::clone(&live.sync))),
         team: options.team,
         sharing: options.sharing,
+        joining: options.joining,
         reopening: AtomicBool::new(false),
         reopen: Arc::clone(&reopen),
         revision: AtomicU64::new(0),
@@ -342,6 +355,7 @@ enum Endpoint {
     TeamRemove,
     TeamPlaces,
     TeamShare,
+    TeamJoin,
 }
 
 fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
@@ -363,6 +377,7 @@ fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
         "/api/team/remove" => return Some((Endpoint::TeamRemove, None, POST)),
         "/api/team/places" => return Some((Endpoint::TeamPlaces, None, GET)),
         "/api/team/share" => return Some((Endpoint::TeamShare, None, POST)),
+        "/api/team/join" => return Some((Endpoint::TeamJoin, None, POST)),
         _ => {}
     }
     let rest = path.strip_prefix("/api/items/")?;
@@ -417,6 +432,37 @@ where
     } else {
         None
     };
+
+    // Where there is no workspace yet, only the join is served: there is no board to read.
+    if let Some(joining) = &app.joining {
+        if endpoint != Endpoint::TeamJoin {
+            return Err(http(
+                StatusCode::NOT_FOUND,
+                "no_workspace",
+                "There is no board here yet: join a team, or start one with rodu init",
+            ));
+        }
+        let input: JoinRequest = parse_body(body.unwrap_or(serde_json::Value::Null))?;
+        let joining = Arc::clone(joining);
+        return tokio::task::spawn_blocking(move || {
+            // One join at a time, and none once one made the workspace.
+            let _one = app
+                .service
+                .lock()
+                .map_err(|_| Failure::Domain(RoduError::internal("service lock poisoned")))?;
+            if app.reopening.load(Ordering::SeqCst) {
+                return Err(reopening());
+            }
+            let (done, changed) = joining.join(&input);
+            if changed {
+                app.reopening.store(true, Ordering::SeqCst);
+                app.reopen.notify_one();
+            }
+            answer_with(done)
+        })
+        .await
+        .map_err(|e| Failure::Domain(RoduError::internal(format!("request task failed: {e}"))))?;
+    }
 
     // Looking for places reads the disk, never the store, so it does not wait behind other calls.
     if endpoint == Endpoint::TeamPlaces {
@@ -535,6 +581,12 @@ where
                 answer_with(done)
             }
             Endpoint::TeamPlaces => unreachable!("answered without the lock above"),
+            Endpoint::TeamJoin => {
+                return Err(Failure::Domain(
+                    RoduError::conflict("This folder already has a board")
+                        .with_hint("Join from a folder with no workspace: rodu team join"),
+                ));
+            }
             Endpoint::Team
             | Endpoint::TeamInvite
             | Endpoint::TeamRevoke

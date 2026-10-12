@@ -10,7 +10,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use crate::api::{Api, ApiError, take_token};
 use crate::board::{drop_neighbours, group_by_state, initials, insertion_index};
 use crate::panel::ItemPanel;
-use crate::team::TeamPanel;
+use crate::team::{JoinScreen, TeamPanel};
 
 const LAST_COLLECTION: &str = "rodu.collection";
 const DRAG_TYPE: &str = "application/x-rodu-item";
@@ -36,7 +36,7 @@ fn recall(key: &str) -> Option<String> {
 #[component]
 pub fn App() -> impl IntoView {
     match take_token() {
-        Some(token) => view! { <Workspace api=Api::new(token) /> }.into_any(),
+        Some(token) => view! { <Start api=Api::new(token) /> }.into_any(),
         None => view! {
             <main class="empty-state">
                 <h1>"Rodu"</h1>
@@ -47,6 +47,33 @@ pub fn App() -> impl IntoView {
             </main>
         }
         .into_any(),
+    }
+}
+
+/// Whether `rodu web` serves a board, or runs where there is no workspace yet.
+#[derive(Clone, Copy, PartialEq)]
+enum Here {
+    Asking,
+    Board,
+    NoBoard,
+}
+
+/// The board, or the join screen where `rodu web` found no workspace.
+#[component]
+fn Start(api: Api) -> impl IntoView {
+    let here = RwSignal::new(Here::Asking);
+    spawn_local(async move {
+        let next = match api.me().await {
+            Err(e) if e.code == "no_workspace" => Here::NoBoard,
+            // Anything else is the board's to show, errors included.
+            _ => Here::Board,
+        };
+        here.try_set(next);
+    });
+    move || match here.get() {
+        Here::Asking => view! { <p class="loading">"Loading…"</p> }.into_any(),
+        Here::Board => view! { <Workspace api=api /> }.into_any(),
+        Here::NoBoard => view! { <JoinScreen api=api /> }.into_any(),
     }
 }
 

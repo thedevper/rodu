@@ -90,7 +90,9 @@ workspace, **Team** shows who is on the team and their machines; on the owner's 
 machine it also invites someone (copy the invite, shown once), admits a machine by the code its
 person reads out, cancels an invite, and removes someone after asking. On a board that is yours
 alone, **Team** shares it with a team instead: pick one of your Google Drive folders and the board
-reopens, encrypted and signed, on the same link.
+reopens, encrypted and signed, on the same link. Started in a folder with no workspace, `rodu web`
+offers to join a team instead: paste the invite a teammate sent you, and the board opens on the
+same link once joined.
 
 ## Work as a team
 

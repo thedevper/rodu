@@ -3,9 +3,9 @@
 use gloo_net::http::{Method, RequestBuilder};
 use rodu_api::{
     AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
-    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, NewCollectionRequest,
-    PatchRequest, PlaceView, PrincipalView, RemoveRequest, RevisionView, RevokeRequest,
-    ShareRequest, TeamDone, TeamView, TransitionRequest,
+    InviteCreated, InviteRequest, ItemDetail, ItemView, JoinRequest, MeView, MoveRequest,
+    NewCollectionRequest, PatchRequest, PlaceView, PrincipalView, RemoveRequest, RevisionView,
+    RevokeRequest, ShareRequest, TeamDone, TeamView, TransitionRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -16,13 +16,15 @@ const TOKEN_KEY: &str = "rodu.token";
 pub struct ApiError {
     /// HTTP status; 0 when no response arrived.
     pub status: u16,
+    /// The server's error code, such as `no_workspace`; empty when it gave none.
+    pub code: String,
     pub message: String,
     pub hint: Option<String>,
 }
 
 impl ApiError {
     pub fn local(message: impl Into<String>) -> Self {
-        Self { status: 0, message: message.into(), hint: None }
+        Self { status: 0, code: String::new(), message: message.into(), hint: None }
     }
 }
 
@@ -86,14 +88,18 @@ impl Api {
         let text = response.text().await.unwrap_or_default();
         if !response.ok() {
             return Err(match serde_json::from_str::<ErrorBody>(&text) {
-                Ok(body) => ApiError { status, message: body.message, hint: body.hint },
+                Ok(body) => {
+                    ApiError { status, code: body.code, message: body.message, hint: body.hint }
+                }
                 Err(_) => {
-                    ApiError { status, message: format!("Request failed ({status})"), hint: None }
+                    let message = format!("Request failed ({status})");
+                    ApiError { status, code: String::new(), message, hint: None }
                 }
             });
         }
         serde_json::from_str(&text).map_err(|e| ApiError {
             status,
+            code: String::new(),
             message: format!("Unexpected response: {e}"),
             hint: None,
         })
@@ -219,5 +225,14 @@ impl Api {
     pub async fn share(self, path: &str) -> Result<TeamDone, ApiError> {
         let body = ShareRequest { path: path.to_owned() };
         self.call(Method::POST, "/api/team/share", Some(&body)).await
+    }
+
+    /// Joins a team where there is no workspace yet. `again` for someone already on the team,
+    /// joining from another machine under `name`.
+    pub async fn join(self, code: &str, name: &str, again: bool) -> Result<TeamDone, ApiError> {
+        let name = Some(name.trim().to_owned()).filter(|n| !n.is_empty());
+        let (name, as_name) = if again { (None, name) } else { (name, None) };
+        let body = JoinRequest { code: code.trim().to_owned(), name, as_name };
+        self.call(Method::POST, "/api/team/join", Some(&body)).await
     }
 }

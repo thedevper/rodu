@@ -896,3 +896,42 @@ button.ghost.danger {
 .team-share > button {
   align-self: flex-start;
 }
+
+.join-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.join-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.join-form .join-again {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.join-form textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}
+
+.join-form pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.join-form > button {
+  align-self: flex-start;
+}
+
+.join-done {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  margin-bottom: 12px;
+}
