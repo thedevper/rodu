@@ -93,4 +93,10 @@ pub trait Store {
 
     fn get_idempotent(&self, key: &str) -> Result<Option<String>>;
     fn put_idempotent(&self, key: &str, result: &str) -> Result<()>;
+
+    /// A number that changes when another process commits to the same storage, so a long-running
+    /// server notices writes it did not make. Its own writes need not change it.
+    fn data_version(&self) -> Result<u64> {
+        Ok(0)
+    }
 }

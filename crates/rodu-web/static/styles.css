@@ -369,7 +369,7 @@ pre {
   top: 0;
   right: 0;
   bottom: 0;
-  width: min(440px, 100vw);
+  width: min(640px, 100vw);
   overflow-y: auto;
   background: var(--surface);
   border-left: 1px solid var(--border);
@@ -380,18 +380,64 @@ pre {
   gap: 16px;
 }
 
+.panel > * {
+  flex-shrink: 0;
+}
+
+.conflict {
+  margin: 8px 0 0;
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+/* The width comes from the panel itself (dragged or preset); the window always caps it. */
+.panel {
+  max-width: 100vw;
+}
+
+.panel-edge {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  margin-left: -24px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.panel-edge:hover,
+.panel.resizing .panel-edge {
+  background: var(--accent-soft);
+}
+
+.panel.resizing {
+  user-select: none;
+}
+
 .panel-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
 }
 
+.panel-actions {
+  display: flex;
+  gap: 4px;
+}
+
 .panel-title {
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
+  line-height: 1.35;
   border-color: transparent;
   padding: 4px 6px;
   margin: -4px -6px;
+  resize: none;
+  overflow: hidden;
+  field-sizing: content;
+  min-height: 2.2em;
 }
 
 .panel-title:hover {
@@ -431,6 +477,191 @@ pre {
   resize: vertical;
 }
 
+.panel textarea.panel-title {
+  width: calc(100% + 12px);
+  resize: none;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.section-head h3 {
+  margin: 0;
+}
+
+.description textarea {
+  font-size: 15px;
+  line-height: 1.6;
+  min-height: 280px;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.tabs [aria-selected="true"] {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.row .hint {
+  align-self: center;
+}
+
+.add-description {
+  width: 100%;
+  text-align: left;
+  border: 1px dashed var(--border);
+  padding: 12px;
+}
+
+.leave-bar {
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+/* Rendered Markdown: descriptions and comments are what people read most, so they get a larger
+   size and room to breathe. */
+.markdown {
+  font-size: 15px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown pre,
+.markdown table,
+.markdown blockquote {
+  margin: 0 0 12px;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  margin: 20px 0 8px;
+  line-height: 1.3;
+  color: var(--text);
+  font-weight: 650;
+}
+
+.markdown h1 {
+  font-size: 22px;
+}
+
+.markdown h2 {
+  font-size: 19px;
+}
+
+.markdown h3 {
+  font-size: 17px;
+}
+
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+  font-size: 15px;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 24px;
+}
+
+.markdown li + li {
+  margin-top: 4px;
+}
+
+.markdown li > input[type="checkbox"] {
+  margin: 0 6px 0 -20px;
+}
+
+.markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown code {
+  background: var(--surface-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.88em;
+}
+
+.markdown pre {
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.markdown pre code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+}
+
+.markdown blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+  color: var(--muted);
+}
+
+.markdown table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+
+.markdown th,
+.markdown td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 16px 0;
+}
+
+.markdown.preview {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  min-height: 280px;
+}
+
 .row {
   display: flex;
   gap: 8px;
@@ -461,8 +692,6 @@ pre {
 
 .comment-body {
   margin: 4px 0 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 
 .comments form {
