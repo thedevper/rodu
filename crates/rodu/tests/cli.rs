@@ -364,3 +364,39 @@ async fn serves_mcp_over_stdio_as_the_workspace_agent() {
     let shown = cli(dir.path(), &["show", "DEMO-1"]).await;
     assert!(shown.last_out().contains("From agent"));
 }
+
+#[tokio::test]
+async fn the_board_keeps_serving_when_nothing_reads_its_output() {
+    // `rodu web | head`, or a parent that stops reading after the link: printing must not stop
+    // the board.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    init(cwd).await;
+    let dist = web_dist(cwd);
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rodu"))
+        .args(["web", "--port", &port.to_string(), "--no-open"])
+        .current_dir(cwd)
+        .env_remove("RODU_DIR")
+        .env("RODU_WEB_DIST", &dist)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let base = format!("http://127.0.0.1:{port}/");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let served = loop {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            break get(&base, "/", "").await;
+        }
+        if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            break String::new();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let exited = child.try_wait().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(served.contains("<title>Rodu</title>"), "exited: {exited:?}, served: {served:?}");
+}
