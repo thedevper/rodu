@@ -680,4 +680,11 @@ impl Store for SqliteStore {
         self.run("INSERT INTO idempotency (key, result) VALUES (?, ?)", [key, result])?;
         Ok(())
     }
+
+    fn data_version(&self) -> Result<u64> {
+        // SQLite's own counter: it moves on every commit from another connection, only.
+        let version: i64 =
+            self.conn.query_row("PRAGMA data_version", [], |row| row.get(0)).map_err(db)?;
+        Ok(version.unsigned_abs())
+    }
 }
