@@ -656,7 +656,10 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
             .await
             .map_err(|e| RoduError::internal(format!("Cannot stop the board: {e}")))?;
         if !reopened {
-            team::after_reopen(io, false);
+            // With no workspace, there is nothing to sync on the way out.
+            if dir.is_some() {
+                team::after_reopen(io, false);
+            }
             return Ok(());
         }
     }

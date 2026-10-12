@@ -1101,6 +1101,10 @@ async fn a_join_that_went_through_asks_to_reopen_and_a_refused_one_does_not() {
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert_eq!(reply.json()["message"], "Joined the team");
     assert!(reopen_asked(&s).await);
+    // The page waits for the board by this: the stand-in is not answered from any more.
+    let reply = send(&s, "GET", "/api/me", none()).await;
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.json()["code"], "reopening");
     // Joined once: a second join is not run on top of it.
     let again = json!({"code": "good", "as": "bob"});
     let reply = send(&s, "POST", "/api/team/join", join_body(again)).await;

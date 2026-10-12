@@ -394,7 +394,8 @@ Each step ships alone.
   `--name` or `--as` when given, with the folder and environment `rodu web` started with, so the
   folder is found and every check is made as in the CLI. It sits behind the same token, Host check
   and body limits, with unknown fields refused; a code of `-` is refused, since it would read the
-  terminal. One join runs at a time. On a board that is there, the route answers 409.
+  terminal, and so is an empty `as`, which would otherwise join as someone new. One join runs at
+  a time. On a board that is there, the route answers 409.
 - **Reopening.** A join that fails removes what it made, so only one that went through leaves a
   workspace: the server then answers 503 (`reopening`) and `rodu web` starts again on it, on the
   same port with the same token, as after a share.
@@ -404,14 +405,17 @@ Each step ships alone.
   clears the invite from the page and keeps what the join said on screen, since it holds this
   machine's code to read out to the owner; the page offers to open the board once it is back,
   rather than reloading on its own.
-- **Output.** The join's own lines go to the page only. The invite is never sent back nor printed
-  to the terminal.
+- **Output.** The join's own lines, its notes on the first sync included, go to the page only.
+  The invite is never sent back nor printed to the terminal. Stopping a board that never joined
+  does not try to sync.
 - **Tests.**
   - `rodu-http`, with a stand-in: with no workspace every other route answers `no_workspace`; a
-    refused join keeps serving, and one that went through asks to reopen and refuses a second;
+    refused join keeps serving, and one that went through asks to reopen, answers 503 from then on
+    and refuses a second;
     the token, method and body checks; 409 on a board that is there.
   - `tests/team.rs`, through a real `rodu web` started in an empty folder with a stand-in Google
-    Drive home holding the team's folder: a code that is not an invite leaves no workspace; the
+    Drive home holding the team's folder: a code that is not an invite, or an empty `as`, leaves no
+    workspace; the
     invite joins as the system user, the answer holds the machine's code and not the invite, and
     the same link and token then reach the team's board with its card. The terminal never shows
     the invite.

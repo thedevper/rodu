@@ -1909,6 +1909,12 @@ fn rodu_web_with_no_workspace_joins_a_team_and_reopens_as_its_board_on_the_same_
     assert!(!bob.join(".rodu").exists(), "a refused join leaves no workspace");
     assert!(web.get("/api/me").contains("no_workspace"));
 
+    // Already on the team, with no name given: refused rather than joined as someone new.
+    let blank = serde_json::json!({ "code": code, "as": " " }).to_string();
+    let (status, refused) = web.post("/api/team/join", &blank);
+    assert_eq!(status, 400, "{refused}");
+    assert!(!bob.join(".rodu").exists(), "{refused}");
+
     let (status, joined) = web.post("/api/team/join", &body(&code));
     assert_eq!(status, 200, "{joined}");
     let message = json_field(&joined, "message");

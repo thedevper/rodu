@@ -544,16 +544,23 @@ impl rodu_http::Joining for Joiner {
     /// workspace to reopen on.
     fn join(&self, request: &rodu_api::JoinRequest) -> (Result<TeamDone>, bool) {
         let code = zeroize::Zeroizing::new(request.code.trim().to_owned());
+        // Someone already on the team says who: joining as a new person instead would add one.
+        if request.as_name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+            let refused =
+                RoduError::invalid("Give your name on the team to join from this computer");
+            return (Err(refused), false);
+        }
         // `-` would read the code from the terminal `rodu web` runs in.
         if code.is_empty() || code.as_str() == "-" {
             let refused = RoduError::invalid("Paste the invite code your teammate sent you");
             return (Err(refused), false);
         }
-        // What join prints is shown on the page: where it joined, and this machine's code to read
-        // out to the owner. The invite code itself is only ever read, never printed.
-        let mut lines = Vec::new();
-        let mut out = |line: &str| lines.push(line.to_owned());
-        let mut err = |_: &str| {};
+        // What join prints is shown on the page: where it joined, this machine's code to read out
+        // to the owner, and notes on what the first sync found. The invite code itself is only
+        // ever read, never printed.
+        let lines = std::cell::RefCell::new(Vec::new());
+        let mut out = |line: &str| lines.borrow_mut().push(line.to_owned());
+        let mut err = |line: &str| lines.borrow_mut().push(line.to_owned());
         let mut io = Io {
             cwd: self.cwd.clone(),
             env: self.env.clone(),
@@ -575,7 +582,7 @@ impl rodu_http::Joining for Joiner {
         let made = join(&mut io, &args, Some(&code));
         let changed = has_workspace(&io);
         drop(io);
-        (made.map(|()| TeamDone { message: lines.join("\n") }), changed)
+        (made.map(|()| TeamDone { message: lines.into_inner().join("\n") }), changed)
     }
 }
 
