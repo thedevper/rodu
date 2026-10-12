@@ -101,10 +101,11 @@ fn a_collection_added_on_one_machine_reaches_the_others() {
         ok(&bob, &["collection", "add", "OPS", "--title", "Operations"]).trim(),
         "Created collection OPS (Operations)"
     );
-    ok(&bob, &["add", "Rotate keys", "--collection", "OPS"]);
-    // ann takes the collection in with the card and numbers it there.
+    // The collection alone is a change: ann has it before any card is made in it.
     let listed = ok(&team.ann, &["collections"]);
     assert!(listed.contains("OPS  Operations"), "{listed}");
+    ok(&bob, &["add", "Rotate keys", "--collection", "OPS"]);
+    // ann takes the card in and numbers it in OPS.
     assert!(ok(&team.ann, &["ls"]).contains("OPS-1"), "the card is numbered in OPS");
     assert!(ok(&bob, &["ls"]).contains("OPS-1"), "bob sees the number");
 }
