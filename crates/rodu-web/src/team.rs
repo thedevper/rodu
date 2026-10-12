@@ -630,6 +630,12 @@ pub fn JoinScreen(api: Api) -> impl IntoView {
         if typed.trim().is_empty() {
             return;
         }
+        if again.get_untracked() && name.get_untracked().trim().is_empty() {
+            failed.set(Some(ApiError::local(
+                "Give your name on the team to join from this computer",
+            )));
+            return;
+        }
         state.set(Join::Joining);
         failed.set(None);
         spawn_local(async move {

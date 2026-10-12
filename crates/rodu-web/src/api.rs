@@ -230,8 +230,11 @@ impl Api {
     /// Joins a team where there is no workspace yet. `again` for someone already on the team,
     /// joining from another machine under `name`.
     pub async fn join(self, code: &str, name: &str, again: bool) -> Result<TeamDone, ApiError> {
-        let name = Some(name.trim().to_owned()).filter(|n| !n.is_empty());
-        let (name, as_name) = if again { (None, name) } else { (name, None) };
+        let name = name.trim().to_owned();
+        // Someone already on the team always says who, so a blank name is refused, not taken
+        // for someone new.
+        let (name, as_name) =
+            if again { (None, Some(name)) } else { (Some(name).filter(|n| !n.is_empty()), None) };
         let body = JoinRequest { code: code.trim().to_owned(), name, as_name };
         self.call(Method::POST, "/api/team/join", Some(&body)).await
     }

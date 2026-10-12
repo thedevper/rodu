@@ -435,6 +435,10 @@ where
 
     // Where there is no workspace yet, only the join is served: there is no board to read.
     if let Some(joining) = &app.joining {
+        // Once a join made the workspace, the page waits for the board by this answer.
+        if app.reopening.load(Ordering::SeqCst) {
+            return Err(reopening());
+        }
         if endpoint != Endpoint::TeamJoin {
             return Err(http(
                 StatusCode::NOT_FOUND,
