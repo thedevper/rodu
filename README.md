@@ -88,7 +88,9 @@ columns to change status (workflow rules apply, and refusals say how to fix them
 column to reorder, filter with JQL-lite, and click a card to edit it or comment. In a team
 workspace, **Team** shows who is on the team and their machines; on the owner's or an admin's
 machine it also invites someone (copy the invite, shown once), admits a machine by the code its
-person reads out, cancels an invite, and removes someone after asking.
+person reads out, cancels an invite, and removes someone after asking. On a board that is yours
+alone, **Team** shares it with a team instead: pick one of your Google Drive folders and the board
+reopens, encrypted and signed, on the same link.
 
 ## Work as a team
 

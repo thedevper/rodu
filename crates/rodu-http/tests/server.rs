@@ -154,6 +154,7 @@ async fn fixture() -> Fixture {
         token: Some(TOKEN.into()),
         live: None,
         team: None,
+        sharing: None,
     })
     .await
     .unwrap();
@@ -477,6 +478,7 @@ async fn serves_files_held_in_memory_as_the_single_binary_does() {
         token: Some(TOKEN.into()),
         live: None,
         team: None,
+        sharing: None,
     })
     .await
     .unwrap();
@@ -510,6 +512,7 @@ async fn without_a_ui_serves_only_the_api() {
         token: None,
         live: None,
         team: None,
+        sharing: None,
     })
     .await
     .unwrap();
@@ -572,6 +575,7 @@ async fn live_server(sync: std::sync::Arc<FakeSync>) -> RunningServer {
         token: Some(TOKEN.into()),
         live: Some(LiveOptions { sync, every: std::time::Duration::from_millis(40) }),
         team: None,
+        sharing: None,
     })
     .await
     .unwrap()
@@ -720,6 +724,14 @@ async fn team_server(
     team: Option<std::sync::Arc<FakeTeam>>,
     sync: std::sync::Arc<FakeSync>,
 ) -> RunningServer {
+    sharing_server(team, None, sync).await
+}
+
+async fn sharing_server(
+    team: Option<std::sync::Arc<FakeTeam>>,
+    sharing: Option<std::sync::Arc<FakeSharing>>,
+    sync: std::sync::Arc<FakeSync>,
+) -> RunningServer {
     let service = RoduService::new(SqliteStore::memory().unwrap());
     let human = service.create_principal("alice", PrincipalKind::Human, None).unwrap();
     let actor = Actor { principal_id: human.id, via_agent_id: None };
@@ -733,6 +745,7 @@ async fn team_server(
         // The timer stays out of the way: only the requests sync.
         live: Some(LiveOptions { sync, every: std::time::Duration::from_secs(3600) }),
         team: team.map(|t| t as std::sync::Arc<dyn rodu_http::TeamPanel<SqliteStore>>),
+        sharing: sharing.map(|t| t as std::sync::Arc<dyn rodu_http::Sharing<SqliteStore>>),
     })
     .await
     .unwrap()
@@ -823,6 +836,7 @@ async fn the_revision_counts_writes_another_process_makes_to_the_same_workspace(
         token: Some(TOKEN.into()),
         live: None,
         team: None,
+        sharing: None,
     })
     .await
     .unwrap();
@@ -840,4 +854,144 @@ async fn the_revision_counts_writes_another_process_makes_to_the_same_workspace(
     let mine = revision(&s).await;
     assert_ne!(mine, after);
     assert_eq!(revision(&s).await, mine);
+}
+
+// --- sharing a plain board ---
+
+/// One place, `/drive/a`. A share there works; `/drive/half` fails having changed the
+/// workspace; any other path is refused with nothing changed.
+#[derive(Default)]
+struct FakeSharing {
+    calls: Mutex<Vec<String>>,
+}
+
+impl rodu_http::Sharing<SqliteStore> for FakeSharing {
+    fn places(&self) -> rodu_core::Result<Vec<rodu_api::PlaceView>> {
+        self.calls.lock().unwrap().push("places".into());
+        Ok(vec![rodu_api::PlaceView {
+            label: "My Drive (ann@example.com)".into(),
+            path: "/drive/a".into(),
+            shared: false,
+        }])
+    }
+
+    fn share(
+        &self,
+        _: &RoduService<SqliteStore>,
+        path: &str,
+    ) -> (rodu_core::Result<rodu_api::TeamDone>, bool) {
+        self.calls.lock().unwrap().push(format!("share {path}"));
+        match path {
+            "/drive/a" => (Ok(rodu_api::TeamDone { message: "shared".into() }), true),
+            "/drive/half" => (Err(rodu_core::RoduError::invalid("stopped half way")), true),
+            "/drive/slow" => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                (Ok(rodu_api::TeamDone { message: "shared".into() }), true)
+            }
+            _ => (Err(rodu_core::RoduError::invalid("not a place")), false),
+        }
+    }
+}
+
+/// True if the server asked to be reopened within a short wait.
+async fn reopen_asked(s: &RunningServer) -> bool {
+    tokio::time::timeout(std::time::Duration::from_millis(500), s.reopen_wanted()).await.is_ok()
+}
+
+fn share_body(path: &str) -> Opts<'static> {
+    Opts { body: Some(json!({ "path": path })), ..Opts::default() }
+}
+
+#[tokio::test]
+async fn a_share_from_the_board_answers_then_stops_serving_and_asks_to_reopen() {
+    let sharing = std::sync::Arc::new(FakeSharing::default());
+    let s = sharing_server(None, Some(sharing.clone()), std::sync::Arc::default()).await;
+    let reply = send(&s, "GET", "/api/team/places", none()).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.json()[0]["path"], "/drive/a");
+    let reply = send(&s, "POST", "/api/team/share", share_body("/drive/a")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.json()["message"], "shared");
+    assert!(reopen_asked(&s).await);
+    // The store it holds is no longer the workspace's: nothing is read or written through it.
+    for (method, path) in [("GET", "/api/me"), ("GET", "/api/team/places")] {
+        let reply = send(&s, method, path, none()).await;
+        assert_eq!(reply.status, 503, "{path}: {}", reply.body);
+        assert_eq!(reply.json()["code"], "reopening");
+    }
+    let made = Opts { body: Some(json!({"title": "lost"})), ..Opts::default() };
+    assert_eq!(send(&s, "POST", "/api/items", made).await.status, 503);
+    assert_eq!(*sharing.calls.lock().unwrap(), ["places", "share /drive/a"]);
+}
+
+#[tokio::test]
+async fn a_share_that_stopped_half_way_still_reopens_and_one_that_changed_nothing_does_not() {
+    let sharing = std::sync::Arc::new(FakeSharing::default());
+    let s = sharing_server(None, Some(sharing.clone()), std::sync::Arc::default()).await;
+    let reply = send(&s, "POST", "/api/team/share", share_body("/elsewhere")).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(!reopen_asked(&s).await);
+    assert_eq!(send(&s, "GET", "/api/me", none()).await.status, 200, "still serving");
+
+    let reply = send(&s, "POST", "/api/team/share", share_body("/drive/half")).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(reply.json()["message"].as_str().unwrap().contains("half way"));
+    assert!(reopen_asked(&s).await);
+    assert_eq!(send(&s, "GET", "/api/me", none()).await.status, 503);
+}
+
+#[tokio::test]
+async fn the_share_routes_need_the_token_the_right_method_and_a_known_body() {
+    let sharing = std::sync::Arc::new(FakeSharing::default());
+    let s = sharing_server(None, Some(sharing.clone()), std::sync::Arc::default()).await;
+    let no_token = Opts { headers: vec![("Authorization", "")], ..Opts::default() };
+    assert_eq!(send(&s, "GET", "/api/team/places", no_token).await.status, 401);
+    let no_token = Opts { headers: vec![("Authorization", "")], ..share_body("/drive/a") };
+    assert_eq!(send(&s, "POST", "/api/team/share", no_token).await.status, 401);
+    assert_eq!(send(&s, "GET", "/api/team/share", none()).await.status, 405);
+    assert_eq!(send(&s, "POST", "/api/team/places", none()).await.status, 405);
+    let extra =
+        Opts { body: Some(json!({"path": "/drive/a", "encrypt": false})), ..Opts::default() };
+    assert_eq!(send(&s, "POST", "/api/team/share", extra).await.status, 400);
+    let wrong = Opts { body: Some(json!({"path": 7})), ..Opts::default() };
+    assert_eq!(send(&s, "POST", "/api/team/share", wrong).await.status, 400);
+    assert!(sharing.calls.lock().unwrap().is_empty(), "nothing reached the sharing");
+    assert!(!reopen_asked(&s).await);
+}
+
+#[tokio::test]
+async fn a_team_board_is_not_shared_again_and_one_without_sharing_says_so() {
+    let sharing = std::sync::Arc::new(FakeSharing::default());
+    let team = std::sync::Arc::new(FakeTeam::default());
+    let s = sharing_server(Some(team), Some(sharing.clone()), std::sync::Arc::default()).await;
+    assert_eq!(send(&s, "GET", "/api/team/places", none()).await.status, 409);
+    assert_eq!(send(&s, "POST", "/api/team/share", share_body("/drive/a")).await.status, 409);
+    assert!(sharing.calls.lock().unwrap().is_empty());
+
+    let s = sharing_server(None, None, std::sync::Arc::default()).await;
+    let reply = send(&s, "GET", "/api/team/places", none()).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    assert!(reply.json()["hint"].as_str().unwrap().contains("rodu team create"));
+}
+
+#[tokio::test]
+async fn a_request_waiting_behind_a_share_is_refused_rather_than_served_from_the_old_store() {
+    let sharing = std::sync::Arc::new(FakeSharing::default());
+    let s = std::sync::Arc::new(
+        sharing_server(None, Some(sharing.clone()), std::sync::Arc::default()).await,
+    );
+    let sharer = std::sync::Arc::clone(&s);
+    let share = tokio::spawn(async move {
+        send(&sharer, "POST", "/api/team/share", share_body("/drive/slow")).await
+    });
+    // The share holds the service lock for half a second; this request waits behind it.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let made = Opts {
+        body: Some(json!({"collection": "X", "item": {"title": "late"}})),
+        ..Opts::default()
+    };
+    let late = send(&s, "POST", "/api/items", made).await;
+    assert_eq!(share.await.unwrap().status, 200);
+    assert_eq!(late.status, 503, "{}", late.body);
+    assert_eq!(late.json()["code"], "reopening");
 }

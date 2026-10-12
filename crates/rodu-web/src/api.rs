@@ -4,8 +4,8 @@ use gloo_net::http::{Method, RequestBuilder};
 use rodu_api::{
     AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
     InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, NewCollectionRequest,
-    PatchRequest, PrincipalView, RemoveRequest, RevisionView, RevokeRequest, TeamDone, TeamView,
-    TransitionRequest,
+    PatchRequest, PlaceView, PrincipalView, RemoveRequest, RevisionView, RevokeRequest,
+    ShareRequest, TeamDone, TeamView, TransitionRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -210,5 +210,14 @@ impl Api {
     pub async fn remove(self, name: &str) -> Result<TeamDone, ApiError> {
         let body = RemoveRequest { name: name.to_owned(), machine: None };
         self.call(Method::POST, "/api/team/remove", Some(&body)).await
+    }
+
+    pub async fn places(self) -> Result<Vec<PlaceView>, ApiError> {
+        self.get("/api/team/places").await
+    }
+
+    pub async fn share(self, path: &str) -> Result<TeamDone, ApiError> {
+        let body = ShareRequest { path: path.to_owned() };
+        self.call(Method::POST, "/api/team/share", Some(&body)).await
     }
 }

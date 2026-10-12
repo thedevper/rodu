@@ -67,7 +67,8 @@ pub struct Io<'a> {
     pub err: &'a mut dyn FnMut(&str),
     /// Opens the board link in the user's browser; None in tests.
     pub open_url: Option<&'a mut dyn FnMut(&str)>,
-    /// Takes the running web server instead of serving until Ctrl+C, so tests can stop it.
+    /// Takes the running web server instead of serving until Ctrl+C, so tests can stop it. A server
+    /// taken this way is not reopened after a share from the board: it answers 503 from then on.
     pub on_web_server: Option<&'a mut dyn FnMut(RunningServer)>,
 }
 
@@ -548,60 +549,105 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
             .parse::<u16>()
             .map_err(|_| RoduError::invalid("--port must be a whole number from 0 to 65535"))?,
     };
-    let ws = open(io, false)?;
-    team::before(io, &ws);
     let (dist_dir, files) = match source {
         WebSource::Disk(dir) => (Some(dir), None),
         WebSource::Embedded => {
-            let files = embedded::WEB_FILES
+            let files: HashMap<String, Bytes> = embedded::WEB_FILES
                 .iter()
                 .map(|(url, bytes)| ((*url).to_owned(), Bytes::from_static(bytes)))
                 .collect();
             (None, Some(files))
         }
     };
-    let dir = ws.dir.clone();
-    let live = team::live(&ws).map(|sync| LiveOptions { sync, every: LIVE_EVERY });
-    let team = team::panel(&ws);
-    let server = start_web_server(WebServerOptions {
-        service: ws.service,
-        actor: ws.actor,
-        port,
-        dist_dir,
-        files,
-        token: None,
-        live,
-        team,
-    })
-    .await
-    .map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
-            RoduError::conflict(format!("Port {port} is in use"))
-                .with_hint("Pick another with --port")
+    // A share from the board changes what the workspace is (a plain store becomes a team's), so
+    // the server is started again for it, on the same port and with the same token: the page the
+    // user has open keeps working.
+    let mut again: Option<(u16, String)> = None;
+    // One wait for Ctrl+C across every reopen, so one pressed while the board reopens still stops it.
+    let stop = shutdown_signal();
+    tokio::pin!(stop);
+    loop {
+        let ws = open(io, false)?;
+        team::before(io, &ws);
+        let dir = ws.dir.clone();
+        let live = team::live(&ws).map(|sync| LiveOptions { sync, every: LIVE_EVERY });
+        let team = team::panel(&ws);
+        let sharing = team::sharing(io, &ws);
+        let (port, token) = match &again {
+            Some((port, token)) => (*port, Some(token.clone())),
+            None => (port, None),
+        };
+        let options = WebServerOptions {
+            service: ws.service,
+            actor: ws.actor,
+            port,
+            dist_dir: dist_dir.clone(),
+            files: files.clone(),
+            token,
+            live,
+            team,
+            sharing,
+        };
+        let reopening = again.is_some();
+        let server = start_again(options, reopening).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse && reopening {
+                RoduError::conflict(format!("Port {port} was taken while the board reopened"))
+                    .with_hint("Start the board again: rodu web")
+            } else if e.kind() == std::io::ErrorKind::AddrInUse {
+                RoduError::conflict(format!("Port {port} is in use"))
+                    .with_hint("Pick another with --port")
+            } else {
+                RoduError::internal(format!("Cannot start the board: {e}"))
+            }
+        })?;
+        if again.is_some() {
+            (io.out)(&format!("Reopened the board for {}", dir.display()));
         } else {
-            RoduError::internal(format!("Cannot start the board: {e}"))
+            (io.out)(&format!("Rodu board for {}", dir.display()));
+            // The token rides in the fragment, which browsers never send to the server.
+            let link = format!("{}#token={}", server.url, server.token);
+            (io.out)(&format!("Open: {link}"));
+            (io.out)("Local only. Press Ctrl+C to stop.");
+            if open_browser && let Some(open_url) = io.open_url.as_mut() {
+                open_url(&link);
+            }
         }
-    })?;
-    (io.out)(&format!("Rodu board for {}", dir.display()));
-    // The token rides in the fragment, which browsers never send to the server.
-    let link = format!("{}#token={}", server.url, server.token);
-    (io.out)(&format!("Open: {link}"));
-    (io.out)("Local only. Press Ctrl+C to stop.");
-    if open_browser && let Some(open_url) = io.open_url.as_mut() {
-        open_url(&link);
-    }
-    match io.on_web_server.as_mut() {
-        Some(take) => take(server),
-        None => {
-            shutdown_signal().await;
-            server
-                .close()
-                .await
-                .map_err(|e| RoduError::internal(format!("Cannot stop the board: {e}")))?;
+        if let Some(take) = io.on_web_server.as_mut() {
+            take(server);
+            return Ok(());
+        }
+        let reopen = server.reopen_wanted();
+        let reopened = tokio::select! {
+            () = &mut stop => false,
+            () = reopen => true,
+        };
+        again = Some((server.port, server.token.clone()));
+        server
+            .close()
+            .await
+            .map_err(|e| RoduError::internal(format!("Cannot stop the board: {e}")))?;
+        if !reopened {
             team::after_reopen(io, false);
+            return Ok(());
         }
     }
-    Ok(())
+}
+
+/// Starts the board. Started again after a share, its port was just released: it is waited for
+/// a moment, in case the system has not let go of it yet.
+async fn start_again(
+    options: WebServerOptions<AnyStore>,
+    retry: bool,
+) -> std::io::Result<RunningServer> {
+    if retry {
+        for _ in 0..20 {
+            if std::net::TcpListener::bind(("127.0.0.1", options.port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    start_web_server(options).await
 }
 
 async fn shutdown_signal() {
