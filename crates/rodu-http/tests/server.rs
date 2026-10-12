@@ -625,11 +625,13 @@ async fn a_live_server_syncs_on_a_timer_and_after_writes_and_counts_revisions() 
     // The revision asks for the token like every other route.
     let refused = send(&s, "GET", "/api/revision", with(vec![("Authorization", "")])).await;
     assert_eq!(refused.status, 401);
-    // Closing stops the timer.
+    // Closing stops the timer. A pull already running on a blocking thread cannot be cancelled
+    // and may still land just after close returns: let it settle, then nothing more starts.
     s.close().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let after = sync.pulls.load(SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(sync.pulls.load(SeqCst), after);
+    assert_eq!(sync.pulls.load(SeqCst), after, "a pull started after close");
 }
 
 #[tokio::test]
