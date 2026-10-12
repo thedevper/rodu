@@ -863,11 +863,14 @@ async fn the_revision_counts_writes_another_process_makes_to_the_same_workspace(
 #[derive(Default)]
 struct FakeSharing {
     calls: Mutex<Vec<String>>,
+    /// How long looking for places takes, as on a slow Drive mount.
+    places_take: std::time::Duration,
 }
 
 impl rodu_http::Sharing<SqliteStore> for FakeSharing {
     fn places(&self) -> rodu_core::Result<Vec<rodu_api::PlaceView>> {
         self.calls.lock().unwrap().push("places".into());
+        std::thread::sleep(self.places_take);
         Ok(vec![rodu_api::PlaceView {
             label: "My Drive (ann@example.com)".into(),
             path: "/drive/a".into(),
@@ -972,6 +975,24 @@ async fn a_team_board_is_not_shared_again_and_one_without_sharing_says_so() {
     let reply = send(&s, "GET", "/api/team/places", none()).await;
     assert_eq!(reply.status, 404, "{}", reply.body);
     assert!(reply.json()["hint"].as_str().unwrap().contains("rodu team create"));
+}
+
+#[tokio::test]
+async fn looking_for_places_does_not_hold_up_the_board() {
+    let sharing = std::sync::Arc::new(FakeSharing {
+        places_take: std::time::Duration::from_millis(800),
+        ..FakeSharing::default()
+    });
+    let s =
+        std::sync::Arc::new(sharing_server(None, Some(sharing), std::sync::Arc::default()).await);
+    let looker = std::sync::Arc::clone(&s);
+    let places =
+        tokio::spawn(async move { send(&looker, "GET", "/api/team/places", none()).await });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let started = std::time::Instant::now();
+    assert_eq!(send(&s, "GET", "/api/me", none()).await.status, 200);
+    assert!(started.elapsed() < std::time::Duration::from_millis(400), "{:?}", started.elapsed());
+    assert_eq!(places.await.unwrap().status, 200);
 }
 
 #[tokio::test]
