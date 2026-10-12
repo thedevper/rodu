@@ -90,6 +90,18 @@ fn Workspace(api: Api) -> impl IntoView {
     // The server's revision as of the board on screen, read before the board itself, so a change
     // that lands in between is reloaded again rather than missed.
     let seen = StoredValue::new(None::<u64>);
+    // The same, for the open card: it reads itself again when this moves.
+    let revision = RwSignal::new(None::<u64>);
+    // The open card has a description that is not saved yet.
+    let unsaved = RwSignal::new(false);
+    let may_leave_card = move || {
+        !unsaved.get_untracked()
+            || window()
+                .confirm_with_message(
+                    "The description has changes that are not saved. Discard them?",
+                )
+                .unwrap_or(false)
+    };
     let reload = move || async move {
         let Some(collection) = collection_key.get_untracked() else { return };
         let q = applied.get_untracked();
@@ -97,6 +109,9 @@ fn Workspace(api: Api) -> impl IntoView {
         let request = latest_board.get_value();
         if let Ok(now) = api.revision().await {
             seen.set_value(Some(now));
+            if revision.get_untracked() != Some(now) {
+                revision.set(Some(now));
+            }
         }
         let result = api.board(&collection, &q).await;
         if request != latest_board.get_value() {
@@ -118,8 +133,8 @@ fn Workspace(api: Api) -> impl IntoView {
     });
 
     // Live: while the page is visible and no card is held, ask whether the board changed (a
-    // teammate's change came in) and reload it when it did. The item panel is left alone, so an
-    // edit in progress is never overwritten; a save on a stale card is refused by its version.
+    // teammate's change came in) and reload it when it did. The open card reads itself again too,
+    // but never replaces what is being edited; a save on a stale card is refused by its version.
     set_interval(
         move || {
             let hidden = document().hidden();
@@ -199,6 +214,9 @@ fn Workspace(api: Api) -> impl IntoView {
     };
 
     let on_open = Callback::new(move |key: String| {
+        if selected.get_untracked().as_deref() == Some(key.as_str()) || !may_leave_card() {
+            return;
+        }
         team_open.set(false);
         selected.set(Some(key));
     });
@@ -216,7 +234,17 @@ fn Workspace(api: Api) -> impl IntoView {
                 </div>
                 <select
                     aria-label="Collection"
-                    on:change=move |e| choose_collection(event_target_value(&e))
+                    on:change=move |e| {
+                        if may_leave_card() {
+                            choose_collection(event_target_value(&e));
+                        } else if let Some(select) = e
+                            .target()
+                            .and_then(|t| t.dyn_into::<web_sys::HtmlSelectElement>().ok())
+                        {
+                            // Staying: the list shows the collection still on screen.
+                            select.set_value(&collection_key.get_untracked().unwrap_or_default());
+                        }
+                    }
                 >
                     {move || {
                         let chosen = collection_key.get();
@@ -260,6 +288,9 @@ fn Workspace(api: Api) -> impl IntoView {
                     class="ghost team-button"
                     aria-pressed=move || team_open.get().to_string()
                     on:click=move |_| {
+                        if !may_leave_card() {
+                            return;
+                        }
                         selected.set(None);
                         team_open.update(|open| *open = !*open);
                     }
@@ -390,6 +421,8 @@ fn Workspace(api: Api) -> impl IntoView {
                                 item_key=key
                                 states=states
                                 principals=principals
+                                revision=revision
+                                unsaved=unsaved
                                 on_close=on_close
                                 on_changed=on_changed
                                 on_error=on_error
