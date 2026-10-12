@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 
 use rodu::team::CHECK_COMMAND;
 use rodu::{Io, open_url, run};
@@ -40,8 +41,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut out = |line: &str| println!("{line}");
-    let mut err = |line: &str| eprintln!("{line}");
+    // A reader that went away (`rodu web | head`) must not stop the command: println! would
+    // panic, and the board prints after its link.
+    let mut out = |line: &str| {
+        let _ = writeln!(std::io::stdout(), "{line}");
+    };
+    let mut err = |line: &str| {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    };
     let mut open = |url: &str| open_url(url);
     let mut io = Io {
         cwd,
