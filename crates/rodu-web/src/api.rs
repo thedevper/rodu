@@ -3,8 +3,8 @@
 use gloo_net::http::{Method, RequestBuilder};
 use rodu_api::{
     AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
-    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, PatchRequest,
-    PrincipalView, RemoveRequest, RevisionView, RevokeRequest, TeamDone, TeamView,
+    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, NewCollectionRequest,
+    PatchRequest, PrincipalView, RemoveRequest, RevisionView, RevokeRequest, TeamDone, TeamView,
     TransitionRequest,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -109,6 +109,15 @@ impl Api {
 
     pub async fn collections(self) -> Result<Vec<CollectionView>, ApiError> {
         self.get("/api/collections").await
+    }
+
+    pub async fn create_collection(
+        self,
+        key: &str,
+        name: Option<&str>,
+    ) -> Result<CollectionView, ApiError> {
+        let body = NewCollectionRequest { key: key.to_string(), name: name.map(str::to_string) };
+        self.call(Method::POST, "/api/collections", Some(&body)).await
     }
 
     pub async fn revision(self) -> Result<u64, ApiError> {

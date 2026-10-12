@@ -67,6 +67,7 @@ async fn lists_the_tools_with_annotations_and_instructions() {
         names,
         [
             "comment",
+            "create_collection",
             "create_items",
             "cycle_report",
             "get_context",
@@ -445,4 +446,48 @@ fn live_sync_warnings_are_written_once_until_they_change() {
     *sync.warning.lock().unwrap() = Some("folder unreachable".into());
     live.pull(&service);
     assert_eq!(written.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn adds_a_collection_an_agent_can_then_use() {
+    let client = connect().await;
+    let made = parsed(
+        &call(&client, "create_collection", json!({ "key": "web", "name": "Website" })).await,
+    );
+    assert_eq!(made["key"], "WEB");
+    assert_eq!(made["name"], "Website");
+    assert!(
+        made["statuses"].as_array().is_some_and(|s| s.iter().any(|v| v == "Todo (backlog)")),
+        "{made}"
+    );
+
+    let plain = parsed(&call(&client, "create_collection", json!({ "key": "DOCS" })).await);
+    assert_eq!(plain["name"], "DOCS");
+
+    let listed = parsed(&call(&client, "list_collections", json!({})).await);
+    let keys: Vec<&str> =
+        listed.as_array().unwrap().iter().filter_map(|c| c["key"].as_str()).collect();
+    assert!(keys.contains(&"WEB") && keys.contains(&"DOCS"), "{listed}");
+    let created = parsed(
+        &call(
+            &client,
+            "create_items",
+            json!({ "collection": "WEB", "items": [{ "title": "Landing page" }] }),
+        )
+        .await,
+    );
+    assert_eq!(created[0]["key"], "WEB-1");
+
+    let again = call(&client, "create_collection", json!({ "key": "WEB" })).await;
+    assert_eq!(again.is_error, Some(true));
+    assert!(text(&again).contains("already exists"), "{}", text(&again));
+    for bad in [
+        json!({ "key": "1x" }),
+        json!({ "key": "WAYTOOLONGKEY" }),
+        json!({}),
+        json!({ "key": "OK", "name": "" }),
+    ] {
+        let refused = call(&client, "create_collection", bad.clone()).await;
+        assert_eq!(refused.is_error, Some(true), "{bad}: {}", text(&refused));
+    }
 }
