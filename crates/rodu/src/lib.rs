@@ -567,26 +567,48 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
     let stop = shutdown_signal();
     tokio::pin!(stop);
     loop {
-        let ws = open(io, false)?;
-        team::before(io, &ws);
-        let dir = ws.dir.clone();
-        let live = team::live(&ws).map(|sync| LiveOptions { sync, every: LIVE_EVERY });
-        let team = team::panel(&ws);
-        let sharing = team::sharing(io, &ws);
         let (port, token) = match &again {
             Some((port, token)) => (*port, Some(token.clone())),
             None => (port, None),
         };
-        let options = WebServerOptions {
-            service: ws.service,
-            actor: ws.actor,
-            port,
-            dist_dir: dist_dir.clone(),
-            files: files.clone(),
-            token,
-            live,
-            team,
-            sharing,
+        // With no workspace here, the board offers to join a team, then reopens on what that made.
+        let (options, dir) = match has_workspace(io) {
+            false => {
+                let options = WebServerOptions {
+                    service: RoduService::new(AnyStore::Plain(SqliteStore::memory()?)),
+                    actor: Actor { principal_id: String::new(), via_agent_id: None },
+                    port,
+                    dist_dir: dist_dir.clone(),
+                    files: files.clone(),
+                    token,
+                    live: None,
+                    team: None,
+                    sharing: None,
+                    joining: Some(team::joining(io)),
+                };
+                (options, None)
+            }
+            true => {
+                let ws = open(io, false)?;
+                team::before(io, &ws);
+                let dir = ws.dir.clone();
+                let live = team::live(&ws).map(|sync| LiveOptions { sync, every: LIVE_EVERY });
+                let team = team::panel(&ws);
+                let sharing = team::sharing(io, &ws);
+                let options = WebServerOptions {
+                    service: ws.service,
+                    actor: ws.actor,
+                    port,
+                    dist_dir: dist_dir.clone(),
+                    files: files.clone(),
+                    token,
+                    live,
+                    team,
+                    sharing,
+                    joining: None,
+                };
+                (options, Some(dir))
+            }
         };
         let reopening = again.is_some();
         let server = start_again(options, reopening).await.map_err(|e| {
@@ -600,10 +622,17 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
                 RoduError::internal(format!("Cannot start the board: {e}"))
             }
         })?;
+        let shown = dir.as_ref().unwrap_or(&io.cwd).display().to_string();
         if again.is_some() {
-            (io.out)(&format!("Reopened the board for {}", dir.display()));
+            (io.out)(&format!("Reopened the board for {shown}"));
         } else {
-            (io.out)(&format!("Rodu board for {}", dir.display()));
+            (io.out)(&match dir {
+                Some(_) => format!("Rodu board for {shown}"),
+                None => format!(
+                    "No Rodu board in {shown} yet: join a team from the page, or start one with \
+                     rodu init"
+                ),
+            });
             // The token rides in the fragment, which browsers never send to the server.
             let link = format!("{}#token={}", server.url, server.token);
             (io.out)(&format!("Open: {link}"));
@@ -627,7 +656,10 @@ async fn serve_web(io: &mut Io<'_>, port: Option<&str>, open_browser: bool) -> R
             .await
             .map_err(|e| RoduError::internal(format!("Cannot stop the board: {e}")))?;
         if !reopened {
-            team::after_reopen(io, false);
+            // With no workspace, there is nothing to sync on the way out.
+            if dir.is_some() {
+                team::after_reopen(io, false);
+            }
             return Ok(());
         }
     }

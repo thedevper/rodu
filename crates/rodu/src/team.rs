@@ -527,6 +527,65 @@ impl Sharing<AnyStore> for Sharer {
     }
 }
 
+/// Joins a team from `rodu web` started where there is no workspace yet (ADR 0004, step 3b), with
+/// the folder and environment `rodu web` was started with.
+pub(crate) struct Joiner {
+    cwd: PathBuf,
+    env: std::collections::HashMap<String, String>,
+}
+
+pub(crate) fn joining(io: &Io<'_>) -> std::sync::Arc<dyn rodu_http::Joining> {
+    std::sync::Arc::new(Joiner { cwd: io.cwd.clone(), env: io.env.clone() })
+}
+
+impl rodu_http::Joining for Joiner {
+    /// Runs `rodu team join <code>`, with `--name` or `--as` when given, finding the team's folder
+    /// as it does. A join that fails removes what it made, so only one that went through leaves a
+    /// workspace to reopen on.
+    fn join(&self, request: &rodu_api::JoinRequest) -> (Result<TeamDone>, bool) {
+        let code = zeroize::Zeroizing::new(request.code.trim().to_owned());
+        // Someone already on the team says who: joining as a new person instead would add one.
+        if request.as_name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+            let refused =
+                RoduError::invalid("Give your name on the team to join from this computer");
+            return (Err(refused), false);
+        }
+        // `-` would read the code from the terminal `rodu web` runs in.
+        if code.is_empty() || code.as_str() == "-" {
+            let refused = RoduError::invalid("Paste the invite code your teammate sent you");
+            return (Err(refused), false);
+        }
+        // What join prints is shown on the page: where it joined, this machine's code to read out
+        // to the owner, and notes on what the first sync found. The invite code itself is only
+        // ever read, never printed.
+        let lines = std::cell::RefCell::new(Vec::new());
+        let mut out = |line: &str| lines.borrow_mut().push(line.to_owned());
+        let mut err = |line: &str| lines.borrow_mut().push(line.to_owned());
+        let mut io = Io {
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            out: &mut out,
+            err: &mut err,
+            open_url: None,
+            on_web_server: None,
+        };
+        let mut args = Args::default();
+        let given = |name: &Option<String>| {
+            name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned)
+        };
+        if let Some(name) = given(&request.name) {
+            args.values.insert("name".to_owned(), name);
+        }
+        if let Some(name) = given(&request.as_name) {
+            args.values.insert("as".to_owned(), name);
+        }
+        let made = join(&mut io, &args, Some(&code));
+        let changed = has_workspace(&io);
+        drop(io);
+        (made.map(|()| TeamDone { message: lines.into_inner().join("\n") }), changed)
+    }
+}
+
 impl FolderPanel {
     /// The store and folder of a signed team, for a step only an owner or admin takes.
     fn signed<'a>(

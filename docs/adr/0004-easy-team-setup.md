@@ -1,6 +1,7 @@
 # ADR 0004: Team setup in as few steps as possible
 
-- Status: accepted 2026-10-11; steps 1, 2, 3a and 3b part 1 built 2026-10-11
+- Status: accepted 2026-10-11; steps 1, 2, 3a and 3b part 1 built 2026-10-11; 3b part 2 built
+  2026-10-13
 
 ## Context
 
@@ -382,6 +383,44 @@ Each step ships alone.
     A second run with a share that stops half way checks the reason stays on screen with Reload.
 - **Known limits.** The board offers Google Drive only; other folder apps use `rodu team create
   --folder`. A server taken by a test through `on_web_server` is not reopened.
+
+### Step 3b part 2 as built
+
+- **No workspace.** `rodu web` started where no workspace is found (no `.rodu/config.json` here
+  or above, nor at `$RODU_DIR`) no longer stops: it serves the page, prints its link and says
+  there is no board yet. Every API call but the join answers 404 (`no_workspace`), so nothing is
+  read from the stand-in store the server holds.
+- **One code path.** `POST /api/team/join {code, name?, as?}` runs `rodu team join <code>`, with
+  `--name` or `--as` when given, with the folder and environment `rodu web` started with, so the
+  folder is found and every check is made as in the CLI. It sits behind the same token, Host check
+  and body limits, with unknown fields refused; a code of `-` is refused, since it would read the
+  terminal, and so is an empty `as`, which would otherwise join as someone new. One join runs at
+  a time. On a board that is there, the route answers 409.
+- **Reopening.** A join that fails removes what it made, so only one that went through leaves a
+  workspace: the server then answers 503 (`reopening`) and `rodu web` starts again on it, on the
+  same port with the same token, as after a share.
+- **The page.** Asked for `/api/me`, a server with no workspace answers `no_workspace`, and the
+  page shows a form: the invite, a name, and whether the person is already on the team and joins
+  from another computer. A refused join keeps the form, with the reason. A join that went through
+  clears the invite from the page and keeps what the join said on screen, since it holds this
+  machine's code to read out to the owner; the page offers to open the board once it is back,
+  rather than reloading on its own.
+- **Output.** The join's own lines, its notes on the first sync included, go to the page only.
+  The invite is never sent back nor printed to the terminal. Stopping a board that never joined
+  does not try to sync.
+- **Tests.**
+  - `rodu-http`, with a stand-in: with no workspace every other route answers `no_workspace`; a
+    refused join keeps serving, and one that went through asks to reopen, answers 503 from then on
+    and refuses a second;
+    the token, method and body checks; 409 on a board that is there.
+  - `tests/team.rs`, through a real `rodu web` started in an empty folder with a stand-in Google
+    Drive home holding the team's folder: a code that is not an invite, or an empty `as`, leaves no
+    workspace; the
+    invite joins as the system user, the answer holds the machine's code and not the invite, and
+    the same link and token then reach the team's board with its card. The terminal never shows
+    the invite.
+- **Known limits.** The page does not choose between several team folders: when the search finds
+  more than one, the reason says to join with `rodu team join --folder`.
 
 ## What this does not do
 

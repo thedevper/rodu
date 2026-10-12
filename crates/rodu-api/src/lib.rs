@@ -259,6 +259,19 @@ pub struct ShareRequest {
     pub path: String,
 }
 
+/// `POST /api/team/join`: join a team with an invite, from `rodu web` started where there is no
+/// workspace yet (ADR 0004, step 3b). As `rodu team join`: `name` for someone new to the team,
+/// `as` for someone already on it joining from another machine, neither for the invite's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinRequest {
+    pub code: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, rename = "as")]
+    pub as_name: Option<String>,
+}
+
 /// What a team change did, to show the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamDone {
