@@ -418,6 +418,18 @@ where
         None
     };
 
+    // Looking for places reads the disk, never the store, so it does not wait behind other calls.
+    if endpoint == Endpoint::TeamPlaces {
+        return tokio::task::spawn_blocking(move || {
+            if app.reopening.load(Ordering::SeqCst) {
+                return Err(reopening());
+            }
+            ok(StatusCode::OK, &sharing_of(&app)?.places()?)
+        })
+        .await
+        .map_err(|e| Failure::Domain(RoduError::internal(format!("request task failed: {e}"))))?;
+    }
+
     // SQLite work is blocking: run it off the async workers, one request at a time.
     tokio::task::spawn_blocking(move || {
         let service = app
@@ -512,30 +524,17 @@ where
                 let revision = app.revision.load(Ordering::SeqCst).wrapping_add(others);
                 ok(StatusCode::OK, &RevisionView { revision })
             }
-            Endpoint::TeamPlaces | Endpoint::TeamShare => {
-                if app.team.is_some() {
-                    return Err(Failure::Domain(RoduError::conflict(
-                        "This board already syncs with a team",
-                    )));
+            Endpoint::TeamShare => {
+                let sharing = sharing_of(&app)?;
+                let input: ShareRequest = parse_body(body)?;
+                let (done, changed) = sharing.share(&service, &input.path);
+                if changed {
+                    app.reopening.store(true, Ordering::SeqCst);
+                    app.reopen.notify_one();
                 }
-                let Some(sharing) = &app.sharing else {
-                    return Err(Failure::Domain(
-                        RoduError::not_found("This board cannot be shared from here")
-                            .with_hint("Share it with: rodu team create"),
-                    ));
-                };
-                if endpoint == Endpoint::TeamPlaces {
-                    ok(StatusCode::OK, &sharing.places()?)
-                } else {
-                    let input: ShareRequest = parse_body(body)?;
-                    let (done, changed) = sharing.share(&service, &input.path);
-                    if changed {
-                        app.reopening.store(true, Ordering::SeqCst);
-                        app.reopen.notify_one();
-                    }
-                    answer_with(done)
-                }
+                answer_with(done)
             }
+            Endpoint::TeamPlaces => unreachable!("answered without the lock above"),
             Endpoint::Team
             | Endpoint::TeamInvite
             | Endpoint::TeamRevoke
@@ -590,6 +589,19 @@ where
     })
     .await
     .map_err(|e| Failure::Domain(RoduError::internal(format!("request task failed: {e}"))))?
+}
+
+/// What shares this board, refused on a team's board and where `rodu web` gave none.
+fn sharing_of<S: Store>(app: &App<S>) -> Outcome<&Arc<dyn Sharing<S>>> {
+    if app.team.is_some() {
+        return Err(Failure::Domain(RoduError::conflict("This board already syncs with a team")));
+    }
+    app.sharing.as_ref().ok_or_else(|| {
+        Failure::Domain(
+            RoduError::not_found("This board cannot be shared from here")
+                .with_hint("Share it with: rodu team create"),
+        )
+    })
 }
 
 fn reopening() -> Failure {
