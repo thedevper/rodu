@@ -17,9 +17,9 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use rodu_api::{
     AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
-    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, PatchRequest,
-    PrincipalView, RemoveRequest, RevisionView, RevokeRequest, StateView, TeamDone, TeamView,
-    TransitionRequest,
+    InviteCreated, InviteRequest, ItemDetail, ItemView, MeView, MoveRequest, NewCollectionRequest,
+    PatchRequest, PrincipalView, RemoveRequest, RevisionView, RevokeRequest, StateView, TeamDone,
+    TeamView, TransitionRequest,
 };
 use rodu_core::query::parse_query;
 use rodu_core::service::Placement;
@@ -315,9 +315,10 @@ fn resolve(path: &str) -> Option<(Endpoint, Option<&str>, &'static [Method])> {
     const GET: &[Method] = &[Method::GET];
     const POST: &[Method] = &[Method::POST];
     const GET_PATCH: &[Method] = &[Method::GET, Method::PATCH];
+    const GET_POST: &[Method] = &[Method::GET, Method::POST];
     match path {
         "/api/me" => return Some((Endpoint::Me, None, GET)),
-        "/api/collections" => return Some((Endpoint::Collections, None, GET)),
+        "/api/collections" => return Some((Endpoint::Collections, None, GET_POST)),
         "/api/principals" => return Some((Endpoint::Principals, None, GET)),
         "/api/board" => return Some((Endpoint::Board, None, GET)),
         "/api/revision" => return Some((Endpoint::Revision, None, GET)),
@@ -405,6 +406,9 @@ where
         let answer = match endpoint {
             Endpoint::Me => {
                 ok(StatusCode::OK, &MeView { name: ctx.name(Some(&app.actor.principal_id))? })
+            }
+            Endpoint::Collections if method == Method::POST => {
+                ctx.create_collection(parse_body(body)?)
             }
             Endpoint::Collections => {
                 let all = service.list_collections()?;
@@ -605,6 +609,19 @@ impl<S: Store> Ctx<'_, S> {
             items: items.iter().map(|i| self.item_view(i)).collect::<rodu_core::Result<_>>()?,
             total,
         })
+    }
+
+    fn create_collection(
+        &self,
+        input: NewCollectionRequest,
+    ) -> Outcome<(StatusCode, serde_json::Value)> {
+        check_len("key", &input.key, 20)?;
+        // Unnamed, it is called by its key as stored: in capitals.
+        let upper = input.key.to_uppercase();
+        let name = input.name.as_deref().unwrap_or(&upper);
+        check_len("name", name, 80)?;
+        let made = self.service.create_collection(self.actor, &input.key, name)?;
+        ok(StatusCode::CREATED, &collection_view(&made))
     }
 
     fn create(&self, input: CreateRequest) -> Outcome<(StatusCode, serde_json::Value)> {

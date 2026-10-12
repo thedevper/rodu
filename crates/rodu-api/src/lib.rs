@@ -84,6 +84,15 @@ pub struct ErrorBody {
     pub hint: Option<String>,
 }
 
+/// `POST /api/collections`: add a collection; its name is the key when none is given.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewCollectionRequest {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// `POST /api/items`: create one item, optionally straight into a column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

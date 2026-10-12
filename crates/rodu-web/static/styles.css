@@ -135,6 +135,28 @@ pre {
   background: var(--accent);
 }
 
+.add-collection {
+  padding: 4px 10px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.new-collection {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.new-collection input[aria-label="Collection key"] {
+  width: 7.5em;
+  text-transform: uppercase;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.new-collection input[aria-label="Collection name"] {
+  width: 12em;
+}
+
 .filter {
   flex: 1;
   display: flex;
