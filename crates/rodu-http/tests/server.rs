@@ -593,7 +593,9 @@ async fn a_live_server_syncs_on_a_timer_and_after_writes_and_counts_revisions() 
 #[tokio::test]
 async fn a_server_without_live_sync_still_answers_the_revision() {
     let f = fixture().await;
-    assert_eq!(revision(&f.server).await, 0);
+    // The number means nothing by itself; the board only compares it with the last one.
+    let first = revision(&f.server).await;
+    assert_eq!(revision(&f.server).await, first);
     f.server.close().await.unwrap();
 }
 
@@ -757,4 +759,41 @@ async fn a_workspace_with_no_team_says_so() {
     assert!(reply.json()["hint"].as_str().unwrap().contains("rodu team create"));
     let body = Opts { body: Some(json!({"name": "bob"})), ..Opts::default() };
     assert_eq!(send(&s, "POST", "/api/team/invites", body).await.status, 404);
+}
+
+#[tokio::test]
+async fn the_revision_counts_writes_another_process_makes_to_the_same_workspace() {
+    // `rodu mcp` or a CLI command writes to the same database while the board runs (#26).
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rodu.db");
+    let service = RoduService::new(SqliteStore::open(&path).unwrap());
+    let human = service.create_principal("alice", PrincipalKind::Human, None).unwrap();
+    let actor = Actor { principal_id: human.id, via_agent_id: None };
+    service.create_collection(&actor, "DEMO", "Demo project").unwrap();
+    let s = start_web_server(WebServerOptions {
+        service,
+        actor: actor.clone(),
+        port: 0,
+        dist_dir: None,
+        files: None,
+        token: Some(TOKEN.into()),
+        live: None,
+        team: None,
+    })
+    .await
+    .unwrap();
+    let before = revision(&s).await;
+    assert_eq!(revision(&s).await, before, "nothing changed, so neither does the revision");
+
+    let other = RoduService::new(SqliteStore::open(&path).unwrap());
+    other.create_items(&actor, "DEMO", &[json!({ "title": "Made elsewhere" })], None).unwrap();
+    assert_ne!(revision(&s).await, before);
+
+    // The server's own writes still count, and a quiet moment after them changes nothing.
+    let after = revision(&s).await;
+    let reply = send(&s, "POST", "/api/items", create("Made here")).await;
+    assert_eq!(reply.status, 201, "{}", reply.body);
+    let mine = revision(&s).await;
+    assert_ne!(mine, after);
+    assert_eq!(revision(&s).await, mine);
 }

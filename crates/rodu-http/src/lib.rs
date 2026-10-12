@@ -463,7 +463,11 @@ where
                 ok(StatusCode::CREATED, &ctx.comment_view(&made)?)
             }
             Endpoint::Revision => {
-                ok(StatusCode::OK, &RevisionView { revision: app.revision.load(Ordering::SeqCst) })
+                // This server's own changes, plus those another process (`rodu mcp`, the CLI)
+                // committed to the same workspace. Both only grow, so the sum changes with each.
+                let others = service.store.data_version()?;
+                let revision = app.revision.load(Ordering::SeqCst).wrapping_add(others);
+                ok(StatusCode::OK, &RevisionView { revision })
             }
             Endpoint::Team
             | Endpoint::TeamInvite
