@@ -200,11 +200,12 @@ cargo build --release -p rodu         # target/release/rodu, with the board embe
 ```sh
 cargo xtask dist             # dist/release: the archive for this machine (or --target NAME)
 cargo xtask smoke            # drives the binary built for this machine
+cargo xtask browser-smoke    # drives its board in headless Chrome (Node 22+, Chrome)
 cargo xtask release-files    # SHA256SUMS, rodu.rb, rodu.json and the install scripts
 ```
 
 CI (`.github/workflows/ci.yml`) tests on macOS and Windows, builds the binaries, installs each one
-with the user-facing script on its own OS and smoke-tests it. Pushing a `vX.Y.Z` tag that matches
+with the user-facing script on its own OS and smoke-tests it, and drives the board in headless Chrome on macOS. Pushing a `vX.Y.Z` tag that matches
 the version in `Cargo.toml` and the install URLs above publishes a GitHub release.
 
 ## Contributing

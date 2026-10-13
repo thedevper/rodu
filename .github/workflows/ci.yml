@@ -208,6 +208,14 @@ jobs:
           sh packaging/install.sh
           for n in LICENSE NOTICE THIRD-PARTY-NOTICES.txt; do test -s "$XDG_DATA_HOME/rodu/$n"; done
           cargo xtask smoke "$RUNNER_TEMP/bin/rodu"
+      # The board the binary carries, in headless Chrome (on the runner image): once is enough.
+      - if: matrix.os == 'macos-latest'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Browser smoke test
+        if: matrix.os == 'macos-latest'
+        run: cargo xtask browser-smoke "$RUNNER_TEMP/bin/rodu"
       - name: Install with irm | iex on Windows PowerShell 5.1 and smoke test
         if: matrix.shell == 'powershell'
         shell: powershell

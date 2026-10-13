@@ -16,7 +16,10 @@ tasks:
   release-files        write SHA256SUMS, the Homebrew formula and the Scoop manifest for the
                        archives in dist/release/, and copy the install scripts beside them
   smoke [BINARY]       drive a built rodu like a new user: init, add, ls, web and mcp
-                       (default: this machine's release build)";
+                       (default: this machine's release build)
+  browser-smoke [BINARY]
+                       drive the board it carries in headless Chrome: cards, collections,
+                       sharing and joining a team (needs Node 22+ and Chrome; CHROME_PATH)";
 
 const REPO: &str = "TheDevper/rodu";
 const DESCRIPTION: &str = "Local-first, AI-first kanban for small teams";
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
         Some("dist") => dist(std::env::args().skip(2).collect()),
         Some("release-files") => release_files(),
         Some("smoke") => smoke(std::env::args().nth(2)),
+        Some("browser-smoke") => browser_smoke(std::env::args().nth(2)),
         Some("-h" | "--help") => {
             println!("{USAGE}");
             Ok(())
@@ -462,20 +466,37 @@ fn read_until(child: &mut std::process::Child, marker: &str) -> Result<String> {
 }
 
 /// `cargo xtask smoke`: the checks a new user's first minutes would make, on a real binary.
-fn smoke(binary: Option<String>) -> Result {
-    use std::io::Write;
-    use std::process::Stdio;
-    let root = workspace_root();
+/// The rodu to smoke-test: the one given, or this machine's release build.
+fn smoke_binary(root: &Path, binary: Option<String>) -> Result<PathBuf> {
     let binary = match binary {
         Some(path) => PathBuf::from(path),
         None => {
             let host = host_target().ok_or("no release target for this machine")?;
             let exe = if host.zip { "rodu.exe" } else { "rodu" };
-            target_dir(&root).join(host.triple).join("release").join(exe)
+            target_dir(root).join(host.triple).join("release").join(exe)
         }
     };
-    let binary = fs::canonicalize(&binary)
-        .map_err(|e| format!("{}: {e} (run cargo xtask dist first)", binary.display()))?;
+    fs::canonicalize(&binary)
+        .map_err(|e| format!("{}: {e} (run cargo xtask dist first)", binary.display()))
+}
+
+/// Runs `xtask/browser/smoke.mjs` against a built rodu: the board in headless Chrome.
+fn browser_smoke(binary: Option<String>) -> Result {
+    let root = workspace_root();
+    let binary = smoke_binary(&root, binary)?;
+    let status = Command::new("node")
+        .arg(root.join("xtask").join("browser").join("smoke.mjs"))
+        .arg(&binary)
+        .status()
+        .map_err(|e| format!("could not run node (Node 22 or later is needed): {e}"))?;
+    if status.success() { Ok(()) } else { Err("the browser smoke test failed".into()) }
+}
+
+fn smoke(binary: Option<String>) -> Result {
+    use std::io::Write;
+    use std::process::Stdio;
+    let root = workspace_root();
+    let binary = smoke_binary(&root, binary)?;
     let ws = std::env::temp_dir().join(format!("rodu-smoke-{}", std::process::id()));
     fs::create_dir_all(&ws).map_err(|e| e.to_string())?;
     let rodu = |args: &[&str]| -> Result<String> {
