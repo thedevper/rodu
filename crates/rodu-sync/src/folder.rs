@@ -15,7 +15,9 @@
 //! of removed machines (`request.json`, `authority.json`, `seen.json`; `.sealed` when encrypted).
 //! An encrypted signed team's replica folders also hold each machine's X25519 key
 //! (`exchange.sealed`) and the new team keys an owner's or admin's machine wrapped for each
-//! machine (`keys.json`; ADR 0002, step 3b). Which kind a workspace syncs is its own setting, never
+//! machine (`keys.json`; ADR 0002, step 3b). Every replica folder also holds its machine's sync
+//! status (`status.json`, `.sealed` when encrypted; ADR 0005): when it last synced, how much of
+//! each machine's work it held, and its Rodu version, signed on a signed team. Which kind a workspace syncs is its own setting, never
 //! the folder's: a folder that does not match it is refused, so a changed team file cannot make it
 //! write plain or unsigned files, or trust another root key.
 //!
@@ -89,6 +91,20 @@ const MAX_KEYS_FILE: u64 = 1024 * 1024;
 /// The most wrapped keys tried from one keys file in one pull, so a planted file cannot make a
 /// pull run X25519 without end.
 const MAX_UNWRAP: usize = 64;
+/// Each machine's sync status, in its replica folder; sealed for an encrypted team (ADR 0005).
+const STATUS_PLAIN: &str = "status.json";
+const STATUS_SEALED: &str = "status.sealed";
+/// The largest status file read: room for [`MAX_HOLDS`] entries of 38 bytes at most each, the
+/// signature and the seal.
+const MAX_STATUS: u64 = 64 * 1024;
+/// The most machines a status says anything about.
+const MAX_HOLDS: usize = 1024;
+/// The longest version a status names.
+const MAX_VERSION: usize = 32;
+/// A status that changed is rewritten once its last write is this many seconds old.
+const STATUS_GAP: u64 = 60;
+/// A status is rewritten once it is this many seconds old, changed or not.
+const STATUS_REFRESH: u64 = 600;
 /// A replica compacts its own files once it wrote this many since it last did.
 const COMPACT_AT: usize = 32;
 
@@ -254,6 +270,63 @@ struct ExchangeFile {
     public_key: String,
     exchange_key: String,
     signature: String,
+}
+
+/// What a status file holds. `holds` is `<peer, 16 hex>:<end>` entries, comma-separated, sorted
+/// by peer; `publicKey` and `signature` are there only on a signed team.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusFile {
+    format: u32,
+    at: u64,
+    holds: String,
+    version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+}
+
+/// A machine's sync status, as its status file says (ADR 0005).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineStatus {
+    /// When it last synced, in seconds since 1970, by its own clock.
+    pub at: u64,
+    /// How much of each peer's operations it held then ([`LoroStore::seen_end`]).
+    pub holds: BTreeMap<u64, u64>,
+    /// Its Rodu version.
+    pub version: String,
+}
+
+fn holds_text(holds: &BTreeMap<u64, u64>) -> String {
+    let entries: Vec<String> =
+        holds.iter().map(|(peer, end)| format!("{}:{end}", peer_dir_name(*peer))).collect();
+    entries.join(",")
+}
+
+/// Reads `holds` back: at most [`MAX_HOLDS`] entries of a peer as 16 lowercase hex digits and a
+/// decimal end, each peer once; `None` for anything else.
+fn parse_holds(text: &str) -> Option<BTreeMap<u64, u64>> {
+    let mut holds = BTreeMap::new();
+    if text.is_empty() {
+        return Some(holds);
+    }
+    for entry in text.split(',') {
+        let (peer, end) = entry.split_once(':')?;
+        let digits = !end.is_empty() && end.len() <= 20 && end.bytes().all(|b| b.is_ascii_digit());
+        let end: u64 = if digits { end.parse().ok()? } else { return None };
+        if holds.insert(parse_peer_dir(peer)?, end).is_some() || holds.len() > MAX_HOLDS {
+            return None;
+        }
+    }
+    Some(holds)
+}
+
+/// A version a status may name: up to [`MAX_VERSION`] ASCII letters, digits, `.`, `+` and `-`.
+fn is_version(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_VERSION
+        && text.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
 }
 
 /// What a keys file holds, format 2: `<recipient peer, 16 hex>.<generation>.<key check>.<wrapped,
@@ -531,6 +604,10 @@ pub struct TeamFolder {
     /// personal invites it made and that were not used yet, one `<expires>.<secret>.<name>` per
     /// line.
     invites: Option<PathBuf>,
+    /// When a status is rewritten: the seconds after which one that changed is, and after which
+    /// one is anyway ([`STATUS_GAP`], [`STATUS_REFRESH`]).
+    status_gap: u64,
+    status_refresh: u64,
 }
 
 /// The path holds untrusted names from the folder and ends up in a terminal: control
@@ -605,6 +682,8 @@ impl TeamFolder {
             pending: Mutex::new(Vec::new()),
             seal_key: Mutex::new(None),
             invites: None,
+            status_gap: STATUS_GAP,
+            status_refresh: STATUS_REFRESH,
         }
     }
 
@@ -638,6 +717,15 @@ impl TeamFolder {
     pub fn compacting(mut self, at: usize, max_bytes: usize) -> Self {
         self.compact_at = at.max(1);
         self.compact_max = max_bytes.min(MAX_IMPORT_BYTES);
+        self
+    }
+
+    /// For tests: rewrite a status that changed once its last write is `gap` seconds old, and any
+    /// status once it is `refresh` seconds old.
+    #[doc(hidden)]
+    pub fn status_timing(mut self, gap: u64, refresh: u64) -> Self {
+        self.status_gap = gap;
+        self.status_refresh = refresh;
         self
     }
 
@@ -1272,6 +1360,12 @@ impl TeamFolder {
                 e.message
             ));
         }
+        if let Err(e) = self.note_status(store, &info) {
+            report.batch.notes.push(format!(
+                "saying when this machine last synced: {}; tried again next time",
+                e.message
+            ));
+        }
         if let Err(e) = self.note_exchange(&info, store.peer()) {
             report.batch.notes.push(format!(
                 "publishing this machine's key for receiving team keys: {}; tried again next time",
@@ -1342,6 +1436,108 @@ impl TeamFolder {
         let dir = self.root.join(SYNC_DIR).join(peer_dir_name(store.peer()));
         fs::create_dir_all(&dir).map_err(|e| folder_error(&dir, e))?;
         write_replacing(&dir, &dir.join(file), &bytes)
+    }
+
+    /// Writes this machine's status file when the one there does not read back, when what it
+    /// holds or its version changed and it is [`STATUS_GAP`] old, or when it is
+    /// [`STATUS_REFRESH`] old or from a later time than now (ADR 0005).
+    /// Only into a replica folder this machine's pushes made: a pull before the first push, such
+    /// as a join's that may yet be refused, leaves the team folder as it was.
+    fn note_status(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        let peer = store.peer();
+        let dir = self.root.join(SYNC_DIR).join(peer_dir_name(peer));
+        if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        let now = unix_now();
+        let holds = holds_text(&store.holds());
+        let version = env!("CARGO_PKG_VERSION");
+        let mine = self.signing.as_ref().map(|(key, _)| key.public());
+        if let Some((signer, last)) = self.status_of(info, peer) {
+            let age = now.checked_sub(last.at);
+            let same =
+                signer == mine && holds_text(&last.holds) == holds && last.version == version;
+            let due = match age {
+                None => true,
+                Some(age) => age >= self.status_refresh || (!same && age >= self.status_gap),
+            };
+            if !due {
+                return Ok(());
+            }
+        }
+        let signature = self
+            .signing
+            .as_ref()
+            .map(|(key, _)| key.sign_status(self.team_id(info), peer, now, &holds, version));
+        let status = StatusFile {
+            format: 1,
+            at: now,
+            holds,
+            version: version.to_owned(),
+            public_key: mine.map(|key| key.to_hex()),
+            signature,
+        };
+        let json = serde_json::to_vec(&status).expect("a status file serializes");
+        let (file, bytes) = match &self.key {
+            Some(_) => (STATUS_SEALED, self.seal_for(info, peer, &json)?),
+            None => (STATUS_PLAIN, json),
+        };
+        write_replacing(&dir, &dir.join(file), &bytes)
+    }
+
+    /// `peer`'s status file, with its signer on a signed team, if it reads: well formed and, on a
+    /// signed team, signed for `peer`. Whether that signer counts is the caller's to check.
+    fn status_of(&self, info: &TeamInfo, peer: u64) -> Option<(Option<PublicKey>, MachineStatus)> {
+        let name = if self.key.is_some() { STATUS_SEALED } else { STATUS_PLAIN };
+        let json = self.small_file(info, peer, name, MAX_STATUS)?;
+        let file = serde_json::from_slice::<StatusFile>(&json).ok()?;
+        (file.format == 1 && is_version(&file.version)).then_some(())?;
+        let holds = parse_holds(&file.holds)?;
+        let signer = match (&self.signing, &file.public_key, &file.signature) {
+            (None, _, _) => None,
+            (Some(_), Some(key), Some(signature)) => {
+                let key = PublicKey::from_hex(key)?;
+                let signed = (file.at, file.holds.as_str(), file.version.as_str());
+                sign::check_status(&key, self.team_id(info), peer, signed, signature)
+                    .then_some(())?;
+                Some(key)
+            }
+            (Some(_), _, _) => return None,
+        };
+        Some((signer, MachineStatus { at: file.at, holds, version: file.version }))
+    }
+
+    /// The sync status of each machine whose replica folder holds one that counts: on a signed
+    /// team, signed by a machine admitted for that folder or allowed to admit (ADR 0005).
+    pub fn statuses(&self, store: &LoroStore) -> Result<BTreeMap<u64, MachineStatus>> {
+        let info = self.checked_info()?;
+        // A signed team: who may vouch for which folder. [`Self::status_of`] reads a status with
+        // no signer only on a team that does not sign.
+        let trust = match &self.signing {
+            None => None,
+            Some(_) => {
+                let records = self.authority_records(store, &info)?;
+                let authority = self.resolve(store, &records)?;
+                let admitted = self.admitted_under(store, &info, &authority)?;
+                Some((authority, admitted))
+            }
+        };
+        let mut statuses = BTreeMap::new();
+        for peer in self.replica_folders()? {
+            let Some((signer, status)) = self.status_of(&info, peer) else { continue };
+            let counts = match (&trust, signer) {
+                (None, None) => true,
+                (Some((authority, admitted)), Some(signer)) => {
+                    authority.may_admit(&signer)
+                        || admitted.get(&peer).is_some_and(|keys| keys.contains(&signer))
+                }
+                _ => false,
+            };
+            if counts {
+                statuses.insert(peer, status);
+            }
+        }
+        Ok(statuses)
     }
 
     /// The machines admitted, by peer: every admission in the team document or checked before

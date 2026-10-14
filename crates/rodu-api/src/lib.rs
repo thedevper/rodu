@@ -180,6 +180,11 @@ pub struct MachineView {
     /// Such as "this machine", "numbers cards", "team owner", "admin", "waiting to be admitted",
     /// "removed".
     pub marks: Vec<String>,
+    /// When it last synced, whether it then held everything this machine holds, and its Rodu
+    /// version, as its status file says (ADR 0005), such as "synced 4 min ago, up to date with
+    /// this machine, rodu 0.8.0". `None` for this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

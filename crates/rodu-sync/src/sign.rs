@@ -41,6 +41,15 @@
 //! "rodu-exchange-1" 0x00 || u64 LE byte length of the workspace id || the workspace id
 //!     || the machine's peer id, u64 LE || its X25519 public key (32 bytes)
 //! ```
+//!
+//! Each machine also signs its sync status (ADR 0005): when it last synced, how much of each
+//! machine's work it held then, and its Rodu version:
+//!
+//! ```text
+//! "rodu-status-1" 0x00 || u64 LE byte length of the workspace id || the workspace id
+//!     || the machine's peer id, u64 LE || at, u64 LE || u64 LE byte length of holds || holds
+//!     || u64 LE byte length of version || version
+//! ```
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rodu_core::{Result, RoduError};
@@ -63,6 +72,7 @@ const EXCHANGE_DOMAIN: &[u8] = b"rodu-exchange-1\0";
 const EXCHANGE_KEY_DOMAIN: &[u8] = b"rodu-exchange-key-1\0";
 const WRAPPED_DOMAIN: &[u8] = b"rodu-wrapped-key-1\0";
 const JOIN_DOMAIN: &[u8] = b"rodu-join-1\0";
+const STATUS_DOMAIN: &[u8] = b"rodu-status-1\0";
 /// The length of a personal invite's join secret (ADR 0004, step 2).
 pub const JOIN_SECRET_LEN: usize = 16;
 
@@ -112,6 +122,16 @@ fn seen_message(workspace_id: &str, peer: u64, text: &str) -> Vec<u8> {
     let mut message = with_team(SEEN_DOMAIN, workspace_id, peer);
     message.extend((text.len() as u64).to_le_bytes());
     message.extend(text.as_bytes());
+    message
+}
+
+fn status_message(workspace_id: &str, peer: u64, at: u64, holds: &str, version: &str) -> Vec<u8> {
+    let mut message = with_team(STATUS_DOMAIN, workspace_id, peer);
+    message.extend(at.to_le_bytes());
+    for text in [holds, version] {
+        message.extend((text.len() as u64).to_le_bytes());
+        message.extend(text.as_bytes());
+    }
     message
 }
 
@@ -252,6 +272,19 @@ impl MachineKey {
         hex::encode(self.0.sign(&seen_message(workspace_id, peer, text)).to_bytes())
     }
 
+    /// This key's signature, 128 hex, on the sync status of the machine writing as `peer`: it
+    /// synced at `at` holding `holds`, running Rodu `version` (ADR 0005).
+    pub fn sign_status(
+        &self,
+        workspace_id: &str,
+        peer: u64,
+        at: u64,
+        holds: &str,
+        version: &str,
+    ) -> String {
+        hex::encode(self.0.sign(&status_message(workspace_id, peer, at, holds, version)).to_bytes())
+    }
+
     /// This machine's X25519 secret, for receiving team keys: derived from the signing key's seed
     /// under its own domain, so it is a separate key that needs no file of its own.
     pub fn exchange_secret(&self) -> Zeroizing<[u8; KEY_LEN]> {
@@ -356,6 +389,19 @@ pub fn check_seen(
 ) -> bool {
     from_hex::<SIGNATURE_LEN>(signature)
         .is_some_and(|sig| key.verifies(&seen_message(workspace_id, peer, text), &sig))
+}
+
+/// Whether `key` signed this sync status for the machine writing as `peer`.
+pub fn check_status(
+    key: &PublicKey,
+    workspace_id: &str,
+    peer: u64,
+    (at, holds, version): (u64, &str, &str),
+    signature: &str,
+) -> bool {
+    from_hex::<SIGNATURE_LEN>(signature).is_some_and(|sig| {
+        key.verifies(&status_message(workspace_id, peer, at, holds, version), &sig)
+    })
 }
 
 /// Whether `key` signed `exchange` as the X25519 key of the machine writing as `peer`.
