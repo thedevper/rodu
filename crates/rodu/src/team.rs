@@ -15,7 +15,9 @@ use rodu_core::{
     Actor, ErrorCode, LiveSync, PrincipalKind, Pulled, Result, RoduError, RoduService,
 };
 use rodu_http::{Sharing, TeamPanel};
-use rodu_sync::folder::{Admitted, JoinRequest, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder};
+use rodu_sync::folder::{
+    Admitted, JoinRequest, MachineStatus, PullReport, SYNC_DIR, TEAM_FILE, TeamFolder,
+};
 use rodu_sync::seal::TeamKey;
 use rodu_sync::sign::{self, MachineKey, PublicKey};
 use rodu_sync::{Checker, LoroStore};
@@ -927,11 +929,49 @@ pub(crate) fn members(io: &mut Io<'_>) -> Result<()> {
 }
 
 fn machine_line(machine: &MachineView) -> String {
-    if machine.marks.is_empty() {
+    let line = if machine.marks.is_empty() {
         format!("  machine {}", machine.id)
     } else {
         format!("  machine {} ({})", machine.id, machine.marks.join(", "))
+    };
+    match &machine.sync {
+        Some(sync) => format!("{line} — {sync}"),
+        None => line,
     }
+}
+
+/// What a status is compared with: what this machine holds, with each removed machine's work only
+/// up to its cut, since the team takes in nothing past it.
+fn compared(mut holds: BTreeMap<u64, u64>, removed: &BTreeMap<u64, u64>) -> BTreeMap<u64, u64> {
+    for (peer, cut) in removed {
+        if let Some(end) = holds.get_mut(peer) {
+            *end = (*end).min(*cut);
+        }
+    }
+    holds
+}
+
+/// What a machine's status file says, for `rodu team members` and the Team panel (ADR 0005):
+/// how long ago it synced by this machine's clock, whether it then held at least what this
+/// machine holds now (`mine`), and its version.
+fn sync_text(status: Option<&MachineStatus>, mine: &BTreeMap<u64, u64>, now: u64) -> String {
+    let Some(status) = status else {
+        return "no sync status yet (an older rodu, or it has not synced since it joined)"
+            .to_owned();
+    };
+    let when = match now.checked_sub(status.at) {
+        None if status.at - now > 300 => "synced at a time ahead of this machine's clock".into(),
+        None => "synced just now".to_owned(),
+        Some(age) if age < 60 => "synced just now".to_owned(),
+        Some(age) if age < 3600 => format!("synced {} min ago", age / 60),
+        Some(age) if age < 86400 => format!("synced {} h ago", age / 3600),
+        Some(age) if age < 2 * 86400 => "synced 1 day ago".to_owned(),
+        Some(age) => format!("synced {} days ago", age / 86400),
+    };
+    let up_to_date =
+        mine.iter().all(|(peer, end)| status.holds.get(peer).is_some_and(|held| held >= end));
+    let where_ = if up_to_date { "up to date with this machine" } else { "behind this machine" };
+    format!("{when}, {where_}, rodu {}", status.version)
 }
 
 /// The team as `rodu team members` and the board's Team panel show it.
@@ -963,6 +1003,14 @@ fn team_view(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> 
         Some(folder) => folder.removed(store)?,
         None => BTreeMap::new(),
     };
+    // What each machine's status file says (ADR 0005); none when the folder cannot be read,
+    // which the command's own sync has already warned about.
+    let statuses =
+        team_folder(dir, team).and_then(|folder| folder.statuses(store)).unwrap_or_default();
+    let mine = compared(store.holds(), &removed);
+    let now = unix_now();
+    let sync =
+        |peer: u64| (peer != store.peer()).then(|| sync_text(statuses.get(&peer), &mine, now));
     // The role of a machine in a signed team, by the keys admitted for it.
     let role = |peer: u64| -> Option<&'static str> {
         if removed.contains_key(&peer) {
@@ -1016,6 +1064,7 @@ fn team_view(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> 
             machines.push(MachineView {
                 id: short(peer),
                 marks: marks.into_iter().flatten().map(str::to_owned).collect(),
+                sync: sync(peer),
             });
         }
         let removable = signed.is_some() && active && !protected;
@@ -1037,7 +1086,11 @@ fn team_view(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> 
             } else {
                 None
             };
-            MachineView { id: short(peer), marks: mark.into_iter().map(str::to_owned).collect() }
+            MachineView {
+                id: short(peer),
+                marks: mark.into_iter().map(str::to_owned).collect(),
+                sync: sync(peer),
+            }
         })
         .collect();
     let asking = match &signed {
@@ -1056,7 +1109,6 @@ fn team_view(dir: &Path, team: &TeamConfig, service: &RoduService<AnyStore>) -> 
         (Some((_, _, authority)), Some(identity)) => authority.may_admit(&identity.public()),
         _ => false,
     };
-    let now = unix_now();
     let invites = match &folder {
         Some(folder) => folder
             .pending_invites()?
@@ -2537,5 +2589,37 @@ mod tests {
         let long = user(&"a".repeat(60)).unwrap();
         assert_eq!(long.len(), 34);
         assert!(rodu_core::service::valid_principal_name(&format!("{long}-agent")));
+    }
+
+    #[test]
+    fn a_sync_status_reads_as_an_age_a_comparison_and_a_version() {
+        let status = |at: u64, holds: &[(u64, u64)]| MachineStatus {
+            at,
+            holds: holds.iter().copied().collect(),
+            version: "0.8.0".to_owned(),
+        };
+        let mine: BTreeMap<u64, u64> = [(1, 10), (2, 5)].into();
+        let now = 1_000_000;
+        let text = |s: &MachineStatus| sync_text(Some(s), &mine, now);
+        assert_eq!(
+            text(&status(now - 30, &[(1, 10), (2, 5), (3, 1)])),
+            "synced just now, up to date with this machine, rodu 0.8.0"
+        );
+        assert!(
+            text(&status(now - 4 * 60, &[(1, 9), (2, 5)])).starts_with("synced 4 min ago, behind")
+        );
+        assert!(text(&status(now - 3 * 3600, &[(1, 10)])).contains("3 h ago, behind"));
+        assert!(text(&status(now - 86400, &[])).starts_with("synced 1 day ago"));
+        assert!(text(&status(now - 5 * 86400, &[])).starts_with("synced 5 days ago"));
+        assert!(text(&status(now + 60, &[])).starts_with("synced just now"), "a clock a bit ahead");
+        assert!(text(&status(now + 3600, &[])).starts_with("synced at a time ahead"));
+        assert!(sync_text(None, &mine, now).starts_with("no sync status yet"));
+        // A removed machine's work past its cut is never expected of anyone.
+        let removed: BTreeMap<u64, u64> = [(2, 3)].into();
+        let held = compared(mine.clone(), &removed);
+        assert_eq!(held, [(1, 10), (2, 3)].into());
+        assert!(
+            sync_text(Some(&status(now, &[(1, 10), (2, 3)])), &held, now).contains("up to date")
+        );
     }
 }
