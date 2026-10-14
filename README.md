@@ -21,7 +21,7 @@ brew install thedevper/tap/rodu
 Or without Homebrew:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.6.0/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/TheDevper/rodu/v0.7.0/packaging/install.sh | sh
 ```
 
 Update with `brew upgrade rodu`, or by running the script again.
@@ -31,14 +31,14 @@ Update with `brew upgrade rodu`, or by running the script again.
 In PowerShell (5.1 or 7; no administrator needed):
 
 ```powershell
-irm https://raw.githubusercontent.com/TheDevper/rodu/v0.6.0/packaging/install.ps1 | iex
+irm https://raw.githubusercontent.com/TheDevper/rodu/v0.7.0/packaging/install.ps1 | iex
 ```
 
 It puts `rodu.exe` in `%LOCALAPPDATA%\Programs\rodu` and adds that folder to your PATH. Open a new
 terminal afterwards, then check with `rodu --version`.
 
 To update, run the same command again: it installs the latest release. It works while `rodu web`
-or `rodu mcp` is running; restart them to use the new version. `$env:RODU_VERSION = '0.6.0'`
+or `rodu mcp` is running; restart them to use the new version. `$env:RODU_VERSION = '0.7.0'`
 before the command installs a given release instead.
 
 Or with [Scoop](https://scoop.sh):
