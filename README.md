@@ -137,6 +137,12 @@ rodu team members               # who is on the team
 rodu team remove bob --yes      # refuse what bob's machines write from now on
 ```
 
+`rodu team members` and the board's **Team** panel also say when each teammate's machine last
+synced, whether it then had everything your machine has, and which Rodu version it runs, so a
+teammate who reads the board without changing anything still shows up. Each machine keeps that in
+a small file in its own folder, sealed and signed like the rest; machines on Rodu 0.7.0 or older
+write none.
+
 `team remove` also changes the team key. What each machine writes once it has the new key is
 closed to the removed machine. What the folder held before stays readable to it, and so does what
 a machine writes before it next syncs. `rodu team admin` lets another person admit machines, and

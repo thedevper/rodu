@@ -897,7 +897,7 @@ fn members_lists_each_person_with_their_agents_and_machines() {
     assert!(list.contains("agents: ann-agent"), "{list}");
     assert!(list.contains("agents: bob-agent"), "{list}");
     assert!(list.contains(&format!("machine {ann_id} (this machine, numbers cards)")), "{list}");
-    assert!(list.contains(&format!("machine {bob_id}\n")), "{list}");
+    assert!(list.contains(&format!("machine {bob_id} — no sync status yet")), "{list}");
     assert!(!list.contains("Unknown"), "{list}");
     assert!(list.contains("nothing proves it yet"), "{list}");
     // bob sees the same people, with his own machine marked.
@@ -913,7 +913,10 @@ fn a_replica_folder_nobody_claims_is_an_unknown_machine() {
     std::fs::create_dir_all(team.folder.join("sync/not-a-machine")).unwrap();
     let list = ok(&team.ann, &["team", "members"]);
     assert!(list.contains("Unknown machines"), "{list}");
-    assert!(list.contains("machine 00000000\n"), "shown by its folder's first 8 digits: {list}");
+    assert!(
+        list.contains("machine 00000000 — no sync status yet"),
+        "shown by its folder's first 8 digits: {list}"
+    );
     assert!(!list.contains("not-a-machine"), "only replica folders are machines: {list}");
 }
 
@@ -1939,4 +1942,29 @@ fn rodu_web_with_no_workspace_joins_a_team_and_reopens_as_its_board_on_the_same_
     for text in [&printed, &errors] {
         assert!(!text.contains(&code), "the invite stays out of the terminal: {text}");
     }
+}
+
+#[test]
+fn members_says_when_each_machine_last_synced() {
+    let team = team();
+    let bob = join(&team, "bob");
+    let cat = join(&team, "cat");
+    // bob syncs once more after his join; cat's join was the last time cat synced.
+    ok(&bob, &["ls"]);
+    let version = format!("rodu {}", env!("CARGO_PKG_VERSION"));
+    let line_of = |list: &str, machine: &str| {
+        list.lines().find(|l| l.contains(machine)).unwrap_or_else(|| panic!("{list}")).to_owned()
+    };
+    let list = ok(&team.ann, &["team", "members"]);
+    let bobs = line_of(&list, &machine(&bob)[..8]);
+    assert!(bobs.contains("synced just now"), "{bobs}");
+    assert!(bobs.contains("up to date with this machine"), "{bobs}");
+    assert!(bobs.contains(&version), "{bobs}");
+    assert!(line_of(&list, &machine(&cat)[..8]).contains("no sync status yet"), "{list}");
+    assert!(!line_of(&list, &machine(&team.ann)[..8]).contains("synced"), "not for this machine");
+
+    // ann's new card is not in what bob held when he last synced.
+    ok(&team.ann, &["add", "After bob synced"]);
+    let list = ok(&team.ann, &["team", "members"]);
+    assert!(line_of(&list, &machine(&bob)[..8]).contains("behind this machine"), "{list}");
 }

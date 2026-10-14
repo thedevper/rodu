@@ -520,6 +520,16 @@ impl LoroStore {
         self.doc.borrow().oplog_vv().get(&peer).map_or(0, |end| (*end).max(0) as u64)
     }
 
+    /// [`LoroStore::seen_end`] of every peer this replica holds operations of. Peer 0, which Loro
+    /// never gives, is left out.
+    pub fn holds(&self) -> BTreeMap<u64, u64> {
+        let vv = self.doc.borrow().oplog_vv();
+        vv.iter()
+            .filter(|(peer, end)| **peer != 0 && **end > 0)
+            .map(|(peer, end)| (*peer, *end as u64))
+            .collect()
+    }
+
     /// Everything this replica has that `version` has not seen.
     pub fn updates_since(&self, version: &[u8]) -> Result<Vec<u8>> {
         let seen = VersionVector::decode(version)
