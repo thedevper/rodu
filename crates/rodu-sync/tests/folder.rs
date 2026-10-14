@@ -171,9 +171,14 @@ fn team() -> (TempDir, TeamFolder) {
     (root, folder)
 }
 
+/// The files in `peer`'s replica folder, but for its sync status (ADR 0005).
 fn files_of(folder: &TeamFolder, peer: u64) -> Vec<std::path::PathBuf> {
     let dir = folder.root().join("sync").join(format!("{peer:016x}"));
-    let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| !p.file_name().unwrap().to_str().unwrap().starts_with("status."))
+        .collect();
     files.sort();
     files
 }
@@ -2938,4 +2943,214 @@ fn an_admin_demoted_in_the_same_pull_admits_no_one_and_its_invites_end() {
     ann_folder.set_admin(a.store(), &public(&bob_key), true).unwrap();
     a.sync(&ann_folder);
     assert!(b.sync(&bob_folder).invited.is_empty());
+}
+
+// --- sync status (ADR 0005) ---------------------------------------------------------------------
+
+fn status_file(folder: &TeamFolder, peer: u64, name: &str) -> std::path::PathBuf {
+    folder.root().join("sync").join(format!("{peer:016x}")).join(name)
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+#[test]
+fn each_machine_says_when_it_last_synced_and_how_much_it_held() {
+    let (_root, folder) = team();
+    let folder = folder.status_timing(0, 600);
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    let start = now();
+    b.sync(&folder);
+    a.sync(&folder);
+    let (ann, bob) = (a.store().peer(), b.store().peer());
+    let statuses = folder.statuses(a.store()).unwrap();
+    let seen = &statuses[&bob];
+    assert!(seen.at >= start && seen.at <= now(), "{seen:?}");
+    assert_eq!(seen.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(seen.holds.get(&ann).copied(), Some(a.store().seen_end(ann)), "{seen:?}");
+    assert!(statuses.contains_key(&ann), "ann's own status is there too");
+
+    // ann writes after bob's sync: bob's status holds less of ann's work, until bob syncs.
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "After" })], None).unwrap();
+    a.sync(&folder);
+    let seen = folder.statuses(a.store()).unwrap().remove(&bob).unwrap();
+    assert!(seen.holds[&ann] < a.store().seen_end(ann));
+    b.sync(&folder);
+    let seen = folder.statuses(a.store()).unwrap().remove(&bob).unwrap();
+    assert_eq!(seen.holds[&ann], a.store().seen_end(ann));
+}
+
+#[test]
+fn a_status_is_rewritten_only_when_it_changed_after_a_while_or_when_it_is_old() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    b.sync(&folder);
+    let path = status_file(&folder, b.store().peer(), "status.json");
+    let written = std::fs::read(&path).unwrap();
+    // Nothing new, or something new within a minute: the file stays as it is.
+    b.sync(&folder);
+    a.svc.create_items(&a.me, "DEMO", &[json!({ "title": "After" })], None).unwrap();
+    a.sync(&folder);
+    b.sync(&folder);
+    assert_eq!(std::fs::read(&path).unwrap(), written);
+    // Once the gap has passed, what changed is written.
+    let quick = folder.status_timing(0, 600);
+    b.sync(&quick);
+    let rewritten = std::fs::read(&path).unwrap();
+    assert_ne!(rewritten, written);
+    b.sync(&quick);
+    assert_eq!(std::fs::read(&path).unwrap(), rewritten, "nothing changed since");
+    // An old status is written again even when nothing changed.
+    let stale = quick.status_timing(0, 0);
+    b.sync(&stale);
+    let seen = stale.statuses(a.store()).unwrap().remove(&b.store().peer()).unwrap();
+    assert!(seen.at + 2 >= now());
+}
+
+#[test]
+fn an_encrypted_teams_status_is_sealed() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = sealed_at(root.path(), KEY);
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    b.sync(&folder);
+    let bob = b.store().peer();
+    assert!(status_file(&folder, bob, "status.sealed").is_file());
+    assert!(!status_file(&folder, bob, "status.json").exists());
+    let all = folder_bytes(&folder);
+    assert!(!all.windows(5).any(|w| w == b"holds"), "the status is not readable in the folder");
+    assert!(folder.statuses(a.store()).unwrap().contains_key(&bob));
+    // Under another key the folder is refused whole.
+    assert!(sealed_at(root.path(), &"0".repeat(64)).statuses(a.store()).is_err());
+}
+
+#[test]
+fn a_signed_teams_status_counts_only_for_a_machine_admitted_for_its_folder() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, bob_folder, b, c, .. } = with_cat(root.path());
+    let (bob, cat) = (b.store().peer(), c.store().peer());
+    b.sync(&bob_folder);
+    let statuses = ann_folder.statuses(a.store()).unwrap();
+    assert!(statuses.contains_key(&bob) && statuses.contains_key(&cat), "{statuses:?}");
+
+    // bob's status copied into cat's folder does not verify there.
+    let bobs = std::fs::read(status_file(&ann_folder, bob, "status.json")).unwrap();
+    std::fs::write(status_file(&ann_folder, cat, "status.json"), &bobs).unwrap();
+    assert!(!ann_folder.statuses(a.store()).unwrap().contains_key(&cat));
+
+    // eve, never admitted, signs a status for a folder of her own.
+    let eve = MachineKey::generate().unwrap();
+    let eve_peer = 0x0e0e_0e0e_0e0e_0e0e_u64;
+    let dir = root.path().join(format!("Shared/Team/sync/{eve_peer:016x}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let holds = format!("{bob:016x}:1");
+    let at = now();
+    let file = json!({
+        "format": 1,
+        "at": at,
+        "holds": holds,
+        "version": "0.7.1",
+        "publicKey": eve.public().to_hex(),
+        "signature": eve.sign_status(TEAM_ID, eve_peer, at, &holds, "0.7.1"),
+    });
+    std::fs::write(dir.join("status.json"), file.to_string()).unwrap();
+    assert!(!ann_folder.statuses(a.store()).unwrap().contains_key(&eve_peer));
+
+    // Without a signature, in a signed team, it says nothing.
+    let unsigned = json!({ "format": 1, "at": at, "holds": holds, "version": "0.7.1" });
+    std::fs::write(status_file(&ann_folder, bob, "status.json"), unsigned.to_string()).unwrap();
+    assert!(!ann_folder.statuses(a.store()).unwrap().contains_key(&bob));
+}
+
+#[test]
+fn a_status_out_of_shape_is_no_status() {
+    let (root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    b.sync(&folder);
+    let bob = b.store().peer();
+    let path = status_file(&folder, bob, "status.json");
+    let at = now();
+    let bad = [
+        json!({ "format": 2, "at": at, "holds": "", "version": "0.7.1" }).to_string(),
+        json!({ "format": 1, "at": at, "holds": "zz:1", "version": "0.7.1" }).to_string(),
+        json!({ "format": 1, "at": at, "holds": format!("{bob:016x}:x"), "version": "0.7.1" })
+            .to_string(),
+        json!({ "format": 1, "at": at, "holds": "", "version": "0.7.1\u{1b}[2J" }).to_string(),
+        json!({ "format": 1, "at": at, "holds": "", "version": "9".repeat(33) }).to_string(),
+        format!(
+            "{{\"format\":1,\"at\":{at},\"holds\":\"{}\",\"version\":\"0.7.1\"}}",
+            (1..=1025u64).map(|p| format!("{p:016x}:1")).collect::<Vec<_>>().join(",")
+        ),
+        "not json".to_owned(),
+    ];
+    for text in bad {
+        std::fs::write(&path, &text).unwrap();
+        assert!(!folder.statuses(a.store()).unwrap().contains_key(&bob), "{text:.80}");
+    }
+    // A link in place of the file is never followed.
+    #[cfg(unix)]
+    {
+        let good = json!({ "format": 1, "at": at, "holds": "", "version": "0.7.1" });
+        let elsewhere = root.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, good.to_string()).unwrap();
+        std::fs::write(&path, good.to_string()).unwrap();
+        assert!(folder.statuses(a.store()).unwrap().contains_key(&bob), "the good one reads");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        assert!(!folder.statuses(a.store()).unwrap().contains_key(&bob));
+    }
+}
+
+#[test]
+fn a_pull_before_a_machines_first_push_writes_no_status() {
+    let (_root, folder) = team();
+    let _a = first(&folder);
+    let dir = tempfile::tempdir().unwrap();
+    let store = LoroStore::open(dir.path()).unwrap();
+    folder.pull(&store, &checker()).unwrap();
+    assert!(!folder.root().join("sync").join(format!("{:016x}", store.peer())).exists());
+}
+
+#[test]
+fn a_status_from_a_later_time_than_now_is_written_again() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    b.sync(&folder);
+    let bob = b.store().peer();
+    let path = status_file(&folder, bob, "status.json");
+    let ahead = now() + 3600;
+    let file = json!({ "format": 1, "at": ahead, "holds": "", "version": "0.7.1" });
+    std::fs::write(&path, file.to_string()).unwrap();
+    b.sync(&folder);
+    let seen = folder.statuses(a.store()).unwrap().remove(&bob).unwrap();
+    assert!(seen.at <= now() && seen.version == env!("CARGO_PKG_VERSION"), "{seen:?}");
+}
+
+#[test]
+fn a_status_holding_many_machines_still_reads_and_more_or_bigger_ones_do_not() {
+    let (_root, folder) = team();
+    let a = first(&folder);
+    let b = join(&folder, "bob");
+    b.sync(&folder);
+    let bob = b.store().peer();
+    let path = status_file(&folder, bob, "status.json");
+    let at = now();
+    let holds = |count: u64| {
+        (1..=count).map(|p| format!("{p:016x}:{}", u64::MAX)).collect::<Vec<_>>().join(",")
+    };
+    let file = |holds: String| {
+        json!({ "format": 1, "at": at, "holds": holds, "version": "0.7.1" }).to_string()
+    };
+    std::fs::write(&path, file(holds(1024))).unwrap();
+    assert_eq!(folder.statuses(a.store()).unwrap()[&bob].holds.len(), 1024);
+    let twice = format!("{bob:016x}:1,{bob:016x}:2");
+    for bad in [file(twice), file(holds(1024)) + &" ".repeat(64 * 1024)] {
+        std::fs::write(&path, &bad).unwrap();
+        assert!(!folder.statuses(a.store()).unwrap().contains_key(&bob), "{:.80}", bad);
+    }
 }

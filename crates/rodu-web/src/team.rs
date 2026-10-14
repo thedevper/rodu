@@ -234,6 +234,7 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
                                                                     .into_iter()
                                                                     .map(|mark| view! { <span class="mark">{mark}</span> })
                                                                     .collect_view()}
+                                                                {machine.sync.map(|sync| view! { <span class="machine-sync">{sync}</span> })}
                                                             </li>
                                                         }
                                                     })
@@ -259,6 +260,7 @@ pub fn TeamPanel(api: Api, on_close: Callback<()>, on_error: Callback<ApiError>)
                                                     <li>
                                                         <code>{machine.id}</code>
                                                         {machine.marks.into_iter().map(|mark| view! { <span class="mark">{mark}</span> }).collect_view()}
+                                                        {machine.sync.map(|sync| view! { <span class="machine-sync">{sync}</span> })}
                                                     </li>
                                                 }
                                             })
