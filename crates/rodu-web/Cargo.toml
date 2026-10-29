@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
-rodu-api = { version = "0.8.0", path = "../rodu-api" }
+rodu-api = { version = "0.9.0", path = "../rodu-api" }
 
 # The board itself only runs in the browser; on the host only the pure board logic builds, so
 # `cargo test -p rodu-web` stays fast and needs no browser.
