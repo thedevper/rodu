@@ -217,13 +217,16 @@ The note under the activity changes from "Recorded on this machine" to:
    - a field change, a comment, a link and a creation, from a second replica;
    - a file held for missing operations is indexed when they land;
    - a rebuild equals the incremental table and keeps `change_received`.
-3. **Reading:** the order, the before value, the time rules and `--local`. Tests:
+3. **Reading:** the order, the before value, the time rules, `--local` and the audit. Tests:
    - two concurrent writes to one field show the same earlier value;
    - a 0.9-style change shows as `earlier`, and as `after` once it builds on a timed change;
    - a clock two hours ahead shows as `before`;
    - on a signed team: an unadmitted peer as an unknown machine, a removed machine's entries before
      and after its cut, and a `via` naming another person's agent dropped;
    - the adopt change reads as "added to the team board";
+   - `rodu audit` and `get_audit` show the machine, and are the same after `team_activity` is
+     edited by hand;
+   - an untimed change after a timed one from the same peer is flagged;
    - the browser smoke test checks a teammate's change in the panel.
 4. **Measure again** at 20,000 cards: a compacted file's size, open, rebuild with its rows, and
    `show --activity`. Record the figures here.
@@ -254,13 +257,42 @@ second. Of the four:
 What is new is that members see it per card, per field. That is the point of the feature, and it
 is the same as what any shared tracker shows.
 
-## Open questions
+## Settled (2026-10-29, by the owner)
 
-1. Should a member be able to turn timestamps off for their own machine? Their changes would still
-   inherit their dependencies' times, so they would show as `after <time>`, not hidden. It costs a
-   setting that nobody else can check.
-2. `team_activity` grows by one row per field change, for ever, like the history. Should it be
-   capped per card (keep the newest 500, as `--limit` caps reading), with the rest read from the
-   document on demand?
-3. Should the board's Activity section show the person's machine (`1a2b3c4d`) when a person has
-   more than one?
+1. **Timestamps are always on.** There is no setting to turn them off, for a machine or a team.
+   Rodu cannot stop a modified build from writing changes without a time. So the audit (below)
+   flags a change with time 0 from a peer that wrote timed changes before it: Rodu itself never
+   writes one.
+2. **`team_activity` is not capped.** It grows by one row per field change, like the history it is
+   built from. Capping a table that a rebuild fills again from the uncapped history would save
+   little. Its size at 20,000 cards is measured in step 4.
+3. **The machine is kept for audit, not shown.** The board, `show --activity` and `get_activity`
+   show the person and the agent. They do not show the machine.
+
+### Audit
+
+`rodu audit <key>` and the MCP tool `get_audit` list a card's entries with everything that is
+known about each one:
+- the machine (peer id, 16 hex digits);
+- the change id (peer and counter) and its Lamport timestamp;
+- the raw time, `deps_at` and `received`;
+- the commit message;
+- whether the writer is admitted, removed, or past its cut.
+
+It is read-only, and there is no way to edit it:
+- nothing in Rodu (CLI, MCP or the local API) writes activity;
+- the audit does not read `team_activity`, which anyone with access to the machine could edit in
+  `rodu.db`. It reads the changes from the document itself, each time it runs. The document's
+  history is only ever added to. On a signed team, each change is signed by the machine that wrote
+  it.
+
+What it proves follows from that:
+- On a signed team it proves which admitted machine wrote each change.
+- On an unsigned team the machine is what the files say. The audit's output says which kind of
+  team it is.
+- On either, a time is what the clocks said (see "When").
+
+Any member can run it. Every member holds the whole document (ADR 0002), so limiting the command to
+the owner and admins would only hide what each member's own copy already holds.
+
+The audit is step 3.
