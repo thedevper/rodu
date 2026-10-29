@@ -550,7 +550,8 @@ where
                     .entries
                     .iter()
                     .map(|e| ActivityView {
-                        at: e.at.clone(),
+                        at: e.when.time().unwrap_or_default().to_string(),
+                        when: e.when.qualifier().map(str::to_string),
                         actor: e.actor.clone(),
                         via: e.via.clone(),
                         what: activity_what(e),
@@ -563,6 +564,7 @@ where
                         comments,
                         activity,
                         activity_total: log.total,
+                        activity_note: log.scope.note().to_string(),
                     },
                 )
             }

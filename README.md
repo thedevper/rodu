@@ -163,9 +163,10 @@ Tools: `search`, `get_my_work`, `get_context`, `get_activity`, `create_items`, `
 `comment`, `link`, `list_collections`, `create_collection`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
 Every change an agent makes is recorded as "owner via agent", and `get_activity` (or
 `rodu show --activity`, or Activity on a card in `rodu web`) lists who changed what on a card and
-when. That history stays on the machine that made the change: in a team, each machine lists only its
-own. Workflow rules are enforced in the
-domain, and refusals carry a hint the agent can act on.
+when. In a team it lists every machine's changes, read from the team's shared history: times are
+each machine's own clock, so one that runs ahead shows as "before" the moment yours received it.
+`rodu show --activity --local` lists what this machine recorded itself. Workflow rules are enforced
+in the domain, and refusals carry a hint the agent can act on.
 
 Only run `rodu mcp` against a workspace you trust: it serves whatever `.rodu/` it finds.
 

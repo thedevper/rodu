@@ -187,6 +187,7 @@ pub fn activity_what(entry: &Activity) -> String {
     let value = |v: &Option<String>| v.as_deref().map_or_else(|| "none".into(), short);
     match entry.action.as_str() {
         "item.create" => "created".into(),
+        "item.adopt" => "added to the team board".into(),
         "item.number" | "item.update" if entry.changes.is_empty() => "updated".into(),
         "item.number" | "item.update" => entry
             .changes
@@ -210,12 +211,10 @@ pub fn activity_what(entry: &Activity) -> String {
     }
 }
 
-/// A card's history as Markdown: one line per entry, `time · who (via agent) · what`. Titles,
+/// A card's history as Markdown: one line per entry, `when · who (via agent) · what`. Titles,
 /// comments and links are people's words, so the whole list sits in one untrusted fence.
 pub fn format_activity(log: &ActivityLog) -> String {
-    let mut out = String::from(
-        "## Activity\n\nRecorded on this machine: changes made on a teammate's machine are not listed.",
-    );
+    let mut out = format!("## Activity\n\n{}", log.scope.note());
     if log.entries.is_empty() {
         out.push_str("\n\nNothing recorded yet.");
         return out;
@@ -226,7 +225,7 @@ pub fn format_activity(log: &ActivityLog) -> String {
         .map(|e| {
             let who =
                 e.via.as_ref().map_or_else(|| e.actor.clone(), |v| format!("{} via {v}", e.actor));
-            format!("- {} · {who} · {}", e.at, activity_what(e))
+            format!("- {} · {who} · {}", e.when, activity_what(e))
         })
         .collect();
     out.push_str("\n\n");

@@ -30,6 +30,16 @@ fn local_time(timestamp: &str) -> String {
         .into()
 }
 
+/// When an entry was made, in local time: `after`, `before` or `earlier` where clocks cannot
+/// say more (ADR 0006).
+fn when_shown(entry: &ActivityView) -> String {
+    match (entry.when.as_deref(), entry.at.is_empty()) {
+        (Some(word), true) => word.to_string(),
+        (Some(word), false) => format!("{word} {}", local_time(&entry.at)),
+        (None, _) => local_time(&entry.at),
+    }
+}
+
 fn remembered_width() -> f64 {
     window()
         .local_storage()
@@ -75,6 +85,7 @@ pub fn ItemPanel(
     let item = RwSignal::new(None::<ItemView>);
     let comments = RwSignal::new(Vec::<CommentView>::new());
     let activity = RwSignal::new((Vec::<ActivityView>::new(), 0usize));
+    let activity_note = RwSignal::new(String::new());
     let title = RwSignal::new(String::new());
     let comment = RwSignal::new(String::new());
     let width = RwSignal::new(remembered_width());
@@ -172,6 +183,7 @@ pub fn ItemPanel(
                 if fresher(n) {
                     comments.try_set(detail.comments);
                     activity.try_set((detail.activity, detail.activity_total));
+                    activity_note.try_set(detail.activity_note);
                 }
                 show(detail.item);
             }
@@ -192,6 +204,7 @@ pub fn ItemPanel(
         if fresher(n) {
             comments.try_set(detail.comments);
             activity.try_set((detail.activity, detail.activity_total));
+            activity_note.try_set(detail.activity_note);
         }
         let Some(shown) = item.try_with_untracked(|i| i.as_ref().map(|i| i.version)) else {
             return;
@@ -736,7 +749,7 @@ pub fn ItemPanel(
                         "Activity "
                         <span class="muted">{move || activity.with(|(_, total)| format!("({total})"))}</span>
                     </summary>
-                    <p class="muted">"Recorded on this machine: changes made on a teammate's machine are not listed."</p>
+                    <p class="muted">{move || activity_note.get()}</p>
                     {move || {
                         let older = activity.with(|(shown, total)| total.saturating_sub(shown.len()));
                         (older > 0).then(|| view! { <p class="muted">{format!("{older} older not shown")}</p> })
@@ -748,12 +761,13 @@ pub fn ItemPanel(
                                 .0
                                 .into_iter()
                                 .map(|a| {
+                                    let when = when_shown(&a);
                                     view! {
                                         <li>
                                             <div class="comment-meta">
                                                 <strong>{a.actor}</strong>
                                                 {a.via.map(|via| view! { <span class="via">{format!("via {via}")}</span> })}
-                                                <time datetime=a.at.clone()>{local_time(&a.at)}</time>
+                                                <time datetime=a.at.clone()>{when}</time>
                                             </div>
                                             <p class="activity-what">{a.what}</p>
                                         </li>
