@@ -990,3 +990,140 @@ fn the_readable_copy_setting_is_shared_and_only_true_turns_it_on() {
         assert!(!c.store().readable_copy().unwrap(), "{bad:?}");
     }
 }
+
+/// Time and commit message of each change `peer` wrote in `bytes` (updates or a snapshot), oldest
+/// first, as a machine with Loro's default settings reads them.
+fn changes_of(bytes: &[u8], peer: u64) -> Vec<(i64, String)> {
+    let doc = LoroDoc::new();
+    doc.import(bytes).unwrap();
+    let end = doc.oplog_vv().get(&peer).copied().unwrap_or(0);
+    let mut out = Vec::new();
+    let mut counter = 0;
+    while counter < end {
+        let meta = doc.get_change(loro::ID::new(peer, counter)).unwrap();
+        out.push((meta.timestamp, meta.message.map(|m| m.to_string()).unwrap_or_default()));
+        counter += meta.len as i32;
+    }
+    out
+}
+
+/// The agent a change's message names, if any, after its parity digit.
+fn via_of(message: &str) -> Option<&str> {
+    let (parity, rest) = message.split_at(1);
+    assert!(parity == "0" || parity == "1", "{message:?}");
+    rest.strip_prefix(" via ")
+}
+
+/// Every change's message differs from the one before it, so Loro never merges two of them.
+fn assert_alternates(changes: &[(i64, String)]) {
+    for pair in changes.windows(2) {
+        assert_ne!(pair[0].1, pair[1].1, "{changes:?}");
+    }
+}
+
+#[test]
+fn each_write_is_a_change_of_its_own_with_the_services_time_and_its_agent() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let start = time::macros::datetime!(2026-10-29 09:00:00 UTC);
+    let offset = std::sync::Arc::new(AtomicI64::new(0));
+    let clock = {
+        let offset = offset.clone();
+        move || -> rodu_core::clock::Clock {
+            let offset = offset.clone();
+            std::sync::Arc::new(move || {
+                start + time::Duration::seconds(offset.load(Ordering::SeqCst))
+            })
+        }
+    };
+    let svc = RoduService::with_clock(LoroStore::open(dir.path()).unwrap(), clock());
+    let ann = svc.create_principal("ann", PrincipalKind::Human, None).unwrap();
+    let agent = svc.create_principal("ann-claude", PrincipalKind::Agent, Some(&ann.id)).unwrap();
+    let me = Actor { principal_id: ann.id.clone(), via_agent_id: None };
+    let via = Actor { principal_id: ann.id, via_agent_id: Some(agent.id.clone()) };
+    svc.create_collection(&me, "demo", "Demo").unwrap();
+    let peer = svc.store.peer();
+    let empty = LoroDoc::new().oplog_vv().encode();
+    let before = changes_of(&svc.store.updates_since(&empty).unwrap(), peer).len();
+    assert_eq!(before, 3, "two principals and a collection");
+
+    // All in one second, by one hand or another: each still a change of its own. The last two
+    // are made by another process, as the CLI makes them, after reopening the saved document.
+    svc.create_items(&me, "DEMO", &[json!({ "title": "One" })], None).unwrap();
+    svc.update_item(&via, "DEMO-1", &json!({ "priority": "high" }), None).unwrap();
+    svc.update_item(&me, "DEMO-1", &json!({ "title": "One, renamed" }), None).unwrap();
+    drop(svc);
+    let svc = RoduService::with_clock(LoroStore::open(dir.path()).unwrap(), clock());
+    svc.update_item(&me, "DEMO-1", &json!({ "estimate": 3 }), None).unwrap();
+    offset.store(1, Ordering::SeqCst);
+    svc.update_item(&me, "DEMO-1", &json!({ "estimate": 5 }), None).unwrap();
+
+    let secs = start.unix_timestamp();
+    let sync_file = svc.store.updates_since(&empty).unwrap();
+    let all = changes_of(&sync_file, peer);
+    let got: Vec<(i64, Option<&str>)> = all.iter().map(|(t, m)| (*t, via_of(m))).collect();
+    let mut want = vec![(secs, None); 3];
+    want.extend([(secs, None), (secs, Some(agent.id.as_str())), (secs, None), (secs, None)]);
+    want.push((secs + 1, None));
+    assert_eq!(got, want, "a sync file: {all:?}");
+    assert_alternates(&all);
+
+    // Another machine keeps them as it took them in, in two pulls, and passes them on so.
+    let other = tempfile::tempdir().unwrap();
+    let replica = LoroStore::open(other.path()).unwrap();
+    let half = {
+        let first = LoroDoc::new();
+        first.import(&sync_file).unwrap();
+        first
+            .export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(peer, 0, 4)]))
+            .unwrap()
+    };
+    replica.import_untrusted(&half, &checker()).unwrap();
+    replica.import_untrusted(&sync_file, &checker()).unwrap();
+    assert_eq!(changes_of(&replica.updates_since(&empty).unwrap(), peer), all, "another machine");
+
+    // The saved document, reopened, keeps them, and so does its snapshot.
+    drop(svc);
+    let reopened = LoroStore::open(dir.path()).unwrap();
+    assert_eq!(changes_of(&reopened.updates_since(&empty).unwrap(), peer), all, "reopened");
+    let snapshot = std::fs::read(dir.path().join("rodu.loro")).unwrap();
+    assert_eq!(changes_of(&snapshot, peer), all, "the snapshot file");
+}
+
+#[test]
+fn a_failed_write_leaves_no_commit_context_behind() {
+    let a = Peer::first();
+    let store = a.store();
+    store.set_commit_context(1_792_000_000, Some("0192f3a4-aaaa-7bbb-8ccc-ddddeeeeffff"));
+    let failed: Result<(), RoduError> = store.transaction(TxMode::Write, || {
+        store.set_readable_copy(true)?;
+        Err(RoduError::invalid("stopped on purpose"))
+    });
+    assert!(failed.is_err());
+    // A write with no context of its own: no agent, and Loro's own clock, not the old time.
+    store.set_readable_copy(true).unwrap();
+    let empty = LoroDoc::new().oplog_vv().encode();
+    let all = changes_of(&store.updates_since(&empty).unwrap(), store.peer());
+    let (last_at, last_message) = all.last().unwrap();
+    assert_eq!(via_of(last_message), None, "{all:?}");
+    assert!(*last_at > 1_792_000_000, "timestamps are on: {last_at}");
+    assert_alternates(&all);
+}
+
+#[test]
+fn a_write_nested_in_another_does_not_take_over_its_context() {
+    let a = Peer::first();
+    let store = a.store();
+    let agent = "0192f3a4-aaaa-7bbb-8ccc-ddddeeeeffff";
+    store.set_commit_context(1_792_000_000, Some(agent));
+    store
+        .transaction(TxMode::Write, || {
+            store.set_commit_context(1_792_000_100, Some("0192f3a4-bbbb-7ccc-8ddd-eeeeffff0000"));
+            store.set_readable_copy(true)
+        })
+        .unwrap();
+    let empty = LoroDoc::new().oplog_vv().encode();
+    let all = changes_of(&store.updates_since(&empty).unwrap(), store.peer());
+    let (last_at, last_message) = all.last().unwrap();
+    assert_eq!((*last_at >= 1_792_000_000, via_of(last_message)), (true, Some(agent)), "{all:?}");
+}

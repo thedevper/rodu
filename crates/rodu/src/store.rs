@@ -41,6 +41,13 @@ impl Store for AnyStore {
         }
     }
 
+    fn set_commit_context(&self, at: i64, via_agent_id: Option<&str>) {
+        match self {
+            AnyStore::Plain(s) => s.set_commit_context(at, via_agent_id),
+            AnyStore::Team(s) => s.set_commit_context(at, via_agent_id),
+        }
+    }
+
     delegate! {
         fn insert_principal(&self, principal: &Principal) -> Result<()>;
         fn find_principal(&self, id_or_name: &str) -> Result<Option<Principal>>;
