@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::activity::{self, Activity, ActivityLog, Refers};
 use crate::clock::{Clock, iso, system_clock, unix_ms};
 use crate::error::{Result, RoduError};
 use crate::format::{ContextParts, format_context, links_to_item};
@@ -942,6 +943,58 @@ impl<S: Store> RoduService<S> {
         };
         let budget = token_budget.unwrap_or(DEFAULT_CONTEXT_TOKENS).max(500) as usize;
         Ok(format_context(&parts, budget * 4))
+    }
+
+    /// The newest `limit` entries (default 50, at most 500) of what was done to an item on this
+    /// replica, oldest first. Ids are shown as the names and keys people know.
+    pub fn activity(&self, reference: &str, limit: Option<u32>) -> Result<ActivityLog> {
+        let item = self.item(reference)?;
+        let limit = limit.unwrap_or(50).clamp(1, 500) as usize;
+        let events = self.store.list_events(&item.id)?;
+        let total = events.len();
+        let principal = |id: &str| -> Result<String> {
+            Ok(self.store.find_principal(id)?.map_or_else(|| id.to_string(), |p| p.name))
+        };
+        let item_key = |id: &str| -> Result<String> {
+            Ok(self.store.get_item(id)?.map_or(id.into(), |i| i.key))
+        };
+        let entries = events[total.saturating_sub(limit)..]
+            .iter()
+            .map(|event| {
+                let changes = activity::changes(event, |refers, id| match refers {
+                    Refers::Principal => principal(id),
+                    Refers::Item => item_key(id),
+                    Refers::Cycle => Ok(self
+                        .store
+                        .find_cycle(&item.collection_id, id)?
+                        .map_or(id.into(), |c| c.name)),
+                    Refers::Text | Refers::Hidden => Ok(id.into()),
+                })?;
+                let link = match activity::field(event, "kind") {
+                    Some(kind) if event.action == "link.create" => {
+                        let target = activity::field(event, "target").unwrap_or_default();
+                        let target = match kind.parse::<LinkKind>() {
+                            Ok(k) if links_to_item(k) => item_key(&target)?,
+                            _ => target,
+                        };
+                        Some((kind, target))
+                    }
+                    _ => None,
+                };
+                Ok(Activity {
+                    at: event.at.clone(),
+                    actor: principal(&event.actor_id)?,
+                    via: event.via_agent_id.as_deref().map(principal).transpose()?,
+                    action: event.action.clone(),
+                    changes,
+                    comment: (event.action == "comment.create")
+                        .then(|| activity::field(event, "body"))
+                        .flatten(),
+                    link,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(ActivityLog { key: item.key, total, entries })
     }
 
     // --- internals -------------------------------------------------------------------------

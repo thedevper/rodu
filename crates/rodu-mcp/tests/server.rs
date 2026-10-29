@@ -70,6 +70,7 @@ async fn lists_the_tools_with_annotations_and_instructions() {
             "create_collection",
             "create_items",
             "cycle_report",
+            "get_activity",
             "get_context",
             "get_my_work",
             "link",
@@ -80,7 +81,14 @@ async fn lists_the_tools_with_annotations_and_instructions() {
             "update_item",
         ]
     );
-    let read_only = ["search", "get_my_work", "get_context", "list_collections", "cycle_report"];
+    let read_only = [
+        "search",
+        "get_my_work",
+        "get_context",
+        "get_activity",
+        "list_collections",
+        "cycle_report",
+    ];
     for tool in &tools {
         let annotations = tool.annotations.as_ref().unwrap();
         let is_read = read_only.contains(&tool.name.as_ref());
@@ -132,6 +140,17 @@ async fn creates_searches_and_moves_items() {
 
     let moved = call(&client, "transition", json!({ "ref": "DEMO-1", "to": "In Progress" })).await;
     assert_eq!(parsed(&moved)["status"], "In Progress");
+
+    let activity = text(&call(&client, "get_activity", json!({ "ref": "DEMO-1" })).await);
+    assert!(activity.starts_with("## Activity"), "{activity}");
+    assert!(activity.contains("· alice via alice-claude · created"), "{activity}");
+    assert!(activity.contains("status: Backlog → In Progress"), "{activity}");
+    let open = activity.find("<untrusted-content source=\"DEMO-1:activity\">").unwrap();
+    assert!(open < activity.find("· created").unwrap(), "{activity}");
+    let last = text(&call(&client, "get_activity", json!({ "ref": "DEMO-1", "limit": 1 })).await);
+    assert!(!last.contains("· created") && last.contains("[1 older entry omitted]"), "{last}");
+    let refused = call(&client, "get_activity", json!({ "ref": "DEMO-1", "limit": 0 })).await;
+    assert_eq!(refused.is_error, Some(true));
 }
 
 #[tokio::test]

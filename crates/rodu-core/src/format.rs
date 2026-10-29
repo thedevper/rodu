@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::activity::{Activity, ActivityLog, Change};
 use crate::model::{Collection, Comment, Cycle, Item, Link, LinkKind, Priority};
 
 /// Everything [`format_context`] renders about one item.
@@ -164,6 +165,78 @@ pub fn format_context(parts: &ContextParts, max_chars: usize) -> String {
                 rendered.len() - kept.len()
             ));
         }
+    }
+    out
+}
+
+/// The longest a value or comment is shown in an activity line, in characters.
+const ACTIVITY_VALUE: usize = 120;
+
+/// One line of `text`, cut to [`ACTIVITY_VALUE`] characters.
+fn short(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if len(&line) > ACTIVITY_VALUE {
+        format!("{}…", take(&line, ACTIVITY_VALUE - 1))
+    } else {
+        line
+    }
+}
+
+/// What an activity entry did, without its time or who: `status: Backlog → In Progress`.
+pub fn activity_what(entry: &Activity) -> String {
+    let value = |v: &Option<String>| v.as_deref().map_or_else(|| "none".into(), short);
+    match entry.action.as_str() {
+        "item.create" => "created".into(),
+        "item.number" | "item.update" if entry.changes.is_empty() => "updated".into(),
+        "item.number" | "item.update" => entry
+            .changes
+            .iter()
+            .map(|change| match change {
+                Change::Value { field, from, to } => {
+                    format!("{field}: {} → {}", value(from), value(to))
+                }
+                Change::Edited(field) => format!("{field} edited"),
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        "comment.create" => {
+            format!("commented: {}", short(entry.comment.as_deref().unwrap_or_default()))
+        }
+        "link.create" => match &entry.link {
+            Some((kind, target)) => format!("linked {kind} → {}", short(target)),
+            None => "linked".into(),
+        },
+        other => other.into(),
+    }
+}
+
+/// A card's history as Markdown: one line per entry, `time · who (via agent) · what`. Titles,
+/// comments and links are people's words, so the whole list sits in one untrusted fence.
+pub fn format_activity(log: &ActivityLog) -> String {
+    let mut out = String::from(
+        "## Activity\n\nRecorded on this machine: changes made on a teammate's machine are not listed.",
+    );
+    if log.entries.is_empty() {
+        out.push_str("\n\nNothing recorded yet.");
+        return out;
+    }
+    let lines: Vec<String> = log
+        .entries
+        .iter()
+        .map(|e| {
+            let who =
+                e.via.as_ref().map_or_else(|| e.actor.clone(), |v| format!("{} via {v}", e.actor));
+            format!("- {} · {who} · {}", e.at, activity_what(e))
+        })
+        .collect();
+    out.push_str("\n\n");
+    out.push_str(&fence(&format!("{}:activity", log.key), &lines.join("\n")));
+    let omitted = log.total - log.entries.len();
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n\n[{omitted} older entr{} omitted]",
+            if omitted == 1 { "y" } else { "ies" }
+        ));
     }
     out
 }

@@ -207,6 +207,8 @@ async function board(page) {
     ].join('\n');
     const patched = await server.api('PATCH', '/api/items/DEMO-1', { patch: { body } });
     if (patched.status !== 200) throw new Error(`PATCH: ${patched.text}`);
+    const said = await server.api('POST', '/api/items/DEMO-1/comments', { body: '<img src=x onerror="window.__smoke=4"> ok' });
+    if (said.status !== 201) throw new Error(`comment: ${said.text}`);
 
     await page.open(server.link);
     await page.untilText('First card');
@@ -231,6 +233,18 @@ async function board(page) {
     check('board: card markdown renders headings and lists', rendered.heading === 'Plan' && rendered.items === 2, JSON.stringify(rendered));
     check('board: links open safely in a new tab', rendered.safe && !rendered.scripted, JSON.stringify(rendered));
     check('board: raw HTML and images stay inert', rendered.images === 0 && rendered.text.includes('<script>'), JSON.stringify(rendered));
+    // The history quotes what people wrote, so it is plain text too.
+    await page.click('aside.panel .activity summary', 'Activity');
+    const activity = await page.eval(`(() => {
+      const box = document.querySelector('aside.panel .activity');
+      return {
+        open: box.open,
+        lines: [...box.querySelectorAll('.activity-what')].map((p) => p.textContent),
+        images: box.querySelectorAll('img').length,
+      };
+    })()`);
+    check('board: the card shows its activity', activity.open && activity.lines[0] === 'created' && activity.lines.includes('description edited'), JSON.stringify(activity));
+    check('board: activity shows what people wrote as text', activity.images === 0 && activity.lines.some((l) => l.startsWith('commented: <img')), JSON.stringify(activity));
     check('board: nothing in the card ran', (await page.eval('window.__smoke')) === undefined);
     await page.click('aside.panel [aria-label="Close"]');
 
