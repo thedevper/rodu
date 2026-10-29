@@ -1,6 +1,6 @@
 use time::OffsetDateTime;
 
-use crate::activity::TeamActivity;
+use crate::activity::{Audit, TeamActivity};
 use crate::error::Result;
 use crate::model::{Collection, Comment, Cycle, Event, Item, Link, Principal};
 
@@ -100,6 +100,12 @@ pub trait Store {
     /// A card's history across the team (ADR 0006), for a store that keeps one; None where the
     /// events this machine recorded are the history.
     fn team_activity(&self, _item_id: &str) -> Result<Option<TeamActivity>> {
+        Ok(None)
+    }
+
+    /// A card's changes as the team document holds them (ADR 0006 "Audit"), for a store that
+    /// keeps one; None for a workspace without one.
+    fn audit(&self, _item_id: &str) -> Result<Option<Audit>> {
         Ok(None)
     }
 

@@ -20,6 +20,7 @@ workspace = true
 [dev-dependencies]
 rmcp = { version = "3.5.1", features = ["client"] }
 rodu-store = { path = "../rodu-store" }
+rodu-sync = { path = "../rodu-sync" }
 rusqlite = "0.40.2"
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-util"] }

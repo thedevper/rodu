@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::activity::{
-    self, Activity, ActivityLog, Change, Refers, Scope, Standing, TeamEntry, When, Writer,
+    self, Activity, ActivityLog, Audit, Change, Refers, Scope, Standing, TeamEntry, When, Writer,
 };
 use crate::clock::{Clock, iso, system_clock, unix_ms};
 use crate::error::{Result, RoduError};
@@ -980,6 +980,25 @@ impl<S: Store> RoduService<S> {
     pub fn recorded_activity(&self, reference: &str, limit: Option<u32>) -> Result<ActivityLog> {
         let item = self.item(reference)?;
         self.recorded(item, limit)
+    }
+
+    /// Every change of the team document that touched an item, with everything known about each
+    /// (`rodu audit`, ADR 0006 "Audit"): read from the document each time, so editing this
+    /// machine's index changes nothing here. Only in a team workspace.
+    pub fn audit(&self, reference: &str) -> Result<(String, Audit)> {
+        let item = self.item(reference)?;
+        let Some(mut audit) = self.store.audit(&item.id)? else {
+            return Err(RoduError::invalid(
+                "An audit reads a team's history, and this workspace is not shared with a team",
+            )
+            .with_hint("rodu show <key> --activity lists what this machine recorded"));
+        };
+        for change in &mut audit.changes {
+            if let Some((id, name)) = &mut change.member {
+                *name = self.name_of(id)?;
+            }
+        }
+        Ok((item.key, audit))
     }
 
     // --- internals -------------------------------------------------------------------------

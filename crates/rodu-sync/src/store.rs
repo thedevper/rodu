@@ -31,7 +31,7 @@ use loro::{
     Counter, ExportMode, Frontiers, IdSpan, Index, LoroDoc, LoroMap, LoroTree, LoroValue, TreeID,
     TreeParentId, ValueOrContainer, VersionVector,
 };
-use rodu_core::activity::TeamActivity;
+use rodu_core::activity::{Audit, TeamActivity};
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::{
     Collection, Comment, Cycle, Event, Item, Link, Principal, Result, RoduError, SearchRequest,
@@ -1941,6 +1941,18 @@ impl Store for LoroStore {
             };
             let doc = self.doc.borrow();
             crate::activity::read(&doc, &rows, &known, |peer, counter| {
+                self.sql.received_at(peer, counter)
+            })
+            .map(Some)
+        })
+    }
+
+    fn audit(&self, item_id: &str) -> Result<Option<Audit>> {
+        self.transaction(TxMode::Write, || {
+            let trust = self.local_note(NOTE_TRUST)?.and_then(|t| Trust::decode(&t));
+            let members = self.members()?;
+            let doc = self.doc.borrow();
+            crate::activity::audit(&doc, item_id, &members, trust.as_ref(), |peer, counter| {
                 self.sql.received_at(peer, counter)
             })
             .map(Some)
