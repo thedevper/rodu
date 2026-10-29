@@ -18,7 +18,7 @@ use rodu_core::ids::is_uuid;
 use rodu_core::input::{MAX_BODY, MAX_ESTIMATE, MAX_TITLE, check_date, is_single_line};
 use rodu_core::service::check_web_url;
 use rodu_core::workflow::validate_workflow;
-use rodu_core::{Collection, Comment, Cycle, Item, Link, Principal};
+use rodu_core::{Collection, Comment, Cycle, Item, ItemType, Link, Principal, Priority};
 use sha2::{Digest, Sha256};
 
 pub const PRINCIPALS: &str = "principals";
@@ -341,6 +341,51 @@ pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
         id,
         key,
     })
+}
+
+/// How one card field set by one operation shows in the card's activity (ADR 0006).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    /// The value as text (None for a field cleared), checked as the card's field would be.
+    Shown(Option<String>),
+    /// A field recorded as edited without its value: the description and the position.
+    Hidden,
+    /// Not activity: bookkeeping (id, category, times), a field Rodu does not know, or a value
+    /// that does not pass the field's check.
+    Ignored,
+}
+
+pub fn item_field(field: &str, value: &LoroValue) -> FieldValue {
+    let map = LoroMap::new();
+    if map.insert(field, value.clone()).is_err() {
+        return FieldValue::Ignored;
+    }
+    let r = Reader::new(&map, "card");
+    let shown = match field {
+        "key" | "provisional_key" => r.opt_line(field, 64),
+        "title" => r.opt_line(field, MAX_TITLE),
+        "status" => r.opt_line(field, MAX_FIELD),
+        "type" => r.parsed::<ItemType>(field).map(|t| Some(t.as_str().to_string())),
+        "priority" => r.parsed::<Priority>(field).map(|p| Some(p.as_str().to_string())),
+        "number" => r.opt_number(field).map(|n| n.map(|n| n.to_string())),
+        "assignee_id" | "cycle_id" => r.opt_id(field),
+        "estimate" => r.opt_estimate(field).map(|n| n.map(|n| n.to_string())),
+        "due_at" => r.opt_date(field),
+        "body" => {
+            return match r.opt_text_max(field, MAX_BODY) {
+                Ok(_) => FieldValue::Hidden,
+                Err(_) => FieldValue::Ignored,
+            };
+        }
+        "rank" => {
+            return match r.opt_line(field, MAX_FIELD) {
+                Ok(_) => FieldValue::Hidden,
+                Err(_) => FieldValue::Ignored,
+            };
+        }
+        _ => return FieldValue::Ignored,
+    };
+    shown.map_or(FieldValue::Ignored, FieldValue::Shown)
 }
 
 pub fn comment(id: &str, map: &LoroMap) -> Result<Comment, String> {

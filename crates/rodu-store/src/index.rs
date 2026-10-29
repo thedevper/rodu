@@ -10,6 +10,28 @@ use rusqlite::params;
 
 use crate::{SqliteStore, db};
 
+/// One operation of the team document that touched a card, as `team_activity` keeps it
+/// (ADR 0006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityRow {
+    /// The writer's peer, as 16 lowercase hex digits.
+    pub peer: String,
+    /// The operation's own counter and Lamport timestamp.
+    pub counter: i64,
+    pub lamport: i64,
+    /// The change's time, and the greatest time among the changes it depends on (0 for none).
+    pub at: i64,
+    pub deps_at: i64,
+    /// The parity digit the change's message starts with; None for a change without one.
+    pub parity: Option<i64>,
+    pub via_agent_id: Option<String>,
+    pub card_id: String,
+    /// `item.create`, `item.update`, `item.number`, `comment.create` or `link.create`.
+    pub action: String,
+    pub field: Option<String>,
+    pub value: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parked {
     Principals,
@@ -221,6 +243,111 @@ impl SqliteStore {
     pub fn forget_sync_seen(&self, key: &str) -> Result<()> {
         self.run("DELETE FROM sync_seen WHERE key = ?", [key])?;
         Ok(())
+    }
+
+    /// Creates the activity tables if this database has none yet: `team_activity` is part of the
+    /// index, rebuilt from the document; `change_received` is local, the time this machine first
+    /// held each change, and a rebuild keeps it.
+    pub fn ensure_team_activity(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS team_activity (
+                   peer TEXT NOT NULL, counter INTEGER NOT NULL, lamport INTEGER NOT NULL,
+                   at INTEGER NOT NULL, deps_at INTEGER NOT NULL, parity INTEGER,
+                   via_agent_id TEXT, card_id TEXT NOT NULL, action TEXT NOT NULL, field TEXT,
+                   value TEXT, PRIMARY KEY (peer, counter));
+                 CREATE INDEX IF NOT EXISTS team_activity_card
+                   ON team_activity (card_id, lamport, peer, counter);
+                 CREATE TABLE IF NOT EXISTS change_received (
+                   peer TEXT NOT NULL, counter INTEGER NOT NULL, end_counter INTEGER NOT NULL,
+                   received_at INTEGER NOT NULL, PRIMARY KEY (peer, counter))",
+            )
+            .map_err(db)
+    }
+
+    pub fn clear_team_activity(&self) -> Result<()> {
+        self.conn.execute_batch("DELETE FROM team_activity").map_err(db)
+    }
+
+    pub fn put_activity(&self, r: &ActivityRow) -> Result<()> {
+        self.run(
+            "INSERT OR REPLACE INTO team_activity (peer, counter, lamport, at, deps_at, parity,
+               via_agent_id, card_id, action, field, value)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                r.peer,
+                r.counter,
+                r.lamport,
+                r.at,
+                r.deps_at,
+                r.parity,
+                r.via_agent_id,
+                r.card_id,
+                r.action,
+                r.field,
+                r.value
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Notes when this machine first held the change of `peer` covering counters `counter` up to
+    /// `end_counter` (exclusive); a change already noted keeps its first time.
+    pub fn note_received(&self, peer: &str, counter: i64, end_counter: i64, at: i64) -> Result<()> {
+        self.run(
+            "INSERT OR IGNORE INTO change_received (peer, counter, end_counter, received_at)
+             VALUES (?, ?, ?, ?)",
+            params![peer, counter, end_counter, at],
+        )?;
+        Ok(())
+    }
+
+    /// A card's activity, in the order its changes were made (Lamport timestamp, then peer).
+    pub fn team_activity(&self, card_id: &str) -> Result<Vec<ActivityRow>> {
+        self.all(
+            "SELECT peer, counter, lamport, at, deps_at, parity, via_agent_id, card_id, action,
+               field, value FROM team_activity WHERE card_id = ?
+             ORDER BY lamport, peer, counter",
+            [card_id],
+            |r| {
+                Ok(ActivityRow {
+                    peer: r.get(0)?,
+                    counter: r.get(1)?,
+                    lamport: r.get(2)?,
+                    at: r.get(3)?,
+                    deps_at: r.get(4)?,
+                    parity: r.get(5)?,
+                    via_agent_id: r.get(6)?,
+                    card_id: r.get(7)?,
+                    action: r.get(8)?,
+                    field: r.get(9)?,
+                    value: r.get(10)?,
+                })
+            },
+        )
+    }
+
+    /// Every activity row and every received time, one line each, for comparing in tests.
+    pub fn dump_activity(&self) -> Result<Vec<String>> {
+        self.dump("SELECT * FROM team_activity ORDER BY peer, counter, action")
+    }
+
+    pub fn dump_received(&self) -> Result<Vec<String>> {
+        self.dump("SELECT * FROM change_received ORDER BY peer, counter")
+    }
+
+    fn dump(&self, sql: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(sql).map_err(db)?;
+        let width = stmt.column_count();
+        let rows = stmt
+            .query_map([], |r| {
+                (0..width)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map(|cols| cols.join("|"))
+            })
+            .map_err(db)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)
     }
 
     /// Lets the next number in each collection follow its highest number, so a replica that takes

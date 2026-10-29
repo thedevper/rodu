@@ -66,6 +66,9 @@ const META_COMPACTED: &str = "compacted_file";
 /// a reference cleared or an entity left out because what it points to is missing, or a card that
 /// lost its number or key. While above zero, every import rebuilds the whole index.
 const META_UNSETTLED: &str = "unsettled";
+/// The version of the document `team_activity` holds every change of, as an encoded version
+/// vector in hex (ADR 0006).
+const META_ACTIVITY: &str = "activity_version";
 
 /// What indexing the document found, beyond the cards it changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -322,6 +325,7 @@ impl LoroStore {
         let sql = SqliteStore::open(&dir.join(DB_FILE))?;
         sql.ensure_index_meta()?;
         sql.ensure_sync_seen()?;
+        sql.ensure_team_activity()?;
         let store = Self {
             sql,
             dir: dir.to_path_buf(),
@@ -829,9 +833,61 @@ impl LoroStore {
         })
     }
 
-    /// Rebuilds the whole index from the document.
+    /// Rebuilds the whole index from the document, the activity table included.
     pub fn rebuild_index(&self) -> Result<IndexReport> {
-        self.transaction(TxMode::Write, || self.index_all())
+        self.transaction(TxMode::Write, || {
+            let report = self.index_all()?;
+            self.reset_activity()?;
+            self.index_activity(None)?;
+            Ok(report)
+        })
+    }
+
+    /// Empties the activity table, so the next [`LoroStore::index_activity`] reads the whole
+    /// history. The times changes were received are local and stay.
+    fn reset_activity(&self) -> Result<()> {
+        self.sql.clear_team_activity()?;
+        self.sql.set_index_meta(META_ACTIVITY, "")
+    }
+
+    /// Adds to `team_activity` every change the document holds that it does not, and notes when
+    /// this machine first held each: `own_at` for this machine's changes when a write makes one,
+    /// the clock now for everything else. Operations still waiting on others are not in the
+    /// history yet, and are added by the import that lands them. A version the table cannot read
+    /// back starts it over from the whole history.
+    fn index_activity(&self, own_at: Option<i64>) -> Result<()> {
+        let doc = self.doc.borrow();
+        let to = doc.oplog_vv();
+        let saved = self.sql.index_meta(META_ACTIVITY)?.filter(|v| !v.is_empty());
+        let from = match saved
+            .map(|hex| hex::decode(hex).ok().and_then(|b| VersionVector::decode(&b).ok()))
+        {
+            Some(Some(vv)) => vv,
+            Some(None) => {
+                self.sql.clear_team_activity()?;
+                VersionVector::default()
+            }
+            None => VersionVector::default(),
+        };
+        if from == to {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let own = self.peer.get();
+        for change in crate::activity::changes_between(&doc, &from, &to) {
+            let at = match own_at {
+                Some(at) if change.peer == own => at,
+                _ => now,
+            };
+            let peer = layout::peer_text(change.peer);
+            self.sql.note_received(&peer, change.start, change.end, at)?;
+            for row in &change.rows {
+                self.sql.put_activity(row)?;
+            }
+        }
+        self.sql.set_index_meta(META_ACTIVITY, &hex::encode(to.encode()))
     }
 
     // --- the document file ------------------------------------------------------------------
@@ -847,7 +903,14 @@ impl LoroStore {
     /// Brings the document and the index in line, under the write lock: finishes or discards a
     /// waiting snapshot, reloads the document if another process changed it, and rebuilds the
     /// index if it does not match the document.
+    /// Loads the document file the index names (finishing or discarding waiting snapshots), and
+    /// brings the activity table up to it.
     fn settle(&self) -> Result<()> {
+        self.settle_document()?;
+        self.index_activity(None)
+    }
+
+    fn settle_document(&self) -> Result<()> {
         let meta = self.sql.index_meta(META_DOC)?;
         let committed = meta.as_deref().map(|hash| self.next_path(hash));
         for entry in fs::read_dir(&self.dir).map_err(|e| io(e, &self.dir))? {
@@ -903,6 +966,7 @@ impl LoroStore {
             return Ok(());
         }
         let report = self.index_all()?;
+        self.reset_activity()?;
         *self.last_report.borrow_mut() = report;
         if let Some(hash) = hash {
             self.sql.set_index_meta(META_DOC, &hash)?;
@@ -985,11 +1049,13 @@ impl LoroStore {
         }
         // Set after the operations, since Loro keeps them only on a transaction that has begun. A
         // commit with no operations of its own drops them.
-        if let Some((at, _)) = self.context.borrow().as_ref() {
-            doc.set_next_commit_timestamp(*at);
+        let at = self.context.borrow().as_ref().map(|(at, _)| *at);
+        if let Some(at) = at {
+            doc.set_next_commit_timestamp(at);
         }
         doc.set_next_commit_message(&message);
         doc.commit();
+        self.index_activity(at)?;
         let bytes = doc.export(ExportMode::Snapshot).map_err(internal)?;
         let hash = sha256(&bytes);
         // Written whole under a name of its own, then renamed: the same snapshot can be staged
