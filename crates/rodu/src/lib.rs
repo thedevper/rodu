@@ -33,7 +33,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   init --name <you> --key <KEY> [--title <collection name>]   create a workspace here
   add <title> [--type bug] [--priority high] [--assignee me] [--collection KEY]
   ls [query] [--limit 50]    list items (JQL-lite, e.g. \"assignee = me() ORDER BY priority\")
-  show <key> [--activity] [--limit 50]   item with its context; --activity adds its history on this machine
+  show <key> [--activity [--local]] [--limit 50]   item with its context; --activity adds its history (in a team, across the team; --local: as this machine recorded it)
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
   collections                the collections in this workspace, key and name
   collection add <KEY> [--title <name>]   add a collection (a project with its own card numbers)
@@ -110,6 +110,7 @@ const STRING_OPTIONS: &[&str] = &[
 ];
 const BOOL_OPTIONS: &[&str] = &[
     "activity",
+    "local",
     "no-open",
     "version",
     "help",
@@ -515,7 +516,12 @@ fn item_command(
                     }
                 };
                 out.push_str("\n\n");
-                out.push_str(&format_activity(&ws.service.activity(key, limit)?));
+                let log = if args.flag("local") {
+                    ws.service.recorded_activity(key, limit)?
+                } else {
+                    ws.service.activity(key, limit)?
+                };
+                out.push_str(&format_activity(&log));
             }
             (io.out)(&out);
             Ok(0)

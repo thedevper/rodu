@@ -1,5 +1,6 @@
 use time::OffsetDateTime;
 
+use crate::activity::TeamActivity;
 use crate::error::Result;
 use crate::model::{Collection, Comment, Cycle, Event, Item, Link, Principal};
 
@@ -95,6 +96,12 @@ pub trait Store {
 
     fn append_event(&self, event: &Event) -> Result<()>;
     fn list_events(&self, target_id: &str) -> Result<Vec<Event>>;
+
+    /// A card's history across the team (ADR 0006), for a store that keeps one; None where the
+    /// events this machine recorded are the history.
+    fn team_activity(&self, _item_id: &str) -> Result<Option<TeamActivity>> {
+        Ok(None)
+    }
 
     fn get_idempotent(&self, key: &str) -> Result<Option<String>>;
     fn put_idempotent(&self, key: &str, result: &str) -> Result<()>;

@@ -5,8 +5,11 @@ use std::process::Command;
 use std::time::Duration;
 
 use loro::{LoroDoc, LoroValue, TreeParentId};
+use rodu_core::activity::{Scope, When};
+use rodu_core::clock::iso_seconds;
+use rodu_core::format::{activity_what, format_activity};
 use rodu_core::{Actor, PrincipalKind, RoduError, RoduService, Store, TxMode};
-use rodu_sync::{Checker, IndexReport, LoroStore, run_check};
+use rodu_sync::{Checker, IndexReport, LoroStore, Trust, run_check};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -1131,10 +1134,16 @@ fn a_write_nested_in_another_does_not_take_over_its_context() {
 /// A card's activity as (writer, action, field, value), oldest first.
 fn activity(peer: &Peer, key: &str) -> Vec<(u64, String, Option<String>, Option<String>)> {
     let card = peer.svc.store.get_item_by_key(key).unwrap().unwrap();
-    let rows = peer.store().index().team_activity(&card.id).unwrap();
+    let rows = peer.store().index().activity_rows(&card.id).unwrap();
     rows.into_iter()
         .map(|r| (u64::from_str_radix(&r.peer, 16).unwrap(), r.action, r.field, r.value))
         .collect()
+}
+
+/// A link's key in the document: its card, kind and target.
+fn link_key(link: &rodu_core::Link) -> String {
+    let id = format!("{}\n{}\n{}", link.from_item_id, link.kind.as_str(), link.target);
+    hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(id.as_bytes())[..16])
 }
 
 fn row(
@@ -1155,8 +1164,8 @@ fn a_teammates_changes_reach_the_activity_table() {
         json!({ "title": "Plan the garden", "body": "Beds by the fence", "assignee": "me" });
     b.patch(&keys[0], fields);
     b.svc.transition(&b.me, &keys[0], "In Progress").unwrap();
-    b.svc.comment(&b.me, &keys[0], "Started on Monday").unwrap();
-    b.svc.link(&b.me, &keys[0], "blocks", &keys[1]).unwrap();
+    let comment = b.svc.comment(&b.me, &keys[0], "Started on Monday").unwrap();
+    let link = b.svc.link(&b.me, &keys[0], "blocks", &keys[1]).unwrap();
     exchange(&a, &b);
 
     let rows = activity(&a, &keys[0]);
@@ -1177,8 +1186,8 @@ fn a_teammates_changes_reach_the_activity_table() {
             row(&b, "item.update", Some("body"), None),
             row(&b, "item.update", Some("assignee_id"), Some(&b.me.principal_id)),
             row(&b, "item.update", Some("status"), Some("In Progress")),
-            row(&b, "comment.create", None, Some("Started on Monday")),
-            row(&b, "link.create", None, Some(&format!("blocks {}", card.id))),
+            row(&b, "comment.create", Some(&comment.id), Some("Started on Monday")),
+            row(&b, "link.create", Some(&link_key(&link)), Some(&format!("blocks {}", card.id))),
         ],
         "{rows:#?}"
     );
@@ -1300,7 +1309,7 @@ fn activity_rows_carry_the_writers_parity_agent_and_moves() {
 
     let card = a.svc.store.get_item_by_key(&keys[1]).unwrap().unwrap();
     let parent = a.svc.store.get_item_by_key(&keys[0]).unwrap().unwrap();
-    let rows = a.store().index().team_activity(&card.id).unwrap();
+    let rows = a.store().index().activity_rows(&card.id).unwrap();
     let moved = rows.iter().find(|r| r.field.as_deref() == Some("parent")).expect("a move row");
     assert_eq!(moved.value.as_deref(), Some(parent.id.as_str()));
     assert_eq!(moved.via_agent_id.as_deref(), Some(agent.id.as_str()));
@@ -1311,4 +1320,398 @@ fn activity_rows_carry_the_writers_parity_agent_and_moves() {
     // Each of a's changes says the opposite parity of the one before it.
     assert_ne!(moved.parity, None);
     assert_eq!(comment.parity, moved.parity.map(|p| 1 - p));
+}
+
+// --- reading a card's activity across the team (ADR 0006, step 3) ---
+
+/// Claims this machine for its person, as `team create` and `team join` do.
+fn claim(peer: &Peer) {
+    peer.store().set_member(peer.store().peer(), &peer.me.principal_id).unwrap();
+}
+
+/// A card's team activity as (who, what), as `show --activity` writes them.
+fn entries(peer: &Peer, key: &str) -> Vec<(String, String)> {
+    let log = peer.svc.activity(key, None).unwrap();
+    log.entries.iter().map(|e| (e.actor.clone(), activity_what(e))).collect()
+}
+
+fn line(who: &str, what: &str) -> (String, String) {
+    (who.into(), what.into())
+}
+
+/// A copy of `peer`'s document under peer id `id`, and its version so far.
+fn raw_as(peer: &Peer, id: u64) -> (LoroDoc, loro::VersionVector) {
+    let (raw, start) = raw_copy(peer);
+    raw.set_peer_id(id).unwrap();
+    (raw, start)
+}
+
+/// The fields of the card keyed `key` in a raw copy.
+fn raw_fields(raw: &LoroDoc, key: &str) -> loro::LoroMap {
+    let tree = raw.get_tree("items");
+    let node = tree
+        .nodes()
+        .into_iter()
+        .find(|n| {
+            let meta = tree.get_meta(*n).unwrap();
+            meta.get("key").and_then(|v| v.into_value().ok()) == Some(key.into())
+        })
+        .unwrap();
+    tree.get_meta(node).unwrap()
+}
+
+/// Commits what `raw` changed with `message`, and sends it to `peer`.
+fn send_with(raw: &LoroDoc, start: &loro::VersionVector, peer: &Peer, message: &str) {
+    raw.set_next_commit_message(message);
+    send_raw(raw, start, peer);
+}
+
+#[test]
+fn a_teammates_change_reads_as_theirs_with_the_value_it_replaced() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let b = Peer::join(&a, "bob");
+    claim(&b);
+    exchange(&a, &b);
+    b.patch(&keys[0], json!({ "title": "Plan the garden", "priority": "high" }));
+    exchange(&a, &b);
+
+    let log = a.svc.activity(&keys[0], None).unwrap();
+    assert_eq!(log.scope, Scope::Team { signed: false });
+    let lines = entries(&a, &keys[0]);
+    assert_eq!(
+        lines,
+        [
+            line("ann", "created"),
+            line("bob", "title: Plan garden → Plan the garden; priority: none → high"),
+        ]
+    );
+    // Every machine reads the same history; --local is what this one recorded.
+    assert_eq!(entries(&b, &keys[0]), lines);
+    let local = b.svc.recorded_activity(&keys[0], None).unwrap();
+    assert_eq!((local.scope, local.total), (Scope::Machine, 1));
+    let text = format_activity(&log);
+    assert!(text.contains("Times are each machine's own clock, and names are what"), "{text}");
+}
+
+#[test]
+fn two_concurrent_writes_to_one_field_show_the_same_earlier_value() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let b = Peer::join(&a, "bob");
+    claim(&b);
+    exchange(&a, &b);
+    a.patch(&keys[0], json!({ "title": "From ann" }));
+    b.patch(&keys[0], json!({ "title": "From bob" }));
+    exchange(&a, &b);
+
+    let updates: Vec<_> = entries(&a, &keys[0]).into_iter().skip(1).collect();
+    assert_eq!(updates.len(), 2, "{updates:?}");
+    assert!(updates.contains(&line("ann", "title: Plan garden → From ann")), "{updates:?}");
+    assert!(updates.contains(&line("bob", "title: Plan garden → From bob")), "{updates:?}");
+    assert_eq!(entries(&b, &keys[0]), entries(&a, &keys[0]));
+}
+
+#[test]
+fn times_say_when_a_clock_cannot_be_taken_at_its_word() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let demo = a.svc.collection("DEMO").unwrap().id;
+    let when = |key: &str| -> Vec<When> {
+        a.svc.activity(key, None).unwrap().entries.into_iter().map(|e| e.when).collect()
+    };
+
+    // Rodu 0.9 records no time: a card it made on nothing timed reads `earlier`.
+    let old = LoroDoc::new();
+    old.set_peer_id(98).unwrap();
+    raw_card(&old, "0190eeee-0000-7000-8000-000000000005", &demo, "DEMO", TreeParentId::Root, None);
+    old.commit();
+    a.store()
+        .import_untrusted(&old.export(loro::ExportMode::all_updates()).unwrap(), &checker())
+        .unwrap();
+    assert_eq!(when("DEMO-EEEE"), [When::Earlier]);
+
+    // Built on a timed change, it takes that change's time, so all it says is `after` it.
+    let (raw, start) = raw_as(&a, 97);
+    raw_fields(&raw, &keys[0]).insert("title", "Plan the beds").unwrap();
+    send_raw(&raw, &start, &a);
+    assert!(matches!(when(&keys[0]).last(), Some(When::After(_))), "{:?}", when(&keys[0]));
+
+    // A clock two hours ahead is held to when this machine received the change.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let (ahead, start) = raw_as(&a, 96);
+    ahead.set_record_timestamp(true);
+    raw_fields(&ahead, &keys[0]).insert("title", "From the future").unwrap();
+    ahead.set_next_commit_timestamp(now + 7200);
+    send_with(&ahead, &start, &a, "1");
+    match when(&keys[0]).last() {
+        Some(When::Before(t)) => assert!(t.as_str() < iso_seconds(now + 60).as_str(), "{t}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_run_of_changes_without_a_parity_digit_reads_as_one_entry() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let (raw, start) = raw_as(&a, 99);
+    raw_fields(&raw, &keys[0]).insert("title", "Plan the beds").unwrap();
+    send_raw(&raw, &start, &a);
+    let middle = raw.oplog_vv();
+    raw_fields(&raw, &keys[0]).insert("priority", "high").unwrap();
+    raw_fields(&raw, &keys[0]).insert("title", "Plan the raised beds").unwrap();
+    send_raw(&raw, &middle, &a);
+    let last = raw.oplog_vv();
+    raw_fields(&raw, &keys[0]).insert("status", "Todo").unwrap();
+    send_with(&raw, &last, &a, "1");
+
+    let lines = entries(&a, &keys[0]);
+    let machine = "unknown machine 00000000";
+    assert_eq!(
+        lines,
+        [
+            line("ann", "created"),
+            line(machine, "title: Plan garden → Plan the raised beds; priority: none → high"),
+            line(machine, "status: Backlog → Todo"),
+        ]
+    );
+    a.store().rebuild_index().unwrap();
+    assert_eq!(entries(&a, &keys[0]), lines);
+}
+
+#[test]
+fn an_agent_counts_only_when_the_writer_owns_it() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let anns = a.svc.create_principal("ann-claude", PrincipalKind::Agent, Some(&a.me.principal_id));
+    let bob = a.svc.create_principal("bob", PrincipalKind::Human, None).unwrap();
+    let bobs = a.svc.create_principal("bob-claude", PrincipalKind::Agent, Some(&bob.id)).unwrap();
+    a.store().set_member(99, &bob.id).unwrap();
+    let (raw, start) = raw_as(&a, 99);
+    raw_fields(&raw, &keys[0]).insert("title", "Through ann's agent").unwrap();
+    send_with(&raw, &start, &a, &format!("1 via {}", anns.unwrap().id));
+    let next = raw.oplog_vv();
+    raw_fields(&raw, &keys[0]).insert("title", "Through bob's agent").unwrap();
+    send_with(&raw, &next, &a, &format!("0 via {}", bobs.id));
+
+    let log = a.svc.activity(&keys[0], None).unwrap();
+    let who: Vec<_> =
+        log.entries.iter().skip(1).map(|e| (e.actor.as_str(), e.via.as_deref())).collect();
+    assert_eq!(who, [("bob", None), ("bob", Some("bob-claude"))]);
+}
+
+#[test]
+fn a_signed_team_names_only_the_machines_it_let_in() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let b = Peer::join(&a, "bob");
+    claim(&b);
+    exchange(&a, &b);
+    b.patch(&keys[0], json!({ "title": "Before the cut" }));
+    exchange(&a, &b);
+    let cut = a.store().holds()[&b.store().peer()];
+    b.patch(&keys[0], json!({ "title": "After the cut" }));
+    exchange(&a, &b);
+    // A machine a person claims that the team never admitted.
+    a.store().set_member(99, &b.me.principal_id).unwrap();
+    let (raw, start) = raw_as(&a, 99);
+    raw_fields(&raw, &keys[0]).insert("priority", "high").unwrap();
+    send_with(&raw, &start, &a, "1");
+
+    let trust = Trust {
+        signed: true,
+        admitted: [a.store().peer()].into(),
+        cut: [(b.store().peer(), cut)].into(),
+    };
+    a.store().set_trust(&trust).unwrap();
+    let log = a.svc.activity(&keys[0], None).unwrap();
+    assert_eq!(log.scope, Scope::Team { signed: true });
+    let who: Vec<_> = log.entries.iter().map(|e| e.actor.as_str()).collect();
+    assert_eq!(who, ["ann", "bob (removed)", "bob (after removal)", "unknown machine 00000000"]);
+    assert!(format_activity(&log).contains("Times are each machine's own clock.\n"));
+}
+
+#[test]
+fn a_board_made_from_a_workspace_reads_its_cards_as_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain =
+        RoduService::new(rodu_store::SqliteStore::open(&dir.path().join("rodu.db")).unwrap());
+    let ann = plain.create_principal("ann", PrincipalKind::Human, None).unwrap();
+    let me = Actor { principal_id: ann.id.clone(), via_agent_id: None };
+    plain.create_collection(&me, "demo", "Demo").unwrap();
+    plain.create_items(&me, "DEMO", &[json!({ "title": "Made alone" })], None).unwrap();
+    plain.comment(&me, "DEMO-1", "Before the team").unwrap();
+    drop(plain);
+    let svc = RoduService::new(LoroStore::adopt(dir.path()).unwrap());
+    svc.store.set_member(svc.store.peer(), &ann.id).unwrap();
+
+    // This machine's own events come first, then the card joining the board.
+    let actions = |svc: &RoduService<LoroStore>| -> Vec<String> {
+        let log = svc.activity("DEMO-1", None).unwrap();
+        log.entries.iter().map(activity_what).collect()
+    };
+    assert_eq!(actions(&svc), ["created", "commented: Before the team", "added to the team board"]);
+    // A write right after it, in the same second, is the team's, and listed once.
+    svc.update_item(&me, "DEMO-1", &json!({ "title": "Right after" }), None).unwrap();
+    let after = actions(&svc);
+    assert_eq!(after.iter().filter(|a| a.starts_with("title:")).count(), 1, "{after:?}");
+    // Another machine has no events: it reads the card added, with its comment.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = RoduService::new(LoroStore::open(other_dir.path()).unwrap());
+    let all = svc.store.updates_since(&LoroDoc::new().oplog_vv().encode()).unwrap();
+    other.store.import_untrusted(&all, &checker()).unwrap();
+    assert_eq!(
+        actions(&other),
+        [
+            "added to the team board",
+            "commented: Before the team",
+            "title: Made alone → Right after"
+        ]
+    );
+}
+
+#[test]
+fn only_the_numbering_machine_numbers_a_card() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let card = a.svc.item(&keys[0]).unwrap().id;
+    let (raw, start) = raw_as(&a, 99);
+    let fields = raw_fields(&raw, &keys[0]);
+    fields.insert("number", 7).unwrap();
+    fields.insert("key", "DEMO-7").unwrap();
+    send_with(&raw, &start, &a, "1");
+    let numbered = |svc: &RoduService<LoroStore>| {
+        svc.activity(&card, None).unwrap().entries.last().unwrap().action.clone()
+    };
+    assert_eq!(numbered(&a.svc), "item.update");
+    a.store().set_numbering_peer(99).unwrap();
+    assert_eq!(numbered(&a.svc), "item.number");
+}
+
+#[test]
+fn a_comment_the_board_does_not_hold_is_not_listed() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let card = a.svc.item(&keys[0]).unwrap();
+    let (raw, start) = raw_as(&a, 99);
+    let comment =
+        raw.get_map("comments").ensure_mergeable_map("0190dddd-0000-7000-8000-000000000004");
+    let comment = comment.unwrap();
+    comment.insert("item_id", card.id.as_str()).unwrap();
+    // Its author is nobody the board knows, so the board leaves it out.
+    comment.insert("author_id", "0190ffff-0000-7000-8000-000000000006").unwrap();
+    comment.insert("body", "From nowhere").unwrap();
+    comment.insert("created_at", "2026-10-29T09:00:00.000Z").unwrap();
+    send_with(&raw, &start, &a, "1");
+    assert!(a.svc.store.list_comments(&card.id).unwrap().is_empty());
+    assert_eq!(entries(&a, &keys[0]), [line("ann", "created")]);
+}
+
+#[test]
+fn a_change_that_straddles_a_removal_reads_on_both_sides_of_it() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let b = Peer::join(&a, "bob");
+    claim(&b);
+    exchange(&a, &b);
+    let held = a.store().holds()[&b.store().peer()];
+    // One change with two fields; the team takes in the first, not the second.
+    b.patch(&keys[0], json!({ "title": "Straddle", "priority": "high" }));
+    exchange(&a, &b);
+    let trust = Trust {
+        signed: true,
+        admitted: [a.store().peer()].into(),
+        cut: [(b.store().peer(), held + 1)].into(),
+    };
+    a.store().set_trust(&trust).unwrap();
+    assert_eq!(
+        entries(&a, &keys[0]),
+        [
+            line("ann", "created"),
+            line("bob (removed)", "title: Plan garden → Straddle"),
+            line("bob (after removal)", "priority: none → high"),
+        ]
+    );
+}
+
+#[test]
+fn this_machines_own_writes_read_at_its_own_time() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    a.patch(&keys[0], json!({ "title": "Plan the beds" }));
+    let log = a.svc.activity(&keys[0], None).unwrap();
+    assert!(log.entries.iter().all(|e| matches!(e.when, When::At(_))), "{:?}", log.entries);
+}
+
+#[test]
+fn another_process_writing_to_the_same_workspace_is_read() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    a.svc.activity(&keys[0], None).unwrap();
+    let other = RoduService::new(LoroStore::open(a.dir.path()).unwrap());
+    other
+        .update_item(&a.me, &keys[0], &json!({ "title": "From the other process" }), None)
+        .unwrap();
+    assert_eq!(
+        entries(&a, &keys[0]),
+        [line("ann", "created"), line("ann", "title: Plan garden → From the other process")]
+    );
+}
+
+#[test]
+fn a_comment_naming_another_author_says_whose_machine_wrote_it() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let card = a.svc.item(&keys[0]).unwrap();
+    let bob = a.svc.create_principal("bob", PrincipalKind::Human, None).unwrap();
+    a.store().set_member(99, &bob.id).unwrap();
+    let (raw, start) = raw_as(&a, 99);
+    let comment =
+        raw.get_map("comments").ensure_mergeable_map("0190dddd-0000-7000-8000-000000000007");
+    let comment = comment.unwrap();
+    comment.insert("item_id", card.id.as_str()).unwrap();
+    comment.insert("author_id", a.me.principal_id.as_str()).unwrap();
+    comment.insert("body", "Signed by ann").unwrap();
+    comment.insert("created_at", "2026-10-29T09:00:00.000Z").unwrap();
+    send_with(&raw, &start, &a, "1");
+    assert_eq!(
+        entries(&a, &keys[0]).last(),
+        Some(&line("bob, as ann", "commented: Signed by ann"))
+    );
+}
+
+#[test]
+fn team_activity_names_links_hides_descriptions_and_keeps_the_newest() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden", "Dig beds"]);
+    a.patch(&keys[0], json!({ "body": "Beds by the fence", "parent": keys[1] }));
+    a.svc.link(&a.me, &keys[0], "blocks", &keys[1]).unwrap();
+    a.svc.link(&a.me, &keys[0], "implements_pr", "https://github.com/acme/demo/pull/7").unwrap();
+    let lines: Vec<String> = entries(&a, &keys[0]).into_iter().map(|(_, what)| what).collect();
+    assert_eq!(
+        lines,
+        [
+            "created".to_string(),
+            format!("parent: none → {}; description edited", keys[1]),
+            format!("linked blocks → {}", keys[1]),
+            "linked implements_pr → https://github.com/acme/demo/pull/7".into(),
+        ]
+    );
+    let last = a.svc.activity(&keys[0], Some(2)).unwrap();
+    assert_eq!((last.total, last.entries.len()), (4, 2));
+    assert_eq!(last.entries[0].action, "link.create");
+    assert_eq!(a.svc.activity("DEMO-99", None).unwrap_err().code, rodu_core::ErrorCode::NotFound);
 }
