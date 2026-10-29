@@ -6,7 +6,9 @@ use leptos::ev;
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rodu_api::{CommentView, ITEM_TYPES, ItemView, PRIORITIES, PrincipalView, StateView};
+use rodu_api::{
+    ActivityView, CommentView, ITEM_TYPES, ItemView, PRIORITIES, PrincipalView, StateView,
+};
 use serde_json::{Value, json};
 use wasm_bindgen::JsCast;
 
@@ -72,6 +74,7 @@ pub fn ItemPanel(
 ) -> impl IntoView {
     let item = RwSignal::new(None::<ItemView>);
     let comments = RwSignal::new(Vec::<CommentView>::new());
+    let activity = RwSignal::new((Vec::<ActivityView>::new(), 0usize));
     let title = RwSignal::new(String::new());
     let comment = RwSignal::new(String::new());
     let width = RwSignal::new(remembered_width());
@@ -168,6 +171,7 @@ pub fn ItemPanel(
             Ok(detail) => {
                 if fresher(n) {
                     comments.try_set(detail.comments);
+                    activity.try_set((detail.activity, detail.activity_total));
                 }
                 show(detail.item);
             }
@@ -187,6 +191,7 @@ pub fn ItemPanel(
         let Ok(detail) = api.item(&key).await else { return };
         if fresher(n) {
             comments.try_set(detail.comments);
+            activity.try_set((detail.activity, detail.activity_total));
         }
         let Some(shown) = item.try_with_untracked(|i| i.as_ref().map(|i| i.version)) else {
             return;
@@ -724,6 +729,40 @@ pub fn ItemPanel(
                         </button>
                     </form>
                 </section>
+
+                // Plain text only: an entry quotes titles, comments and links people wrote.
+                <details class="activity">
+                    <summary>
+                        "Activity "
+                        <span class="muted">{move || activity.with(|(_, total)| format!("({total})"))}</span>
+                    </summary>
+                    <p class="muted">"Recorded on this machine: changes made on a teammate's machine are not listed."</p>
+                    {move || {
+                        let older = activity.with(|(shown, total)| total.saturating_sub(shown.len()));
+                        (older > 0).then(|| view! { <p class="muted">{format!("{older} older not shown")}</p> })
+                    }}
+                    <ol>
+                        {move || {
+                            activity
+                                .get()
+                                .0
+                                .into_iter()
+                                .map(|a| {
+                                    view! {
+                                        <li>
+                                            <div class="comment-meta">
+                                                <strong>{a.actor}</strong>
+                                                {a.via.map(|via| view! { <span class="via">{format!("via {via}")}</span> })}
+                                                <time datetime=a.at.clone()>{local_time(&a.at)}</time>
+                                            </div>
+                                            <p class="activity-what">{a.what}</p>
+                                        </li>
+                                    }
+                                })
+                                .collect_view()
+                        }}
+                    </ol>
+                </details>
             </aside>
         }
         .into_any()

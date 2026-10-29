@@ -121,6 +121,16 @@ async fn initialises_a_workspace_and_manages_items_end_to_end() {
     let shown = cli(cwd, &["show", "DEMO-1"]).await;
     assert_eq!(shown.code, 0);
     assert!(shown.last_out().contains("Crash on login"));
+    assert!(!shown.last_out().contains("## Activity"));
+
+    let history = cli(cwd, &["show", "DEMO-1", "--activity", "--limit", "1"]).await;
+    assert_eq!(history.code, 0);
+    let text = history.last_out();
+    assert!(text.contains("## Activity"), "{text}");
+    assert!(text.contains("status: Backlog → In Progress"), "{text}");
+    assert!(!text.contains("· created"), "{text}");
+    assert!(text.contains("[1 older entry omitted]"), "{text}");
+    assert_eq!(cli(cwd, &["show", "DEMO-1", "--activity", "--limit", "0"]).await.code, 1);
 }
 
 #[tokio::test]
