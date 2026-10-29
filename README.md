@@ -216,7 +216,12 @@ cargo xtask release-files    # SHA256SUMS, rodu.rb, rodu.json and the install sc
 
 CI (`.github/workflows/ci.yml`) tests on macOS and Windows, builds the binaries, installs each one
 with the user-facing script on its own OS and smoke-tests it, and drives the board in headless Chrome on macOS. Pushing a `vX.Y.Z` tag that matches
-the version in `Cargo.toml` and the install URLs above publishes a GitHub release.
+the version in `Cargo.toml` and the install URLs above publishes a GitHub release, then opens a
+pull request on [homebrew-tap](https://github.com/TheDevper/homebrew-tap) and
+[scoop-bucket](https://github.com/TheDevper/scoop-bucket) with its `rodu.rb` and `rodu.json`.
+`brew upgrade` and `scoop update` see the release once those are merged. That step needs a
+`PACKAGES_TOKEN` secret: a fine-grained token with contents and pull requests write on both
+repositories. Without it CI warns, and the two files are copied over by hand.
 
 ## Contributing
 
