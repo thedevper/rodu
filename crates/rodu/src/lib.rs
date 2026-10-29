@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rodu_core::format::item_line;
+use rodu_core::format::{format_activity, item_line};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
 use rodu_http::{
@@ -33,7 +33,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   init --name <you> --key <KEY> [--title <collection name>]   create a workspace here
   add <title> [--type bug] [--priority high] [--assignee me] [--collection KEY]
   ls [query] [--limit 50]    list items (JQL-lite, e.g. \"assignee = me() ORDER BY priority\")
-  show <key>                 item with its context
+  show <key> [--activity] [--limit 50]   item with its context; --activity adds its history on this machine
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
   collections                the collections in this workspace, key and name
   collection add <KEY> [--title <name>]   add a collection (a project with its own card numbers)
@@ -109,6 +109,7 @@ const STRING_OPTIONS: &[&str] = &[
     "revoke",
 ];
 const BOOL_OPTIONS: &[&str] = &[
+    "activity",
     "no-open",
     "version",
     "help",
@@ -503,7 +504,20 @@ fn item_command(
         },
         "show" => {
             let key = rest.first().ok_or_else(|| RoduError::invalid("show needs an item key"))?;
-            (io.out)(&ws.service.context(key, None)?);
+            let mut out = ws.service.context(key, None)?;
+            if args.flag("activity") {
+                let limit = match args.value("limit") {
+                    None => None,
+                    Some(raw) => {
+                        Some(raw.parse::<u32>().ok().filter(|n| (1..=500).contains(n)).ok_or_else(
+                            || RoduError::invalid("--limit must be a whole number from 1 to 500"),
+                        )?)
+                    }
+                };
+                out.push_str("\n\n");
+                out.push_str(&format_activity(&ws.service.activity(key, limit)?));
+            }
+            (io.out)(&out);
             Ok(0)
         }
         _ => {

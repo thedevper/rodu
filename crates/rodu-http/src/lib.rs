@@ -16,11 +16,13 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use rodu_api::{
-    AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView, CreateRequest, ErrorBody,
-    InviteCreated, InviteRequest, ItemDetail, ItemView, JoinRequest, MeView, MoveRequest,
-    NewCollectionRequest, PatchRequest, PlaceView, PrincipalView, RemoveRequest, RevisionView,
-    RevokeRequest, ShareRequest, StateView, TeamDone, TeamView, TransitionRequest,
+    ActivityView, AdmitRequest, BoardView, CollectionView, CommentRequest, CommentView,
+    CreateRequest, ErrorBody, InviteCreated, InviteRequest, ItemDetail, ItemView, JoinRequest,
+    MeView, MoveRequest, NewCollectionRequest, PatchRequest, PlaceView, PrincipalView,
+    RemoveRequest, RevisionView, RevokeRequest, ShareRequest, StateView, TeamDone, TeamView,
+    TransitionRequest,
 };
+use rodu_core::format::activity_what;
 use rodu_core::query::parse_query;
 use rodu_core::service::Placement;
 use rodu_core::store::{Store, TxMode};
@@ -37,6 +39,8 @@ use tokio::task::JoinHandle;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const BOARD_PAGE: u32 = 100;
 const BOARD_MAX_ITEMS: usize = 1000;
+/// How many of an item's newest history entries its panel shows.
+const ACTIVITY_SHOWN: u32 = 100;
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 const SECURITY_HEADERS: &[(&str, &str)] = &[
@@ -541,7 +545,26 @@ where
                     .iter()
                     .map(|c| ctx.comment_view(c))
                     .collect::<rodu_core::Result<Vec<_>>>()?;
-                ok(StatusCode::OK, &ItemDetail { item: ctx.item_view(&found)?, comments })
+                let log = service.activity(&found.id, Some(ACTIVITY_SHOWN))?;
+                let activity = log
+                    .entries
+                    .iter()
+                    .map(|e| ActivityView {
+                        at: e.at.clone(),
+                        actor: e.actor.clone(),
+                        via: e.via.clone(),
+                        what: activity_what(e),
+                    })
+                    .collect();
+                ok(
+                    StatusCode::OK,
+                    &ItemDetail {
+                        item: ctx.item_view(&found)?,
+                        comments,
+                        activity,
+                        activity_total: log.total,
+                    },
+                )
             }
             Endpoint::Item => {
                 let input: PatchRequest = parse_body(body)?;
