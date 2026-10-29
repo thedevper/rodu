@@ -7,7 +7,7 @@ use loro::LoroDoc;
 use rodu_core::{Actor, PrincipalKind, RoduService, Store};
 use rodu_sync::folder::{Frame, TeamFolder, frame, unframe};
 use rodu_sync::seal::TeamKey;
-use rodu_sync::{Checker, LoroStore, Replica, run_check};
+use rodu_sync::{Checker, LoroStore, Replica, Trust, run_check};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -1736,6 +1736,22 @@ fn work_a_member_took_in_before_hearing_of_a_removal_reaches_every_replica() {
     }
     // The cut is where bob's claim put it.
     assert_eq!(ann_folder.removed(a.store()).unwrap()[&cat], b.store().seen_end(cat));
+}
+
+#[test]
+fn each_pull_notes_how_the_team_stands_with_each_machine() {
+    let root = tempfile::tempdir().unwrap();
+    let Three { ann_folder, a, b, c, .. } = with_cat(root.path());
+    let cat = c.store().peer();
+    ann_folder.remove(a.store(), cat).unwrap();
+    a.sync(&ann_folder);
+    // What activity reads without the folder: who is admitted, and where a removal cuts.
+    let trust = Trust::decode(&a.store().local_note("trust").unwrap().unwrap()).unwrap();
+    assert!(trust.signed);
+    assert!(trust.admitted.contains(&a.store().peer()));
+    assert!(trust.admitted.contains(&b.store().peer()));
+    assert_eq!(trust.cut, ann_folder.removed(a.store()).unwrap());
+    assert!(trust.cut.contains_key(&cat));
 }
 
 #[test]

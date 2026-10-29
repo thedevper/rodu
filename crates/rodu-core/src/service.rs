@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::activity::{self, Activity, ActivityLog, Refers};
+use crate::activity::{
+    self, Activity, ActivityLog, Change, Refers, Scope, Standing, TeamEntry, When, Writer,
+};
 use crate::clock::{Clock, iso, system_clock, unix_ms};
 use crate::error::{Result, RoduError};
 use crate::format::{ContextParts, format_context, links_to_item};
@@ -952,59 +954,165 @@ impl<S: Store> RoduService<S> {
         Ok(format_context(&parts, budget * 4))
     }
 
-    /// The newest `limit` entries (default 50, at most 500) of what was done to an item on this
-    /// replica, oldest first. Ids are shown as the names and keys people know.
+    /// The newest `limit` entries (default 50, at most 500) of what was done to an item, oldest
+    /// first: across the team in a team workspace (ADR 0006), as this machine recorded it
+    /// otherwise. Ids are shown as the names and keys people know.
     pub fn activity(&self, reference: &str, limit: Option<u32>) -> Result<ActivityLog> {
         let item = self.item(reference)?;
-        let limit = limit.unwrap_or(50).clamp(1, 500) as usize;
-        let events = self.store.list_events(&item.id)?;
-        let total = events.len();
-        let principal = |id: &str| -> Result<String> {
-            Ok(self.store.find_principal(id)?.map_or_else(|| id.to_string(), |p| p.name))
+        let Some(team) = self.store.team_activity(&item.id)? else {
+            return self.recorded(item, limit);
         };
-        let item_key = |id: &str| -> Result<String> {
-            Ok(self.store.get_item(id)?.map_or(id.into(), |i| i.key))
-        };
-        let entries = events[total.saturating_sub(limit)..]
-            .iter()
-            .map(|event| {
-                let changes = activity::changes(event, |refers, id| match refers {
-                    Refers::Principal => principal(id),
-                    Refers::Item => item_key(id),
-                    Refers::Cycle => Ok(self
-                        .store
-                        .find_cycle(&item.collection_id, id)?
-                        .map_or(id.into(), |c| c.name)),
-                    Refers::Text | Refers::Hidden => Ok(id.into()),
-                })?;
-                let link = match activity::field(event, "kind") {
-                    Some(kind) if event.action == "link.create" => {
-                        let target = activity::field(event, "target").unwrap_or_default();
-                        let target = match kind.parse::<LinkKind>() {
-                            Ok(k) if links_to_item(k) => item_key(&target)?,
-                            _ => target,
-                        };
-                        Some((kind, target))
-                    }
-                    _ => None,
-                };
-                Ok(Activity {
-                    at: event.at.clone(),
-                    actor: principal(&event.actor_id)?,
-                    via: event.via_agent_id.as_deref().map(principal).transpose()?,
-                    action: event.action.clone(),
-                    changes,
-                    comment: (event.action == "comment.create")
-                        .then(|| activity::field(event, "body"))
-                        .flatten(),
-                    link,
-                })
-            })
-            .collect::<Result<_>>()?;
-        Ok(ActivityLog { key: item.key, total, entries })
+        let mut entries = Vec::new();
+        // The board was made from this machine's workspace: what it recorded before is its own.
+        if let Some(adopted) = &team.adopted_at {
+            for event in self.store.list_events(&item.id)?.iter().filter(|e| e.at <= *adopted) {
+                entries.push(self.event_activity(&item, event)?);
+            }
+        }
+        for entry in &team.entries {
+            entries.push(self.team_entry(&item, entry)?);
+        }
+        Ok(newest(item.key, entries, limit, Scope::Team { signed: team.signed }))
+    }
+
+    /// The newest `limit` entries of what this machine recorded of an item, in any workspace
+    /// (`rodu show --activity --local`): with request ids kept and exact before and after values.
+    pub fn recorded_activity(&self, reference: &str, limit: Option<u32>) -> Result<ActivityLog> {
+        let item = self.item(reference)?;
+        self.recorded(item, limit)
     }
 
     // --- internals -------------------------------------------------------------------------
+
+    fn recorded(&self, item: Item, limit: Option<u32>) -> Result<ActivityLog> {
+        let entries = self
+            .store
+            .list_events(&item.id)?
+            .iter()
+            .map(|event| self.event_activity(&item, event))
+            .collect::<Result<_>>()?;
+        Ok(newest(item.key, entries, limit, Scope::Machine))
+    }
+
+    fn name_of(&self, id: &str) -> Result<String> {
+        Ok(self.store.find_principal(id)?.map_or_else(|| id.to_string(), |p| p.name))
+    }
+
+    fn item_key(&self, id: &str) -> Result<String> {
+        Ok(self.store.get_item(id)?.map_or(id.into(), |i| i.key))
+    }
+
+    /// The name people know for an id a field of `item` refers to.
+    fn referred(&self, item: &Item, refers: Refers, id: &str) -> Result<String> {
+        match refers {
+            Refers::Principal => self.name_of(id),
+            Refers::Item => self.item_key(id),
+            Refers::Cycle => {
+                Ok(self.store.find_cycle(&item.collection_id, id)?.map_or(id.into(), |c| c.name))
+            }
+            Refers::Text | Refers::Hidden => Ok(id.into()),
+        }
+    }
+
+    /// A link's kind and what it points at: a card's key, or the URL.
+    fn link_shown(&self, kind: String, target: String) -> Result<(String, String)> {
+        let target = match kind.parse::<LinkKind>() {
+            Ok(k) if links_to_item(k) => self.item_key(&target)?,
+            _ => target,
+        };
+        Ok((kind, target))
+    }
+
+    fn event_activity(&self, item: &Item, event: &Event) -> Result<Activity> {
+        let changes = activity::changes(event, |refers, id| self.referred(item, refers, id))?;
+        let link = match activity::field(event, "kind") {
+            Some(kind) if event.action == "link.create" => {
+                let target = activity::field(event, "target").unwrap_or_default();
+                Some(self.link_shown(kind, target)?)
+            }
+            _ => None,
+        };
+        Ok(Activity {
+            when: When::At(event.at.clone()),
+            actor: self.name_of(&event.actor_id)?,
+            via: event.via_agent_id.as_deref().map(|id| self.name_of(id)).transpose()?,
+            action: event.action.clone(),
+            changes,
+            comment: (event.action == "comment.create")
+                .then(|| activity::field(event, "body"))
+                .flatten(),
+            link,
+        })
+    }
+
+    /// An entry read from the team document. The person is the writing machine's; an agent counts
+    /// only if that person owns it, and a comment naming another author says so.
+    fn team_entry(&self, item: &Item, entry: &TeamEntry) -> Result<Activity> {
+        let (writer, mut actor) = match &entry.writer {
+            Writer::Member { principal_id, standing } => {
+                let name = self.name_of(principal_id)?;
+                let name = match standing {
+                    Standing::Admitted => name,
+                    Standing::Removed => format!("{name} (removed)"),
+                    Standing::AfterRemoval => format!("{name} (after removal)"),
+                };
+                (Some(principal_id.as_str()), name)
+            }
+            Writer::Unknown(machine) => (None, format!("unknown machine {machine}")),
+        };
+        let via = match (&entry.via_agent_id, writer) {
+            (Some(agent), Some(writer)) => match self.store.find_principal(agent)? {
+                Some(p)
+                    if p.kind == PrincipalKind::Agent && p.owner_id.as_deref() == Some(writer) =>
+                {
+                    Some(p.name)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let comment = match &entry.comment {
+            Some((body, author)) => {
+                if writer != Some(author.as_str()) {
+                    actor = format!("{actor}, as {}", self.name_of(author)?);
+                }
+                Some(body.clone())
+            }
+            None => None,
+        };
+        let changes = entry
+            .changes
+            .iter()
+            .map(|change| match change {
+                Change::Value { field, from, to } => {
+                    let shown = |v: &Option<String>| -> Result<Option<String>> {
+                        match (v, activity::refers(field)) {
+                            (
+                                Some(id),
+                                refers @ (Refers::Principal | Refers::Item | Refers::Cycle),
+                            ) => self.referred(item, refers, id).map(Some),
+                            (v, _) => Ok(v.clone()),
+                        }
+                    };
+                    Ok(Change::Value { field, from: shown(from)?, to: shown(to)? })
+                }
+                edited => Ok(edited.clone()),
+            })
+            .collect::<Result<_>>()?;
+        let link = match &entry.link {
+            Some((kind, target)) => Some(self.link_shown(kind.clone(), target.clone())?),
+            None => None,
+        };
+        Ok(Activity {
+            when: entry.when.clone(),
+            actor,
+            via,
+            action: entry.action.clone(),
+            changes,
+            comment,
+            link,
+        })
+    }
 
     fn open_cycle(&self, collection: &Collection, reference: &str) -> Result<Cycle> {
         let cycle = self.cycle(collection, reference)?;
@@ -1126,6 +1234,19 @@ impl<S: Store> RoduService<S> {
             at: self.timestamp(),
         })
     }
+}
+
+/// The newest `limit` entries (default 50, at most 500), oldest first.
+fn newest(
+    key: String,
+    mut entries: Vec<Activity>,
+    limit: Option<u32>,
+    scope: Scope,
+) -> ActivityLog {
+    let limit = limit.unwrap_or(50).clamp(1, 500) as usize;
+    let total = entries.len();
+    entries.drain(..total.saturating_sub(limit));
+    ActivityLog { key, total, entries, scope }
 }
 
 fn to_json<T: Serialize>(value: &T) -> Value {

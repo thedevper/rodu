@@ -31,6 +31,7 @@ use loro::{
     Counter, ExportMode, Frontiers, IdSpan, Index, LoroDoc, LoroMap, LoroTree, LoroValue, TreeID,
     TreeParentId, ValueOrContainer, VersionVector,
 };
+use rodu_core::activity::TeamActivity;
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::{
     Collection, Comment, Cycle, Event, Item, Link, Principal, Result, RoduError, SearchRequest,
@@ -40,6 +41,7 @@ use rodu_store::SqliteStore;
 use rodu_store::index::Parked;
 use sha2::{Digest, Sha256};
 
+use crate::activity::{Known, Trust};
 use crate::layout::{
     self, ADMISSIONS, AUTHORITY, COLLECTIONS, COMMENTS, CYCLES, Fields, ITEMS, LINKS, MEMBERS,
     NUMBERING_PEER, PRINCIPALS, READABLE_COPY, TEAM,
@@ -69,6 +71,18 @@ const META_UNSETTLED: &str = "unsettled";
 /// The version of the document `team_activity` holds every change of, as an encoded version
 /// vector in hex (ADR 0006).
 const META_ACTIVITY: &str = "activity_version";
+/// The local note holding how the team stands with each machine ([`Trust`]).
+const NOTE_TRUST: &str = "trust";
+/// The local note, on the machine that made the team board from its workspace, holding the time
+/// of the last event it had recorded then: its events up to then come first in a card's activity.
+const NOTE_ADOPTED_EVENTS: &str = "adopted-events";
+
+/// This machine's clock, in whole seconds since 1970.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
 
 /// What indexing the document found, beyond the cards it changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -312,6 +326,10 @@ impl LoroStore {
             );
             pending.extend(sql.all_comments()?.into_iter().map(Change::Comment));
             pending.extend(sql.all_links()?.into_iter().map(Change::Link));
+            // With the document, or not at all: a retry finds a team workspace already.
+            if let Some(last) = sql.last_event_at()? {
+                sql.set_index_meta(&format!("{LOCAL_NOTE}{NOTE_ADOPTED_EVENTS}"), &last)?;
+            }
             Ok(())
         });
         store.adopting.set(false);
@@ -473,6 +491,16 @@ impl LoroStore {
         self.transaction(TxMode::Write, || {
             self.sql.set_index_meta(&format!("{LOCAL_NOTE}{key}"), value)
         })
+    }
+
+    /// Keeps how the team stands with each machine, as its folder says now, for reading
+    /// activity without the folder (ADR 0006). Written only when it changed.
+    pub fn set_trust(&self, trust: &Trust) -> Result<()> {
+        let text = trust.encode();
+        if self.local_note(NOTE_TRUST)?.as_deref() == Some(text.as_str()) {
+            return Ok(());
+        }
+        self.set_local_note(NOTE_TRUST, &text)
     }
 
     /// Writes an admission record for `peer`, for every machine once they sync.
@@ -872,9 +900,7 @@ impl LoroStore {
         if from == to {
             return Ok(());
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+        let now = unix_now();
         let own = self.peer.get();
         for change in crate::activity::changes_between(&doc, &from, &to) {
             let at = match own_at {
@@ -1041,6 +1067,9 @@ impl LoroStore {
             let via = self.context.borrow().as_ref().and_then(|(_, via)| via.clone());
             match via {
                 Some(via) => format!("{parity} via {via}"),
+                // The change that makes the team board from a workspace: its cards were not
+                // created then, but added (ADR 0006).
+                None if self.adopting.get() => format!("{parity} adopt"),
                 None => parity.to_string(),
             }
         };
@@ -1049,13 +1078,16 @@ impl LoroStore {
         }
         // Set after the operations, since Loro keeps them only on a transaction that has begun. A
         // commit with no operations of its own drops them.
-        let at = self.context.borrow().as_ref().map(|(at, _)| *at);
-        if let Some(at) = at {
-            doc.set_next_commit_timestamp(at);
-        }
+        // The service's time, or this machine's clock to the second when the sync code writes:
+        // Loro would round its own clock up, past the time this machine notes it held the change.
+        let at = match self.context.borrow().as_ref() {
+            Some((at, _)) => *at,
+            None => unix_now(),
+        };
+        doc.set_next_commit_timestamp(at);
         doc.set_next_commit_message(&message);
         doc.commit();
-        self.index_activity(at)?;
+        self.index_activity(Some(at))?;
         let bytes = doc.export(ExportMode::Snapshot).map_err(internal)?;
         let hash = sha256(&bytes);
         // Written whole under a name of its own, then renamed: the same snapshot can be staged
@@ -1884,6 +1916,35 @@ impl Store for LoroStore {
 
     fn list_events(&self, target_id: &str) -> Result<Vec<Event>> {
         self.sql.list_events(target_id)
+    }
+
+    fn team_activity(&self, item_id: &str) -> Result<Option<TeamActivity>> {
+        // A write transaction settles first: the rows and the document read are what another
+        // process last committed, and every row has its change.
+        self.transaction(TxMode::Write, || {
+            let rows = self.sql.activity_rows(item_id)?;
+            let comments = self.sql.list_comments(item_id)?;
+            let links = self.sql.list_links(item_id)?;
+            let trust = self.local_note(NOTE_TRUST)?.and_then(|t| Trust::decode(&t));
+            let members = self.members()?;
+            let known = Known {
+                own: self.peer.get(),
+                members: &members,
+                trust: trust.as_ref(),
+                numbering_peer: self.numbering_peer()?,
+                adopted_events: self.local_note(NOTE_ADOPTED_EVENTS)?,
+                comments: comments.into_iter().map(|c| (c.id, c.author_id)).collect(),
+                links: links
+                    .iter()
+                    .map(|l| layout::link_key(&l.from_item_id, l.kind.as_str(), &l.target))
+                    .collect(),
+            };
+            let doc = self.doc.borrow();
+            crate::activity::read(&doc, &rows, &known, |peer, counter| {
+                self.sql.received_at(peer, counter)
+            })
+            .map(Some)
+        })
     }
 
     fn get_idempotent(&self, key: &str) -> Result<Option<String>> {

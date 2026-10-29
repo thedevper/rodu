@@ -19,6 +19,11 @@ pub fn iso(at: OffsetDateTime) -> String {
     at.to_offset(UtcOffset::UTC).format(ISO).expect("a UTC time always formats")
 }
 
+/// [`iso`] of a time given in Unix seconds; one out of range gives the epoch.
+pub fn iso_seconds(unix_seconds: i64) -> String {
+    iso(OffsetDateTime::from_unix_timestamp(unix_seconds).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+}
+
 /// Whether `text` is a timestamp exactly as [`iso`] writes it.
 pub fn is_iso(text: &str) -> bool {
     text.len() == 24 && time::PrimitiveDateTime::parse(text, ISO).is_ok()

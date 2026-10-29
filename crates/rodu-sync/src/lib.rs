@@ -17,6 +17,7 @@ pub mod seal;
 pub mod sign;
 mod store;
 
+pub use activity::Trust;
 pub use store::{BatchReport, Incoming, IndexReport, LoroStore};
 
 use std::io::{Read, Write};
