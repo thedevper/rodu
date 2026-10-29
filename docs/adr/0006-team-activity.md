@@ -76,31 +76,50 @@ timestamps).
 The document is configured when `LoroStore` opens it, and in `team create` and `team join`:
 
 - `set_record_timestamp(true)`. Every change gets a time in whole seconds since 1970.
-- `set_change_merge_interval(-1)`. Loro merges a new local change into the one before it only
-  when all of these hold:
+- **Every write is a change of its own.** Loro merges a peer's change into the one before it when
+  all of these hold:
   - it directly follows that change, with a single dependency on it;
-  - their times are at most the interval apart;
+  - their times are close enough;
   - their commit messages are equal.
 
-  Times never go backwards, so with a negative interval no two changes merge, and each write (one
-  `stage()`, one `commit()`) stays one change.
+  For a local change, "close enough" is the document's merge interval. For a change taken in from
+  another machine, it is always the same second. Whether two changes actually merge also depends on
+  that machine's storage: whether the block before is in memory, and whether it is full. So the
+  same two writes could be one change on one machine and two on another. Every change therefore
+  gets a message that differs from its peer's previous change, and none of them ever merges. The
+  message starts with a parity digit, `0` or `1`, the opposite of the previous change's (`1` after
+  a change with no message).
+
+  *As built:* the ADR first chose a merge interval of `-1`. Testing showed that it does not reach
+  changes taken in from another machine (`oplog/change_store.rs`, `insert_change_inner`). A review
+  then showed that no interval makes every machine merge alike. At 20,000 cards and 120,000 writes
+  the parity digit costs 2% of a compacted sync file (5.80 MB against 5.68 MB), and nothing in the
+  snapshot.
 - **Context for the commit.** The `Store` trait gains
   `fn set_commit_context(&self, at: i64, via_agent_id: Option<&str>)`. The service calls it at the
   start of each write transaction, from its own clock and the `Actor`. `SqliteStore` ignores it.
-  `LoroStore` keeps it for the transaction and clears it on rollback. At `stage()` it applies the
-  context:
-  - `set_next_commit_timestamp(at)`, so tests with a fixed clock stay deterministic;
-  - on an agent's write, `set_next_commit_message("via <agent principal id>")`. A person's own
-    write has no message. Readers ignore a message in any other form, so a later version can add
-    fields.
+  - `LoroStore` keeps it until the outermost transaction ends, committed or not.
+  - The outermost transaction is one change. The first context set in it names that change, and a
+    service write nested in it (as MCP's `plan_cycle` nests several) does not take it over.
+  - At `stage()` it applies the context:
+    - `set_next_commit_timestamp(at)`, so tests with a fixed clock stay deterministic. Loro still
+      lifts the time to that of the latest change it builds on (see "When"). A write with no
+      context, such as recording a member or the numbering peer from the sync code, takes Loro's
+      own clock: timestamps are on for every change.
+    - The message: the parity digit, then ` via <agent principal id>` on an agent's write. Readers
+      take the agent from that suffix and ignore any message in another form, so a later version
+      can add fields.
 - **Imports carry no context.** An import adds no change of this machine's own: Loro applies the
   teammate's changes as they were made.
 
-Checked: change boundaries, times and messages travel unchanged:
-- through numbered sync files;
-- through a compacted file;
-- through the saved snapshot;
-- into a reader that merges by default.
+Checked (`each_write_is_a_change_of_its_own_with_the_services_time_and_its_agent`). Writes made in
+one second, some by another process after reopening the saved document, keep the same change
+boundaries, times and messages:
+- in a sync file;
+- on another machine that took them in over two pulls, and in what that machine passes on;
+- in the saved snapshot, and after reopening it.
+
+With the parity digit taken out, that test fails: three writes come out as one change.
 
 Loro's update format does not change, so rodu 0.9 reads these files as before.
 
@@ -192,8 +211,14 @@ syncs with nobody, as in 0.9.0. Both give the same `ActivityLog`.
   | otherwise | the time, as the writer's clock gave it |
 
   Ahead-of-time clocks then never push an entry past the moment this machine had it, whoever's
-  clock it was. A change with time 0 may hold many writes merged by Loro. Its fields appear as one
-  entry per card.
+  clock it was.
+- **Changes without a parity digit** come from rodu 0.9 or older, or from before this ADR. How
+  many such changes Loro made of their writes differs between machines: it depends on each
+  machine's storage when it took them in (see "Writing"). So the reader never treats them one by
+  one. A peer's run of consecutive changes without a parity digit is shown as one entry per card,
+  listing the last value of each field it set, with the time of the run's first change (or
+  `earlier`). A merged change keeps the time of its first write, so that time is the same on every
+  machine, and every machine shows the same entries for them.
 - **Team create.** The change that builds the team document from a workspace (`adopt`) is recorded
   by its id in local data. Its entries read "added to the team board", not "created". On the
   creator's machine, the card's `events` from before it come first, since they are this machine's

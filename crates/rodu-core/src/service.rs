@@ -145,6 +145,14 @@ impl<S: Store> RoduService<S> {
         iso(self.now())
     }
 
+    /// Runs `f` as one write transaction, which the store keeps with when it was made and the
+    /// agent it went through (ADR 0006).
+    fn write<T>(&self, actor: Option<&Actor>, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let via = actor.and_then(|a| a.via_agent_id.as_deref());
+        self.store.set_commit_context(self.now().unix_timestamp(), via);
+        self.store.transaction(TxMode::Write, f)
+    }
+
     // --- principals ------------------------------------------------------------------------
 
     pub fn create_principal(
@@ -178,7 +186,7 @@ impl<S: Store> RoduService<S> {
                 None
             },
         };
-        self.store.insert_principal(&principal)?;
+        self.write(None, || self.store.insert_principal(&principal))?;
         Ok(principal)
     }
 
@@ -230,7 +238,7 @@ impl<S: Store> RoduService<S> {
             workflow,
             created_at: self.timestamp(),
         };
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             self.store.insert_collection(&collection)?;
             let request = self.new_id();
             self.record(
@@ -308,7 +316,7 @@ impl<S: Store> RoduService<S> {
             ends_on,
             state: CycleState::Planned,
         };
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             self.store.insert_cycle(&cycle)?;
             self.record(
                 &self.new_id(),
@@ -349,7 +357,7 @@ impl<S: Store> RoduService<S> {
             .with_hint("Close it first"));
         }
         let started = Cycle { state: CycleState::Active, ..cycle.clone() };
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             self.store.save_cycle(&started)?;
             self.record(
                 &self.new_id(),
@@ -389,7 +397,7 @@ impl<S: Store> RoduService<S> {
             )));
         }
         let request = self.new_id();
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             let mut carried = Vec::new();
             for item in self.store.list_items_in_cycle(&cycle.id)? {
                 if item.category == Category::Done {
@@ -522,7 +530,7 @@ impl<S: Store> RoduService<S> {
             serde_json::to_vec(&json!([collection.id, parsed])).expect("items serialize"),
         ));
 
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             if let Some(key) = &scoped_key
                 && let Some(previous) = self.store.get_idempotent(key)?
             {
@@ -614,7 +622,7 @@ impl<S: Store> RoduService<S> {
                 .with_hint("The team's numbering peer numbers new cards when it syncs"));
         }
         let request = self.new_id();
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             let mut numbered = Vec::new();
             for collection in self.store.list_collections()? {
                 for item in self.store.list_unnumbered_items(&collection.id)? {
@@ -702,15 +710,14 @@ impl<S: Store> RoduService<S> {
                 .transpose()?,
             ..Changes::default()
         };
-        self.store
-            .transaction(TxMode::Write, || self.write_item(&self.new_id(), actor, &item, changes))
+        self.write(Some(actor), || self.write_item(&self.new_id(), actor, &item, changes))
     }
 
     /// Reorders an item: `after` is the item that should sit just above it, `before` the one just
     /// below. With only one given, the item goes right next to it.
     pub fn move_item(&self, actor: &Actor, reference: &str, to: &Placement) -> Result<Item> {
         // Read neighbours inside the transaction so another process cannot move them in between.
-        self.store.transaction(TxMode::Write, || self.place_item(actor, reference, to))
+        self.write(Some(actor), || self.place_item(actor, reference, to))
     }
 
     fn place_item(&self, actor: &Actor, reference: &str, to: &Placement) -> Result<Item> {
@@ -772,7 +779,7 @@ impl<S: Store> RoduService<S> {
             estimate: item.estimate,
         };
         let target = check_transition(&collection.workflow, &subject, to, &links)?.clone();
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             let changes = Changes {
                 status: Some((target.name.clone(), target.category)),
                 ..Changes::default()
@@ -795,7 +802,7 @@ impl<S: Store> RoduService<S> {
             body: text.to_string(),
             created_at: self.timestamp(),
         };
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             self.store.insert_comment(&comment)?;
             self.record(
                 &self.new_id(),
@@ -844,7 +851,7 @@ impl<S: Store> RoduService<S> {
             target: target_value,
             created_at: self.timestamp(),
         };
-        self.store.transaction(TxMode::Write, || {
+        self.write(Some(actor), || {
             self.store.insert_link(&link)?;
             self.record(&self.new_id(), actor, "link.create", &item.id, Value::Null, to_json(&link))
         })?;
