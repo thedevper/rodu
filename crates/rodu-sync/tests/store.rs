@@ -1127,3 +1127,188 @@ fn a_write_nested_in_another_does_not_take_over_its_context() {
     let (last_at, last_message) = all.last().unwrap();
     assert_eq!((*last_at >= 1_792_000_000, via_of(last_message)), (true, Some(agent)), "{all:?}");
 }
+
+/// A card's activity as (writer, action, field, value), oldest first.
+fn activity(peer: &Peer, key: &str) -> Vec<(u64, String, Option<String>, Option<String>)> {
+    let card = peer.svc.store.get_item_by_key(key).unwrap().unwrap();
+    let rows = peer.store().index().team_activity(&card.id).unwrap();
+    rows.into_iter()
+        .map(|r| (u64::from_str_radix(&r.peer, 16).unwrap(), r.action, r.field, r.value))
+        .collect()
+}
+
+fn row(
+    peer: &Peer,
+    action: &str,
+    field: Option<&str>,
+    value: Option<&str>,
+) -> (u64, String, Option<String>, Option<String>) {
+    (peer.store().peer(), action.into(), field.map(Into::into), value.map(Into::into))
+}
+
+#[test]
+fn a_teammates_changes_reach_the_activity_table() {
+    let a = Peer::first();
+    let keys = a.create(&["Plan garden", "Water tomatoes"]);
+    let b = Peer::join(&a, "bob");
+    let fields =
+        json!({ "title": "Plan the garden", "body": "Beds by the fence", "assignee": "me" });
+    b.patch(&keys[0], fields);
+    b.svc.transition(&b.me, &keys[0], "In Progress").unwrap();
+    b.svc.comment(&b.me, &keys[0], "Started on Monday").unwrap();
+    b.svc.link(&b.me, &keys[0], "blocks", &keys[1]).unwrap();
+    exchange(&a, &b);
+
+    let rows = activity(&a, &keys[0]);
+    // The creation, made on a: the card itself, then its first fields.
+    assert_eq!(rows[0], row(&a, "item.create", None, None), "{rows:#?}");
+    assert!(
+        rows.contains(&row(&a, "item.create", Some("title"), Some("Plan garden"))),
+        "{rows:#?}"
+    );
+    // b's work, in the order it was made, attributed to b's machine. The description is recorded
+    // as edited, without its text.
+    let from_b: Vec<_> = rows.iter().filter(|r| r.0 == b.store().peer()).cloned().collect();
+    let card = b.svc.store.get_item_by_key(&keys[1]).unwrap().unwrap();
+    assert_eq!(
+        from_b,
+        vec![
+            row(&b, "item.update", Some("title"), Some("Plan the garden")),
+            row(&b, "item.update", Some("body"), None),
+            row(&b, "item.update", Some("assignee_id"), Some(&b.me.principal_id)),
+            row(&b, "item.update", Some("status"), Some("In Progress")),
+            row(&b, "comment.create", None, Some("Started on Monday")),
+            row(&b, "link.create", None, Some(&format!("blocks {}", card.id))),
+        ],
+        "{rows:#?}"
+    );
+    // b sees the same history of the card.
+    assert_eq!(activity(&b, &keys[0]), rows);
+}
+
+#[test]
+fn a_rebuilt_activity_table_equals_the_one_kept_up_to_date_and_keeps_received_times() {
+    let a = Peer::first();
+    let keys = a.create(&["Plan garden"]);
+    let b = Peer::join(&a, "bob");
+    b.patch(&keys[0], json!({ "priority": "high" }));
+    exchange(&a, &b);
+    a.patch(&keys[0], json!({ "estimate": 2 }));
+    let activity = a.store().index().dump_activity().unwrap();
+    let received = a.store().index().dump_received().unwrap();
+    assert!(!activity.is_empty() && !received.is_empty());
+
+    a.store().rebuild_index().unwrap();
+    assert_eq!(a.store().index().dump_activity().unwrap(), activity);
+    assert_eq!(a.store().index().dump_received().unwrap(), received);
+}
+
+#[test]
+fn operations_still_waiting_are_indexed_when_they_land() {
+    let a = Peer::first();
+    let keys = a.create(&["Plan garden"]);
+    let b = Peer::join(&a, "bob");
+    let seen = a.store().version();
+    b.patch(&keys[0], json!({ "title": "First" }));
+    let middle = b.store().version();
+    b.patch(&keys[0], json!({ "title": "Second" }));
+    let first = b.store().updates_since(&seen).unwrap();
+    let second = b.store().updates_since(&middle).unwrap();
+    // Only b's own operations, so the first update holds b's principal and the first edit.
+
+    // The later update alone waits on the earlier one: nothing of it is indexed yet.
+    a.store().import_untrusted(&second, &checker()).unwrap();
+    assert!(!activity(&a, &keys[0]).iter().any(|r| r.0 == b.store().peer()));
+
+    a.store().import_untrusted(&first, &checker()).unwrap();
+    a.store().import_untrusted(&second, &checker()).unwrap();
+    let titles: Vec<_> = activity(&a, &keys[0])
+        .into_iter()
+        .filter(|r| r.0 == b.store().peer() && r.2.as_deref() == Some("title"))
+        .map(|r| r.3.unwrap())
+        .collect();
+    assert_eq!(titles, ["First", "Second"]);
+}
+
+#[test]
+fn an_unreadable_activity_version_starts_the_table_over_instead_of_failing() {
+    let a = Peer::first();
+    let keys = a.create(&["Plan garden"]);
+    a.store().index().set_index_meta("activity_version", "not a version").unwrap();
+    a.patch(&keys[0], json!({ "priority": "high" }));
+    let kept = a.store().index().dump_activity().unwrap();
+    a.store().rebuild_index().unwrap();
+    assert_eq!(a.store().index().dump_activity().unwrap(), kept);
+    let rows = activity(&a, &keys[0]);
+    assert_eq!(rows[0], row(&a, "item.create", None, None), "{rows:#?}");
+    assert_eq!(rows.last(), Some(&row(&a, "item.update", Some("priority"), Some("high"))));
+}
+
+#[test]
+fn a_rebuild_reads_changes_from_outside_rodu_the_way_they_were_indexed() {
+    let a = Peer::first();
+    let keys = a.create(&["Plan garden", "Water tomatoes"]);
+    let card = |raw: &LoroDoc, key: &str| {
+        let tree = raw.get_tree("items");
+        tree.nodes()
+            .into_iter()
+            .find(|n| {
+                let meta = tree.get_meta(*n).unwrap();
+                meta.get("key").and_then(|v| v.into_value().ok()) == Some(key.into())
+            })
+            .unwrap()
+    };
+    // Two changes with no message, sent one at a time: Loro joins them on import, and hands the
+    // second over as a slice of the first. Then one that deletes the other card.
+    let (raw, start) = raw_copy(&a);
+    let node = card(&raw, &keys[0]);
+    let demo = a.svc.collection("DEMO").unwrap().id;
+    let made = raw_card(
+        &raw,
+        "0190cccc-0000-7000-8000-000000000003",
+        &demo,
+        "DEMO",
+        TreeParentId::Root,
+        None,
+    );
+    raw.get_tree("items").get_meta(node).unwrap().insert("title", "Plan the beds").unwrap();
+    send_raw(&raw, &start, &a);
+    let middle = raw.oplog_vv();
+    raw.get_tree("items").get_meta(node).unwrap().insert("status", "Todo").unwrap();
+    raw.get_tree("items").get_meta(made).unwrap().insert("title", "Turn compost").unwrap();
+    send_raw(&raw, &middle, &a);
+    let last = raw.oplog_vv();
+    raw.get_tree("items").delete(card(&raw, &keys[1])).unwrap();
+    send_raw(&raw, &last, &a);
+
+    let kept = a.store().index().dump_activity().unwrap();
+    assert!(kept.iter().any(|r| r.contains("Plan the beds")), "{kept:#?}");
+    a.store().rebuild_index().unwrap();
+    assert_eq!(a.store().index().dump_activity().unwrap(), kept);
+}
+
+#[test]
+fn activity_rows_carry_the_writers_parity_agent_and_moves() {
+    let a = Peer::first();
+    let keys = a.create(&["Plan garden", "Dig beds"]);
+    let agent =
+        a.svc.create_principal("helper", PrincipalKind::Agent, Some(&a.me.principal_id)).unwrap();
+    let via =
+        Actor { principal_id: a.me.principal_id.clone(), via_agent_id: Some(agent.id.clone()) };
+    a.svc.update_item(&via, &keys[1], &json!({ "parent": keys[0] }), None).unwrap();
+    a.svc.comment(&a.me, &keys[1], &"long ".repeat(200)).unwrap();
+
+    let card = a.svc.store.get_item_by_key(&keys[1]).unwrap().unwrap();
+    let parent = a.svc.store.get_item_by_key(&keys[0]).unwrap().unwrap();
+    let rows = a.store().index().team_activity(&card.id).unwrap();
+    let moved = rows.iter().find(|r| r.field.as_deref() == Some("parent")).expect("a move row");
+    assert_eq!(moved.value.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(moved.via_agent_id.as_deref(), Some(agent.id.as_str()));
+    assert!(moved.at >= moved.deps_at && moved.deps_at > 0, "{moved:?}");
+    let comment = rows.iter().find(|r| r.action == "comment.create").unwrap();
+    assert_eq!(comment.value.as_ref().map(|v| v.chars().count()), Some(500));
+    assert_eq!(comment.via_agent_id, None);
+    // Each of a's changes says the opposite parity of the one before it.
+    assert_ne!(moved.parity, None);
+    assert_eq!(comment.parity, moved.parity.map(|p| 1 - p));
+}
