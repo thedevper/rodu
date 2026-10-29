@@ -106,9 +106,10 @@ The document is configured when `LoroStore` opens it, and in `team create` and `
       lifts the time to that of the latest change it builds on (see "When"). A write with no
       context, such as recording a member or the numbering peer from the sync code, takes Loro's
       own clock: timestamps are on for every change.
-    - The message: the parity digit, then ` via <agent principal id>` on an agent's write. Readers
-      take the agent from that suffix and ignore any message in another form, so a later version
-      can add fields.
+    - The message: the parity digit, then ` via <agent principal id>` on an agent's write, or
+      ` adopt` on the change that makes the team board from a workspace (see "Team create").
+      Readers take these from the suffix and ignore any message in another form, so a later
+      version can add fields.
 - **Imports carry no context.** An import adds no change of this machine's own: Loro applies the
   teammate's changes as they were made.
 
@@ -191,8 +192,11 @@ syncs with nobody, as in 0.9.0. Both give the same `ActivityLog`.
   not by taking whichever entry comes before it in the list. So when two machines set a field at the
   same time, both show the same earlier value, and the document keeps one of the two (ADR 0001).
 - **Who.** The writer's peer, through `members`, gives the person's name.
-  - On a signed team, a peer that is not admitted is shown as `unknown machine 1a2b3c4d`, as
-    `rodu team members` shows it.
+  - A peer no person claims, and on a signed team a peer that is not admitted, is shown as
+    `unknown machine 1a2b3c4d`, as `rodu team members` shows it.
+  - Who is admitted and where each removal cuts are the team folder's to say, and activity is read
+    without the folder: every pull keeps what the folder says then in local data (the `trust`
+    note), and the reader goes by that. Every command pulls first.
   - On an unsigned team the name is what the machine says. The note under the activity says so, as
     `rodu team members` does.
   - **A removed machine.** Its entries are shown with `(removed)`. The cut counts operations, and a
@@ -223,6 +227,16 @@ syncs with nobody, as in 0.9.0. Both give the same `ActivityLog`.
 
   Ahead-of-time clocks then never push an entry past the moment this machine had it, whoever's
   clock it was.
+
+  This machine's own changes are read by what it knows of them: each takes this machine's clock to
+  the second, sync writes included, and is noted as received then. So one is shown at its time,
+  or as `after` it when Loro lifted it to a change it built on, never `before`. A teammate's
+  change made in the same second as one it built on reads `after`, since this machine cannot tell
+  the two apart.
+
+  *As built:* a sync write (the numbering, a member's record, `adopt`) first took Loro's own clock,
+  which rounds to the nearest second, half the time past the second this machine noted. Such a
+  change then read `before`, as if this machine's clock ran ahead.
 - **Changes without a parity digit** come from rodu 0.9 or older, or from before this ADR. How
   many such changes Loro made of their writes differs between machines: it depends on each
   machine's storage when it took them in (see "Writing"). So the reader never treats them one by
@@ -230,10 +244,23 @@ syncs with nobody, as in 0.9.0. Both give the same `ActivityLog`.
   listing the last value of each field it set, with the time of the run's first change (or
   `earlier`). A merged change keeps the time of its first write, so that time is the same on every
   machine, and every machine shows the same entries for them.
-- **Team create.** The change that builds the team document from a workspace (`adopt`) is recorded
-  by its id in local data. Its entries read "added to the team board", not "created". On the
-  creator's machine, the card's `events` from before it come first, since they are this machine's
-  own and are kept.
+- **Team create.** The change that builds the team document from a workspace (`adopt`) says so in
+  its message, so every machine knows it. The creator also notes, in local data, the time of the last
+  event it had recorded then: its events up to that time come first, and a write made right
+  after, even in the same second, is read from the document only. Its entries read "added to the team board", not
+  "created". On the creator's machine, the card's `events` from before it come first, since they
+  are this machine's own and are kept, and they hold the card's comments and links, so the adopt
+  change's own entries for those are left out there.
+
+  *As built:* the ADR first kept the adopt change's id in the creator's local data. That would
+  have marked it on the creator's machine only.
+- **Removed machines, per row.** A change can straddle a cut, so its part past the cut is an entry
+  of its own, marked `(after removal)`.
+- **Known limits.** Where a run of changes without a parity digit starts is found again on each
+  read, by walking that peer's history back; for a team with a long Rodu 0.9 history this is the
+  slow part, and the place to keep it in the index if it shows in step 4. The person comes from
+  `members`, which ADR 0002 lets any admitted member write: a member can claim another person for
+  a machine, as `rodu team members` would show it.
 - **This machine's events still exist.** `events` keeps request ids and exact before and after
   values for audit. In a team workspace, `rodu show --activity --local` lists them as 0.9.0 does.
 
@@ -256,7 +283,8 @@ The note under the activity changes from "Recorded on this machine" to:
      from outside Rodu that Loro joins on import or that delete a card's node;
    - an unreadable saved version starts the table over;
    - a move, an agent's write, the parity and a long comment cut to 500 characters.
-3. **Reading:** the order, the before value, the time rules, `--local` and the audit. Tests:
+3. **Reading:** the order, the before value, the time rules, `--local` and the audit, in two pull
+   requests: reading (3a), then the audit (3b). Tests:
    - two concurrent writes to one field show the same earlier value;
    - a 0.9-style change shows as `earlier`, and as `after` once it builds on a timed change;
    - a clock two hours ahead shows as `before`;

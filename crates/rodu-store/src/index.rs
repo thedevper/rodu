@@ -302,8 +302,30 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The time of the newest event recorded, if any.
+    pub fn last_event_at(&self) -> Result<Option<String>> {
+        self.conn.query_row("SELECT max(at) FROM events", [], |r| r.get(0)).map_err(db)
+    }
+
+    /// When this machine first held the operation `counter` of `peer`, if it noted it.
+    pub fn received_at(&self, peer: &str, counter: i64) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT received_at FROM change_received
+                 WHERE peer = ?1 AND counter <= ?2 AND end_counter > ?2
+                 ORDER BY counter DESC LIMIT 1",
+            )
+            .map_err(db)?;
+        let mut rows = stmt.query(params![peer, counter]).map_err(db)?;
+        match rows.next().map_err(db)? {
+            Some(row) => row.get(0).map(Some).map_err(db),
+            None => Ok(None),
+        }
+    }
+
     /// A card's activity, in the order its changes were made (Lamport timestamp, then peer).
-    pub fn team_activity(&self, card_id: &str) -> Result<Vec<ActivityRow>> {
+    pub fn activity_rows(&self, card_id: &str) -> Result<Vec<ActivityRow>> {
         self.all(
             "SELECT peer, counter, lamport, at, deps_at, parity, via_agent_id, card_id, action,
                field, value FROM team_activity WHERE card_id = ?

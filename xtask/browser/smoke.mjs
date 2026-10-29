@@ -359,6 +359,21 @@ async function joinScenario(page) {
     await page.click('button', 'Open the board');
     await page.untilText('Card from the owner');
     check('join: the team\'s board opens on the same link', true);
+    // The card's history is the team's: it names the owner, who made it on another machine.
+    await page.click('.card', 'Card from the owner');
+    await page.until('the card panel', () => page.eval(`!!document.querySelector('aside.panel .activity summary')`));
+    await page.click('aside.panel .activity summary', 'Activity');
+    const history = await page.eval(`(() => {
+      const box = document.querySelector('aside.panel .activity');
+      return {
+        who: [...box.querySelectorAll('.comment-meta strong')].map((s) => s.textContent),
+        what: [...box.querySelectorAll('.activity-what')].map((p) => p.textContent),
+        note: box.querySelector('p.muted')?.textContent ?? '',
+      };
+    })()`);
+    check('join: a teammate\'s change shows in the card\'s activity', history.who[0] === 'owner' && history.what[0] === 'created', JSON.stringify(history));
+    check('join: the activity says whose clocks its times are', history.note.startsWith("Times are each machine's own clock"), JSON.stringify(history));
+    await page.click('aside.panel [aria-label="Close"]');
     const terminal = `${server.printed.join('\n')}${server.errors()}`;
     check('join: the invite never reaches the terminal', !terminal.includes(code));
     // The no-workspace probe (404), the refused invite (400), and the restart under the page.

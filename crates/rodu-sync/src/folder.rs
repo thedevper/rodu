@@ -43,7 +43,7 @@ use zeroize::Zeroizing;
 use crate::authority::{self, Authority, Record};
 use crate::seal::{self, TeamKey};
 use crate::sign::{self, MachineKey, PublicKey};
-use crate::{BatchReport, Checker, Incoming, LoroStore, MAX_IMPORT_BYTES};
+use crate::{BatchReport, Checker, Incoming, LoroStore, MAX_IMPORT_BYTES, Trust};
 
 pub const TEAM_FILE: &str = "rodu-team.json";
 pub const SYNC_DIR: &str = "sync";
@@ -888,7 +888,22 @@ impl TeamFolder {
         if let Err(e) = self.compact(store, &info, &dir) {
             warnings.push(format!("compacting this machine's sync files: {}", e.message));
         }
+        // A team just made pushes before it ever pulls.
+        if let Err(e) = self.note_trust(store, &info) {
+            warnings.push(format!("noting who the team admits, for activity: {}", e.message));
+        }
         Ok(Pushed { written, warnings })
+    }
+
+    /// Keeps in `store` who the team admits and where each removal cuts, as of now, for reading
+    /// activity without the folder (ADR 0006).
+    fn note_trust(&self, store: &LoroStore, info: &TeamInfo) -> Result<()> {
+        let trusted = self.trusted(store, info)?;
+        store.set_trust(&Trust {
+            signed: self.signing.is_some(),
+            admitted: trusted.admitted.keys().copied().collect(),
+            cut: trusted.cut,
+        })
     }
 
     /// A payload framed: signed first for a signed team, then sealed for an encrypted one.
@@ -1350,6 +1365,12 @@ impl TeamFolder {
         if let Err(e) = settled {
             report.batch.notes.push(format!(
                 "publishing the team key this machine changed to: {}; tried again next time",
+                e.message
+            ));
+        }
+        if let Err(e) = self.note_trust(store, &info) {
+            report.batch.notes.push(format!(
+                "noting who the team admits, for activity: {}; tried again next time",
                 e.message
             ));
         }

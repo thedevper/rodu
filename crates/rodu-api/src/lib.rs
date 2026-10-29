@@ -58,19 +58,26 @@ pub struct BoardView {
 pub struct ItemDetail {
     pub item: ItemView,
     pub comments: Vec<CommentView>,
-    /// The newest entries of the item's history on this machine, oldest first.
+    /// The newest entries of the item's history, oldest first.
     #[serde(default)]
     pub activity: Vec<ActivityView>,
     /// How many entries the history has in all.
     #[serde(default)]
     pub activity_total: usize,
+    /// What the history covers and how far its times and names hold, shown under it.
+    #[serde(default)]
+    pub activity_note: String,
 }
 
 /// One entry of an item's history. `what` holds people's words (titles, comments, links): show
 /// it as plain text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityView {
+    /// The time (RFC 3339), or empty when none was recorded.
     pub at: String,
+    /// `after`, `before` or `earlier` when the time is not simply the writer's clock (ADR 0006).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
     pub actor: String,
     pub via: Option<String>,
     pub what: String,
