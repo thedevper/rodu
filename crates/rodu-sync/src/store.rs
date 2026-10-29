@@ -187,6 +187,9 @@ pub struct LoroStore {
     /// The in-memory document holds pending operations no check has replayed: it is reloaded
     /// from the file, which leaves them out, when the transaction ends.
     forget_pending: Cell<bool>,
+    /// When the write being made happens and the agent it goes through, set by
+    /// [`Store::set_commit_context`] until the outermost transaction ends (ADR 0006).
+    context: RefCell<Option<(i64, Option<String>)>>,
 }
 
 fn internal(error: impl Display) -> RoduError {
@@ -335,6 +338,7 @@ impl LoroStore {
             adopting: Cell::new(false),
             group_cap: Cell::new(MAX_IMPORT_BYTES),
             forget_pending: Cell::new(false),
+            context: RefCell::new(None),
         };
         store.sql.transaction(TxMode::Write, || {
             let peer = match store.sql.index_meta(META_PEER)? {
@@ -908,6 +912,8 @@ impl LoroStore {
 
     fn install(&self, doc: LoroDoc) -> Result<()> {
         doc.set_peer_id(self.peer.get()).map_err(internal)?;
+        // Every change keeps its time (ADR 0006).
+        doc.set_record_timestamp(true);
         doc.get_tree(ITEMS).disable_fractional_index();
         *self.doc.borrow_mut() = doc;
         self.dirty.set(false);
@@ -957,9 +963,32 @@ impl LoroStore {
     fn stage(&self) -> Result<String> {
         self.dirty.set(true);
         let doc = self.doc.borrow();
+        // Read before the operations go in: Loro merges a change into this peer's previous one
+        // when they share a second and a message, and whether it does depends on each machine's
+        // storage, so two machines could draw different changes. A message that differs from the
+        // previous change's keeps every write a change of its own everywhere (ADR 0006).
+        let message = {
+            let last = doc.oplog_vv().get(&self.peer.get()).copied().unwrap_or(0);
+            let previous = (last > 0)
+                .then(|| doc.get_change(loro::ID::new(self.peer.get(), last - 1)))
+                .flatten()
+                .and_then(|change| change.message.map(|m| m.starts_with('1')));
+            let parity = if previous == Some(true) { '0' } else { '1' };
+            let via = self.context.borrow().as_ref().and_then(|(_, via)| via.clone());
+            match via {
+                Some(via) => format!("{parity} via {via}"),
+                None => parity.to_string(),
+            }
+        };
         for change in self.pending.borrow().iter() {
             self.apply(&doc, change)?;
         }
+        // Set after the operations, since Loro keeps them only on a transaction that has begun. A
+        // commit with no operations of its own drops them.
+        if let Some((at, _)) = self.context.borrow().as_ref() {
+            doc.set_next_commit_timestamp(*at);
+        }
+        doc.set_next_commit_message(&message);
         doc.commit();
         let bytes = doc.export(ExportMode::Snapshot).map_err(internal)?;
         let hash = sha256(&bytes);
@@ -1610,6 +1639,7 @@ impl Store for LoroStore {
             return result;
         }
         self.pending.borrow_mut().clear();
+        self.context.borrow_mut().take();
         let result = match (&result, staged.take()) {
             (Ok(_), Some(hash)) => {
                 let next = self.next_path(&hash);
@@ -1637,6 +1667,15 @@ impl Store for LoroStore {
             *self.loaded.borrow_mut() = None;
         }
         result
+    }
+
+    fn set_commit_context(&self, at: i64, via_agent_id: Option<&str>) {
+        // The outermost transaction is one change: the write that opened it names it, and a
+        // service write nested in it does not take it over.
+        let mut context = self.context.borrow_mut();
+        if context.is_none() || self.depth.get() == 0 {
+            *context = Some((at, via_agent_id.map(str::to_string)));
+        }
     }
 
     fn insert_principal(&self, p: &Principal) -> Result<()> {

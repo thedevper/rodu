@@ -40,6 +40,11 @@ pub trait Store {
     /// Runs `f` in a transaction; nested calls join the outer one through savepoints.
     fn transaction<T>(&self, mode: TxMode, f: impl FnOnce() -> Result<T>) -> Result<T>;
 
+    /// When the next write transaction is made (Unix seconds) and the agent it is made through,
+    /// for a store that keeps them with its writes (ADR 0006). They hold until the outermost
+    /// transaction ends, committed or not.
+    fn set_commit_context(&self, _at: i64, _via_agent_id: Option<&str>) {}
+
     fn insert_principal(&self, principal: &Principal) -> Result<()>;
     /// Looks up by id, then by name (case-insensitive).
     fn find_principal(&self, id_or_name: &str) -> Result<Option<Principal>>;
