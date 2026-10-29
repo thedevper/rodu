@@ -132,16 +132,17 @@ Each replica keeps a table in `rodu.db`, `team_activity`, rebuilt from the docum
 of the index. There is one row per operation that touches a card:
 
 ```text
-peer, counter, lamport, at, deps_at, via_agent_id, card_id, action, field, value
+peer, counter, lamport, at, deps_at, parity, via_agent_id, card_id, action, field, value
 ```
 
 - `counter` and `lamport` are the operation's own, not its change's.
 - `at` is the change's Loro time.
 - `deps_at` is the greatest time among the changes it depends on (0 when it has none).
+- `parity` and `via_agent_id` are what the change's message says, or null for any other message.
 - `action` uses the names `events` already uses, so `ActivityLog` and its formatting keep working:
   - `item.create`: the card's tree node and its first fields;
   - `item.update`: one field of the card's map, with the value set, or its parent;
-  - `item.number`: the number the numbering peer gave it;
+  - `item.number`: a later `number` on the card (reading shows it only from the numbering peer);
   - `comment.create`: a comment entry whose `item_id` is the card;
   - `link.create`: a link entry whose `from_item_id` is the card.
 
@@ -158,7 +159,17 @@ clock:
   with `export_json_updates`, maps each operation to its card and adds rows. Operations that are
   still pending are not in the log yet. They are indexed by the import that finally lands them.
   A local write indexes its own change the same way, right after `stage()`.
-- **On a rebuild,** the table is rebuilt from the whole history.
+- **On a rebuild,** the table is rebuilt from the whole history. Its rows equal the ones kept up
+  to date: a row depends only on its change, read whole as the document stores it. Loro may join a
+  peer's consecutive changes that have no parity digit on import, and then hands the later one to
+  an incremental read as a slice; its `deps_at` and whether it made the card come from the whole
+  change, not the slice. A comment or link is read from the fields its own change gives it, and a
+  card's fields by the tree node whose id their map has, deleted or not. A saved version the table
+  cannot read back starts it over from the whole history instead of stopping writes.
+- **Known limit:** a row names the card id its node holds now. Rodu never changes it; a peer
+  outside Rodu that rewrites it moves the node's rows to the new id on the next rebuild.
+  Likewise, a comment or link that such a peer splits over two changes Loro then joins gets its
+  row only on a rebuild, since each half alone is not a whole entry.
 - **Values are untrusted,** like everything indexed from the document (ADR 0001):
   - a value goes into the table only if it passes the same check the card's field would;
   - a field Rodu does not know is left out;
@@ -241,7 +252,10 @@ The note under the activity changes from "Recorded on this machine" to:
    rebuild. Shared service cases on the Loro store check:
    - a field change, a comment, a link and a creation, from a second replica;
    - a file held for missing operations is indexed when they land;
-   - a rebuild equals the incremental table and keeps `change_received`.
+   - a rebuild equals the incremental table and keeps `change_received`, including after changes
+     from outside Rodu that Loro joins on import or that delete a card's node;
+   - an unreadable saved version starts the table over;
+   - a move, an agent's write, the parity and a long comment cut to 500 characters.
 3. **Reading:** the order, the before value, the time rules and `--local`. Tests:
    - two concurrent writes to one field show the same earlier value;
    - a 0.9-style change shows as `earlier`, and as `after` once it builds on a timed change;
@@ -249,6 +263,8 @@ The note under the activity changes from "Recorded on this machine" to:
    - on a signed team: an unadmitted peer as an unknown machine, a removed machine's entries before
      and after its cut, and a `via` naming another person's agent dropped;
    - the adopt change reads as "added to the team board";
+   - `item.number` from a peer other than the numbering peer is not shown as a numbering;
+   - a comment or link row whose entry the board's index does not hold is not shown;
    - the browser smoke test checks a teammate's change in the panel.
 4. **Measure again** at 20,000 cards: a compacted file's size, open, rebuild with its rows, and
    `show --activity`. Record the figures here.
