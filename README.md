@@ -67,6 +67,7 @@ rodu init --name your-name --key DEMO --title "Demo project"
 rodu add Fix login crash --type bug --priority urgent --assignee me
 rodu ls "assignee = me() ORDER BY priority"
 rodu show DEMO-1
+rodu show DEMO-1 --activity   # also who changed what and when
 rodu mv DEMO-1 "In Progress"
 rodu web        # opens the board in your browser
 ```
@@ -158,9 +159,12 @@ Add Rodu to Claude Code from the directory that holds `.rodu/`:
 claude mcp add rodu -- rodu mcp
 ```
 
-Tools: `search`, `get_my_work`, `get_context`, `create_items`, `update_item`, `transition`,
+Tools: `search`, `get_my_work`, `get_context`, `get_activity`, `create_items`, `update_item`, `transition`,
 `comment`, `link`, `list_collections`, `create_collection`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
-Every change an agent makes is recorded as "owner via agent". Workflow rules are enforced in the
+Every change an agent makes is recorded as "owner via agent", and `get_activity` (or
+`rodu show --activity`, or Activity on a card in `rodu web`) lists who changed what on a card and
+when. That history stays on the machine that made the change: in a team, each machine lists only its
+own. Workflow rules are enforced in the
 domain, and refusals carry a hint the agent can act on.
 
 Only run `rodu mcp` against a workspace you trust: it serves whatever `.rodu/` it finds.

@@ -280,6 +280,12 @@ async fn creates_lists_moves_and_comments_on_items() {
     assert_eq!(detail["comments"][0]["author"], "alice");
     assert_eq!(detail["comments"][0]["body"], "Looks good");
     assert!(detail["comments"][0]["createdAt"].is_string());
+    let activity = detail["activity"].as_array().unwrap();
+    assert_eq!(detail["activityTotal"], 2);
+    assert_eq!(activity[0]["actor"], "alice");
+    assert_eq!(activity[0]["what"], "created");
+    assert_eq!(activity[1]["what"], "commented: Looks good");
+    assert!(activity[1]["at"].is_string());
 }
 
 #[tokio::test]

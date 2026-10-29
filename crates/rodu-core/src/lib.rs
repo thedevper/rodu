@@ -1,5 +1,6 @@
 //! Rodu's domain: the model, workflow rules, JQL-lite parsing and the service every surface calls.
 
+pub mod activity;
 pub mod clock;
 pub mod error;
 pub mod format;

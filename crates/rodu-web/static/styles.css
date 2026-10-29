@@ -723,6 +723,29 @@ pre {
   align-items: flex-end;
 }
 
+.activity {
+  margin-top: 16px;
+}
+
+.activity summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.activity ol {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.activity-what {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
 .empty-state {
   max-width: 480px;
   margin: 15vh auto;
