@@ -552,6 +552,119 @@ fn measure_one_write_on_a_large_board() {
     );
 }
 
+#[test]
+#[ignore = "a measurement; run with --release -- --ignored --nocapture"]
+fn measure_team_activity_on_a_large_board() {
+    const PRIORITIES: [&str; 3] = ["high", "low", "normal"];
+    // ADR 0006 step 4: 20,000 cards, then 100,000 edits (a title or a priority), of which the card
+    // DEMO-5 takes 1,000. The edits run 1,000 to a transaction, so the document holds fewer
+    // changes than one per write; the operations, and so the rows, are the same.
+    let a = Peer::first();
+    claim(&a);
+    let mut svc = RoduService::new(LoroStore::open(a.dir.path()).unwrap());
+    svc.max_batch = 1000;
+    let timed = |what: &str, f: &mut dyn FnMut()| {
+        let start = std::time::Instant::now();
+        f();
+        let took = start.elapsed();
+        eprintln!("{what}: {took:?}");
+        took
+    };
+    timed("create 20000 cards", &mut || {
+        svc.store
+            .transaction(TxMode::Write, || {
+                for batch in 0..20 {
+                    let inputs: Vec<Value> = (0..1000)
+                        .map(|i| json!({ "title": format!("Card {batch}-{i}"), "body": "Text" }))
+                        .collect();
+                    svc.create_items(&a.me, "DEMO", &inputs, None)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    });
+    timed("100000 edits", &mut || {
+        for round in 0..100 {
+            svc.store
+                .transaction(TxMode::Write, || {
+                    for i in 0..1000 {
+                        let n = round * 1000 + i;
+                        let key = match n % 100 {
+                            0 => "DEMO-5".to_string(),
+                            _ => format!("DEMO-{}", (n * 7919) % 20000 + 1),
+                        };
+                        let patch = match n % 2 {
+                            0 => json!({ "title": format!("Edit {n}") }),
+                            _ => json!({ "priority": PRIORITIES[n % 3] }),
+                        };
+                        svc.update_item(&a.me, &key, &patch, None)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+    });
+    let dir = a.dir.path();
+    let size = |name: &str| std::fs::metadata(dir.join(name)).unwrap().len();
+    let empty = LoroDoc::new().oplog_vv().encode();
+    let all_updates = svc.store.updates_since(&empty).unwrap().len();
+    let rows = svc.store.index().dump_activity().unwrap().len();
+    eprintln!(
+        "snapshot {} B, all updates (a compacted sync file) {all_updates} B, rodu.db {} B, \
+         team_activity {rows} rows",
+        size("rodu.loro"),
+        size("rodu.db"),
+    );
+
+    timed("one write", &mut || {
+        svc.update_item(&a.me, "DEMO-7", &json!({ "title": "One more" }), None).unwrap();
+    });
+    timed("open", &mut || drop(LoroStore::open(dir).unwrap()));
+    timed("rebuild the index with its rows", &mut || {
+        svc.store.rebuild_index().unwrap();
+    });
+    assert_eq!(svc.store.index().dump_activity().unwrap().len(), rows + 1);
+
+    // A teammate's 1,000 edits arriving in one file.
+    if let Some(keep) = std::env::var_os("RODU_MEASURE_KEEP") {
+        std::fs::copy(dir.join("rodu.db"), keep).unwrap();
+    }
+    let raw = LoroDoc::new();
+    raw.set_peer_id(0x5eed).unwrap();
+    raw.import(&svc.store.updates_since(&empty).unwrap()).unwrap();
+    let start = raw.oplog_vv();
+    raw.set_record_timestamp(true);
+    let tree = raw.get_tree("items");
+    let mut by_key = std::collections::HashMap::new();
+    for node in tree.nodes() {
+        let meta = tree.get_meta(node).unwrap();
+        if let Some(LoroValue::String(key)) = meta.get("key").and_then(|v| v.into_value().ok()) {
+            by_key.insert(key.to_string(), meta);
+        }
+    }
+    eprintln!("cards in the copy: {}", by_key.len());
+    for i in 0..1000 {
+        let key = format!("DEMO-{}", i * 13 + 11);
+        let fields = by_key.get(&key).unwrap_or_else(|| panic!("no {key}"));
+        fields.insert("title", "From bob").unwrap();
+        raw.set_next_commit_message("1");
+        raw.commit();
+    }
+    let update = raw.export(loro::ExportMode::updates(&start)).unwrap();
+    timed("import a teammate's 1000 edits", &mut || {
+        svc.store.import_untrusted(&update, &checker()).unwrap();
+    });
+
+    for key in ["DEMO-12", "DEMO-5"] {
+        let mut total = 0;
+        timed(&format!("show --activity {key}"), &mut || {
+            total = svc.activity(key, None).unwrap().total;
+        });
+        eprintln!("  {key}: {total} entries");
+        timed(&format!("audit {key}"), &mut || drop(svc.audit(key).unwrap()));
+    }
+}
+
 /// A copy of `peer`'s document under peer id 99, to change by hand, and its version so far.
 fn raw_copy(peer: &Peer) -> (LoroDoc, loro::VersionVector) {
     let raw = LoroDoc::new();

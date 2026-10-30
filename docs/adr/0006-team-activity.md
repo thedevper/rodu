@@ -300,6 +300,40 @@ The note under the activity changes from "Recorded on this machine" to:
 4. **Measure again** at 20,000 cards: a compacted file's size, open, rebuild with its rows, and
    `show --activity`. Record the figures here.
 
+   *Measured (2026-10-30):* release build, Loro 1.16.2, Apple M4, with the ignored test
+   `measure_team_activity_on_a_large_board` (`crates/rodu-sync/tests/store.rs`). It builds a board of
+   20,000 cards, then makes 100,000 edits (a title or a priority), 1,000 of them to one card. The edits
+   run 1,000 to a transaction to keep the run to minutes, so the document holds fewer changes than one
+   per write. The operations, and so the rows, are the same.
+
+   | | |
+   |---|---|
+   | snapshot (`rodu.loro`) | 6.9 MB |
+   | all updates (a compacted sync file) | 12.6 MB |
+   | `team_activity` | 372,170 rows, 77.5 MB with its two indexes (about 210 bytes a row) |
+   | `rodu.db` in all | 303 MB, of which `events` is 194 MB (120,002 events) |
+   | one card edit through the service | 56 ms |
+   | open the store | 0.18 s |
+   | rebuild the index with its rows | 4.3 s |
+   | import a teammate's file of 1,000 edits (one change each) | 3.0 s |
+   | `show --activity`, a card with 6 entries | 0.6 ms |
+   | `show --activity`, a card with 201 entries | 3.9 ms |
+   | `rodu audit`, either card | 0.43 s |
+
+   What it shows:
+   - Reading a card's activity is cheap: it reads the card's rows through their index.
+   - The audit reads the whole history each time, as designed. At 0.43 s for a command run now and
+     then, it stays that way (the `shortcut:` in `audit` names this measurement).
+   - `team_activity` is the largest thing this ADR adds: over 10 times the snapshot. Most of it is
+     the card creations (270,297 rows, 73%; the edits are 101,826), one row per field of each new
+     card. That growth follows what the ADR
+     settled: the table is not capped.
+   - The local `events` table, which is older than this ADR, is larger still, because it keeps every
+     write's before and after values (about 1.1 KB an event). It is outside this ADR, and is noted here as a separate thing
+     to look at.
+   - The rebuild (4.3 s, against 0.7 s without rows in ADR 0001) and the import (3 ms a change) are
+     where indexing activity costs time. Both run rarely, or in the background of a sync.
+
 ## What this does not do
 
 - **Prove when.** A time is what clocks said: the writer's, or one inherited from a change it built
