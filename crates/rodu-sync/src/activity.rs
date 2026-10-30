@@ -16,7 +16,8 @@ use loro::{
 };
 use rodu_core::Result;
 use rodu_core::activity::{
-    Change as Shown, Standing, TeamActivity, TeamEntry, When, Writer, document_field,
+    Audit, AuditChange, AuditOp, AuditStanding, Change as Shown, Standing, TeamActivity, TeamEntry,
+    When, Writer, document_field,
 };
 use rodu_core::clock::iso_seconds;
 use rodu_core::ids::is_uuid;
@@ -27,11 +28,16 @@ use crate::layout::{self, COMMENTS, FieldValue, ITEMS, LINKS};
 /// The most of a comment's text a row keeps; activity shows a short line of it.
 const COMMENT_SHOWN: usize = 500;
 
-/// One change of the history: its writer, where its counters start and end, and its rows.
+/// One change of the history: its writer, where its counters start and end, what it says of
+/// itself, and its rows.
 pub struct Change {
     pub peer: u64,
     pub start: i64,
     pub end: i64,
+    pub lamport: i64,
+    pub at: i64,
+    pub deps_at: i64,
+    pub message: Option<String>,
     pub rows: Vec<ActivityRow>,
 }
 
@@ -218,7 +224,16 @@ pub fn changes_between(doc: &LoroDoc, from: &VersionVector, to: &VersionVector) 
         let start = change.id.counter as i64;
         let end =
             change.ops.last().map_or(start, |op| op.counter as i64 + op.content.op_len() as i64);
-        out.push(Change { peer, start, end, rows });
+        out.push(Change {
+            peer,
+            start,
+            end,
+            lamport: change.lamport as i64,
+            at: change.timestamp,
+            deps_at,
+            message: change.msg.clone(),
+            rows,
+        });
     }
     out
 }
@@ -549,6 +564,71 @@ pub fn read(
         entries.push(entry);
     }
     Ok(TeamActivity { signed: known.trust.is_some_and(|t| t.signed), adopted_at, entries })
+}
+
+/// Every change of the document that touched `card_id`, read from the whole history each time
+/// (ADR 0006 "Audit"): nothing here comes from `team_activity`. `members` and `trust` say who
+/// each machine is and how the team stands with it; `received` gives when this machine first held
+/// a peer's operation. Member names are the service's to fill in.
+// shortcut: reads the whole history on every audit, which grows with the board; keep it if step 4
+// finds an audit of a 20,000-card board fast enough, else read only the changes that touch the card.
+pub fn audit(
+    doc: &LoroDoc,
+    card_id: &str,
+    members: &BTreeMap<u64, String>,
+    trust: Option<&Trust>,
+    received: impl Fn(&str, i64) -> Result<Option<i64>>,
+) -> Result<Audit> {
+    let standing = |peer: u64| match trust {
+        Some(t) if t.signed => match t.cut.get(&peer) {
+            Some(&cut) => AuditStanding::Removed { cut },
+            None if t.admitted.contains(&peer) => AuditStanding::Admitted,
+            None => AuditStanding::NotAdmitted,
+        },
+        _ => AuditStanding::Unchecked,
+    };
+    let history = changes_between(doc, &VersionVector::default(), &doc.oplog_vv());
+    // Where each peer's first timed change starts, whatever order Lamport times put them in.
+    let mut first_timed: HashMap<u64, i64> = HashMap::new();
+    for change in history.iter().filter(|c| c.at > 0) {
+        let first = first_timed.entry(change.peer).or_insert(change.start);
+        *first = (*first).min(change.start);
+    }
+    let mut changes = Vec::new();
+    for change in history {
+        let untimed_after_timed =
+            change.at <= 0 && first_timed.get(&change.peer).is_some_and(|&f| f < change.start);
+        let ops: Vec<AuditOp> = change
+            .rows
+            .into_iter()
+            .filter(|r| r.card_id == card_id)
+            .map(|r| AuditOp {
+                counter: r.counter,
+                action: r.action,
+                field: r.field,
+                value: r.value,
+            })
+            .collect();
+        if ops.is_empty() {
+            continue;
+        }
+        let peer = layout::peer_text(change.peer);
+        changes.push(AuditChange {
+            received: received(&peer, change.start)?,
+            peer,
+            start: change.start,
+            end: change.end,
+            lamport: change.lamport,
+            at: change.at,
+            deps_at: change.deps_at,
+            message: change.message,
+            member: members.get(&change.peer).map(|id| (id.clone(), String::new())),
+            standing: standing(change.peer),
+            untimed_after_timed,
+            ops,
+        });
+    }
+    Ok(Audit { card_id: card_id.to_string(), signed: trust.map(|t| t.signed), changes })
 }
 
 #[cfg(test)]

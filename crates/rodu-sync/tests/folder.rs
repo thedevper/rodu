@@ -4,6 +4,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use loro::LoroDoc;
+use rodu_core::format::format_audit;
 use rodu_core::{Actor, PrincipalKind, RoduService, Store};
 use rodu_sync::folder::{Frame, TeamFolder, frame, unframe};
 use rodu_sync::seal::TeamKey;
@@ -1741,7 +1742,7 @@ fn work_a_member_took_in_before_hearing_of_a_removal_reaches_every_replica() {
 #[test]
 fn each_pull_notes_how_the_team_stands_with_each_machine() {
     let root = tempfile::tempdir().unwrap();
-    let Three { ann_folder, a, b, c, .. } = with_cat(root.path());
+    let Three { ann_folder, a, bob_folder, b, c, .. } = with_cat(root.path());
     let cat = c.store().peer();
     ann_folder.remove(a.store(), cat).unwrap();
     a.sync(&ann_folder);
@@ -1752,6 +1753,25 @@ fn each_pull_notes_how_the_team_stands_with_each_machine() {
     assert!(trust.admitted.contains(&b.store().peer()));
     assert_eq!(trust.cut, ann_folder.removed(a.store()).unwrap());
     assert!(trust.cut.contains_key(&cat));
+
+    // The audit says how the team stands with the machine behind each change of a card.
+    let titled = a.svc.search(&a.me, "", Some(100), None).unwrap().items;
+    let card = titled.into_iter().find(|i| i.title == "Before").unwrap();
+    b.sync(&bob_folder);
+    b.svc.transition(&b.me, &card.id, "Todo").unwrap();
+    b.sync(&bob_folder);
+    a.sync(&ann_folder);
+    let (key, audit) = a.svc.audit(&card.id).unwrap();
+    let text = format_audit(&key, &audit);
+    assert!(text.contains(". Signed team: "), "{text}");
+    let standing = |peer: u64| {
+        let machine = format!("  machine {peer:016x} · ");
+        let line = text.lines().find(|l| l.starts_with(&machine));
+        line.unwrap_or_else(|| panic!("{text}")).rsplit(" · ").next().unwrap().to_string()
+    };
+    let cut = trust.cut[&cat];
+    assert_eq!(standing(cat), format!("removed: the team takes in its operations below {cut}"));
+    assert_eq!(standing(b.store().peer()), "admitted");
 }
 
 #[test]

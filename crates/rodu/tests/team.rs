@@ -249,6 +249,29 @@ fn a_plain_workspace_is_unchanged() {
     let sync = rodu(root.path(), &["sync"]);
     assert!(sync.err.contains("not a team workspace"), "{}", sync.err);
     assert!(ok(root.path(), &["team"]).contains("Not a team workspace"));
+    let audit = rodu(root.path(), &["audit", "DEMO-1"]);
+    assert_ne!(audit.code, 0);
+    assert!(audit.err.contains("not shared with a team"), "{}", audit.err);
+}
+
+#[test]
+fn an_audit_names_the_machine_behind_each_change() {
+    let team = team();
+    let bob = join(&team, "bob");
+    ok(&bob, &["mv", "DEMO-1", "Todo"]);
+    let audit = ok(&team.ann, &["audit", "DEMO-1"]);
+    assert!(audit.contains("Unsigned team"), "{audit}");
+    assert!(audit.contains(&format!("machine {} · bob (", machine(&bob))), "{audit}");
+    assert!(audit.contains(&format!("machine {} · ann (", machine(&team.ann))), "{audit}");
+    assert!(audit.contains(" adopt\"\n"), "the card came in with the team: {audit}");
+    assert!(audit.contains("status = \"Todo\""), "{audit}");
+    // Reading it changes nothing.
+    assert_eq!(ok(&team.ann, &["audit", "DEMO-1"]), audit);
+    for extra in [&["audit", "DEMO-1", "DEMO-2"][..], &["audit", "DEMO-1", "--local"], &["audit"]] {
+        let refused = rodu(&team.ann, extra);
+        assert_ne!(refused.code, 0, "{extra:?}");
+        assert!(refused.err.contains("one item key"), "{}", refused.err);
+    }
 }
 
 // --- encrypted teams ----------------------------------------------------------------------------

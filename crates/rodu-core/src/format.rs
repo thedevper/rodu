@@ -2,7 +2,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::activity::{Activity, ActivityLog, Change};
+use crate::activity::{Activity, ActivityLog, Audit, AuditStanding, Change, document_field};
+use crate::clock::iso_seconds;
 use crate::model::{Collection, Comment, Cycle, Item, Link, LinkKind, Priority};
 
 /// Everything [`format_context`] renders about one item.
@@ -237,6 +238,102 @@ pub fn format_activity(log: &ActivityLog) -> String {
             if omitted == 1 { "y" } else { "ies" }
         ));
     }
+    out
+}
+
+/// A card's audit (`rodu audit`, MCP `get_audit`): every change of the team document that touched
+/// it, with the machine, ids, raw times and message of each. Values, names and messages were
+/// written by people or their machines, so all of it is fenced.
+pub fn format_audit(key: &str, audit: &Audit) -> String {
+    let team = match audit.signed {
+        Some(true) => {
+            "Signed team: the team takes in a machine's changes once it admits the machine, as \
+             this machine's last pull or push noted it."
+        }
+        Some(false) => {
+            "Unsigned team, as this machine's last pull or push noted it: a machine is what the \
+             team's files say it is, and none is checked."
+        }
+        None => {
+            "How the team stands with each machine is not known yet: it is noted on this \
+             machine's next pull or push."
+        }
+    };
+    let mut out = format!(
+        "## Audit\n\nCard {key}, id {}. {team} The changes are read from this machine's copy of \
+         the team document each time, never from its activity index; `received` is this \
+         machine's own note. Times are Unix seconds from each machine's own clock: `time` is what \
+         the change says, `built on` the latest time of the changes it built on, `received` when \
+         this machine first held it.",
+        audit.card_id
+    );
+    if audit.changes.is_empty() {
+        out.push_str("\n\nNo change in the team document touches this card.");
+        return out;
+    }
+    let time = |t: i64| match t {
+        0 => "0 (none)".to_string(),
+        t if time::OffsetDateTime::from_unix_timestamp(t).is_err() => format!("{t} (out of range)"),
+        t => format!("{t} ({})", iso_seconds(t)),
+    };
+    let mut lines = Vec::new();
+    for c in &audit.changes {
+        lines.push(format!(
+            "- change {}@{}..{} · lamport {}",
+            c.peer,
+            c.start,
+            c.end.max(c.start + 1) - 1,
+            c.lamport
+        ));
+        let who = match &c.member {
+            Some((id, name)) => format!("{name} ({id})"),
+            None => "no person claims it".to_string(),
+        };
+        let standing = match c.standing {
+            AuditStanding::Unchecked => "not checked".to_string(),
+            AuditStanding::Admitted => "admitted".to_string(),
+            AuditStanding::NotAdmitted => "not admitted".to_string(),
+            AuditStanding::Removed { cut } => {
+                format!("removed: the team takes in its operations below {cut}")
+            }
+        };
+        lines.push(format!("  machine {} · {who} · {standing}", c.peer));
+        lines.push(format!(
+            "  time {} · built on {} · received {}",
+            time(c.at),
+            time(c.deps_at),
+            c.received.map_or_else(|| "not noted".to_string(), time)
+        ));
+        lines.push(format!(
+            "  message {}",
+            c.message.as_ref().map_or_else(|| "none".to_string(), |m| format!("{m:?}"))
+        ));
+        if c.untimed_after_timed {
+            lines.push(
+                "  FLAG: no time, after timed changes from this machine; Rodu never writes one"
+                    .to_string(),
+            );
+        }
+        for op in &c.ops {
+            let mut line = format!("  - {} {}", op.counter, op.action);
+            if let Some(field) = &op.field {
+                line.push_str(&format!(" {field}"));
+            }
+            let hidden = op.field.as_deref().and_then(document_field).is_some_and(|f| f.1);
+            match &op.value {
+                Some(v) => line.push_str(&format!(" = {v:?}")),
+                None if hidden => line.push_str(" (value not kept)"),
+                None if op.field.is_some() => line.push_str(" = none"),
+                None => {}
+            }
+            if matches!(c.standing, AuditStanding::Removed { cut } if op.counter as u64 >= cut) {
+                line.push_str(" · past its cut");
+            }
+            lines.push(line);
+        }
+    }
+    out.push_str("\n\n");
+    out.push_str(&fence(&format!("{key}:audit"), &lines.join("\n")));
     out
 }
 
