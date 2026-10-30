@@ -1,7 +1,7 @@
 //! The store of an opened workspace: a plain one keeps everything in SQLite, a team one keeps a
 //! Loro document with SQLite as its index (ADR 0001).
 
-use rodu_core::activity::TeamActivity;
+use rodu_core::activity::{Audit, TeamActivity};
 use rodu_core::{
     Collection, Comment, Cycle, Event, Item, Link, Principal, Result, SearchRequest, SearchResult,
     Side, Store, TxMode,
@@ -86,6 +86,7 @@ impl Store for AnyStore {
         fn append_event(&self, event: &Event) -> Result<()>;
         fn list_events(&self, target_id: &str) -> Result<Vec<Event>>;
         fn team_activity(&self, item_id: &str) -> Result<Option<TeamActivity>>;
+        fn audit(&self, item_id: &str) -> Result<Option<Audit>>;
         fn get_idempotent(&self, key: &str) -> Result<Option<String>>;
         fn put_idempotent(&self, key: &str, result: &str) -> Result<()>;
     }

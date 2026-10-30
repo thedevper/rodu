@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rodu_core::format::{format_activity, item_line};
+use rodu_core::format::{format_activity, format_audit, item_line};
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
 use rodu_http::{
@@ -34,6 +34,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   add <title> [--type bug] [--priority high] [--assignee me] [--collection KEY]
   ls [query] [--limit 50]    list items (JQL-lite, e.g. \"assignee = me() ORDER BY priority\")
   show <key> [--activity [--local]] [--limit 50]   item with its context; --activity adds its history (in a team, across the team; --local: as this machine recorded it)
+  audit <key>                team workspace: every change to an item, with the machine that wrote it (read-only)
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
   collections                the collections in this workspace, key and name
   collection add <KEY> [--title <name>]   add a collection (a project with its own card numbers)
@@ -420,7 +421,7 @@ async fn command_result(
             team::after_reopen(io, true);
             served.map(|()| 0)
         }
-        "add" | "ls" | "show" | "mv" | "collection" | "collections" => {
+        "add" | "ls" | "show" | "audit" | "mv" | "collection" | "collections" => {
             let ws = open(io, false)?;
             team::before(io, &ws);
             let result = item_command(command, rest, args, &ws, io);
@@ -524,6 +525,15 @@ fn item_command(
                 out.push_str(&format_activity(&log));
             }
             (io.out)(&out);
+            Ok(0)
+        }
+        "audit" => {
+            let options = !args.flags.is_empty() || !args.values.is_empty();
+            let ([key], false) = (rest, options) else {
+                return Err(RoduError::invalid("audit takes one item key, e.g. rodu audit DEMO-1"));
+            };
+            let (key, audit) = ws.service.audit(key)?;
+            (io.out)(&format_audit(&key, &audit));
             Ok(0)
         }
         _ => {

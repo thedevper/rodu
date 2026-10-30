@@ -5,14 +5,15 @@ use rmcp::model::{
 };
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
-use rodu_core::{Actor, PrincipalKind, RoduService};
+use rodu_core::{Actor, PrincipalKind, RoduService, Store};
 use rodu_mcp::RoduMcp;
 use rodu_store::SqliteStore;
+use rodu_sync::LoroStore;
 use serde_json::{Value, json};
 
 type Client = RunningService<RoleClient, ()>;
 
-fn demo_service(store: SqliteStore) -> (RoduService<SqliteStore>, Actor) {
+fn demo_service<S: Store>(store: S) -> (RoduService<S>, Actor) {
     let service = RoduService::new(store);
     let human = service.create_principal("alice", PrincipalKind::Human, None).unwrap();
     let bot =
@@ -23,7 +24,7 @@ fn demo_service(store: SqliteStore) -> (RoduService<SqliteStore>, Actor) {
     (service, actor)
 }
 
-async fn connect_to(service: RoduService<SqliteStore>, actor: Actor) -> Client {
+async fn connect_to<S: Store + Send + 'static>(service: RoduService<S>, actor: Actor) -> Client {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let server = RoduMcp::new(service, actor);
     tokio::spawn(async move {
@@ -71,6 +72,7 @@ async fn lists_the_tools_with_annotations_and_instructions() {
             "create_items",
             "cycle_report",
             "get_activity",
+            "get_audit",
             "get_context",
             "get_my_work",
             "link",
@@ -86,6 +88,7 @@ async fn lists_the_tools_with_annotations_and_instructions() {
         "get_my_work",
         "get_context",
         "get_activity",
+        "get_audit",
         "list_collections",
         "cycle_report",
     ];
@@ -151,6 +154,31 @@ async fn creates_searches_and_moves_items() {
     assert!(!last.contains("· created") && last.contains("[1 older entry omitted]"), "{last}");
     let refused = call(&client, "get_activity", json!({ "ref": "DEMO-1", "limit": 0 })).await;
     assert_eq!(refused.is_error, Some(true));
+
+    // A plain workspace has no team document to audit.
+    let audit = call(&client, "get_audit", json!({ "ref": "DEMO-1" })).await;
+    assert_eq!(audit.is_error, Some(true));
+    assert!(text(&audit).contains("not shared with a team"), "{}", text(&audit));
+}
+
+#[tokio::test]
+async fn audits_a_team_workspace_naming_the_machine_behind_each_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let (service, actor) = demo_service(LoroStore::open(dir.path()).unwrap());
+    let peer = service.store.peer();
+    service.store.set_member(peer, &actor.principal_id).unwrap();
+    service.create_items(&actor, "DEMO", &[json!({ "title": "Crash on login" })], None).unwrap();
+    let client = connect_to(service, actor).await;
+
+    let audit = call(&client, "get_audit", json!({ "ref": "DEMO-1" })).await;
+    assert_ne!(audit.is_error, Some(true), "{}", text(&audit));
+    let audit = text(&audit);
+    assert!(audit.starts_with("## Audit"), "{audit}");
+    let fence = audit.find("<untrusted-content source=\"DEMO-1:audit\">").unwrap();
+    let machine = audit.find(&format!("machine {peer:016x} · alice (")).unwrap();
+    assert!(fence < machine, "{audit}");
+    assert!(audit.contains("title = \"Crash on login\""), "{audit}");
+    assert_eq!(audit.matches("</untrusted-content>").count(), 1, "{audit}");
 }
 
 #[tokio::test]

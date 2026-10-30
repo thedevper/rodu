@@ -7,7 +7,7 @@ use std::time::Duration;
 use loro::{LoroDoc, LoroValue, TreeParentId};
 use rodu_core::activity::{Scope, When};
 use rodu_core::clock::iso_seconds;
-use rodu_core::format::{activity_what, format_activity};
+use rodu_core::format::{activity_what, format_activity, format_audit};
 use rodu_core::{Actor, PrincipalKind, RoduError, RoduService, Store, TxMode};
 use rodu_sync::{Checker, IndexReport, LoroStore, Trust, run_check};
 use serde_json::{Value, json};
@@ -1714,4 +1714,88 @@ fn team_activity_names_links_hides_descriptions_and_keeps_the_newest() {
     assert_eq!((last.total, last.entries.len()), (4, 2));
     assert_eq!(last.entries[0].action, "link.create");
     assert_eq!(a.svc.activity("DEMO-99", None).unwrap_err().code, rodu_core::ErrorCode::NotFound);
+}
+
+/// `rodu audit`'s text for the card keyed `key`, as `peer` reads it.
+fn audit(peer: &Peer, key: &str) -> String {
+    let (key, audit) = peer.svc.audit(key).unwrap();
+    format_audit(&key, &audit)
+}
+
+#[test]
+fn the_audit_names_each_machine_and_ignores_edits_to_the_index() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let b = Peer::join(&a, "bob");
+    claim(&b);
+    exchange(&a, &b);
+    b.patch(&keys[0], json!({ "title": "Plan the garden" }));
+    exchange(&a, &b);
+
+    let before = audit(&a, &keys[0]);
+    let bob = format!("{:016x}", b.store().peer());
+    assert!(before.contains(&format!("machine {bob} · bob (")), "{before}");
+    assert!(before.contains("item.update title = \"Plan the garden\""), "{before}");
+    assert!(before.contains("not known yet"), "no pull has said how the team stands: {before}");
+    assert!(!before.contains("FLAG"), "{before}");
+
+    // Anyone with the machine can rewrite its index: activity follows it, the audit does not.
+    let shown = entries(&a, &keys[0]);
+    let index = a.store().index();
+    let card = a.svc.item(&keys[0]).unwrap();
+    let rows = index.activity_rows(&card.id).unwrap();
+    index.clear_team_activity().unwrap();
+    for mut row in rows {
+        if row.field.as_deref() == Some("title") {
+            row.value = Some("Forged".into());
+        }
+        index.put_activity(&row).unwrap();
+    }
+    assert_ne!(entries(&a, &keys[0]), shown, "the edit reached activity");
+    assert_eq!(audit(&a, &keys[0]), before);
+}
+
+#[test]
+fn the_audit_flags_an_untimed_change_after_timed_ones_from_its_machine() {
+    let a = Peer::first();
+    claim(&a);
+    let keys = a.create(&["Plan garden"]);
+    let (raw, start) = raw_as(&a, 94);
+    raw.set_record_timestamp(true);
+    raw_fields(&raw, &keys[0]).insert("title", "Timed").unwrap();
+    raw.set_next_commit_message("1");
+    raw.commit();
+    raw_fields(&raw, &keys[0]).insert("title", "Untimed").unwrap();
+    raw.set_next_commit_message("0");
+    raw.commit();
+    // Loro lifts a change's time to that of the change before it; a modified build need not.
+    let mut json = raw.export_json_updates_without_peer_compression(&start, &raw.oplog_vv());
+    assert_eq!(json.changes.len(), 2);
+    json.changes[1].timestamp = 0;
+    let forged = LoroDoc::new();
+    forged.import(&a.store().updates_since(&LoroDoc::new().oplog_vv().encode()).unwrap()).unwrap();
+    forged.import_json_updates(json).unwrap();
+    let update = forged.export(loro::ExportMode::updates(&start)).unwrap();
+    a.store().import_untrusted(&update, &checker()).unwrap();
+
+    // A machine whose changes never had a time (Rodu 0.9) is not flagged.
+    let demo = a.svc.collection("DEMO").unwrap().id;
+    let old = LoroDoc::new();
+    old.set_peer_id(93).unwrap();
+    let id = "0190eeee-0000-7000-8000-000000000006";
+    raw_card(&old, id, &demo, "DEMO", TreeParentId::Root, None);
+    old.commit();
+    let update = old.export(loro::ExportMode::all_updates()).unwrap();
+    a.store().import_untrusted(&update, &checker()).unwrap();
+    let untimed = audit(&a, id);
+    assert!(untimed.contains("time 0 (none)") && !untimed.contains("FLAG"), "{untimed}");
+
+    let text = audit(&a, &keys[0]);
+    let changes: Vec<&str> = text.split("\n- change ").skip(1).collect();
+    let of = |value: &str| changes.iter().find(|c| c.contains(value)).copied().unwrap();
+    assert!(of("\"Untimed\"").contains("time 0 (none)"), "{text}");
+    assert!(of("\"Untimed\"").contains("FLAG: no time"), "{text}");
+    assert!(!of("\"Timed\"").contains("FLAG"), "{text}");
+    assert_eq!(text.matches("FLAG").count(), 1, "{text}");
 }

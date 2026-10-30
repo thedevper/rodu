@@ -159,13 +159,17 @@ Add Rodu to Claude Code from the directory that holds `.rodu/`:
 claude mcp add rodu -- rodu mcp
 ```
 
-Tools: `search`, `get_my_work`, `get_context`, `get_activity`, `create_items`, `update_item`, `transition`,
+Tools: `search`, `get_my_work`, `get_context`, `get_activity`, `get_audit`, `create_items`, `update_item`, `transition`,
 `comment`, `link`, `list_collections`, `create_collection`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
 Every change an agent makes is recorded as "owner via agent", and `get_activity` (or
 `rodu show --activity`, or Activity on a card in `rodu web`) lists who changed what on a card and
 when. In a team it lists every machine's changes, read from the team's shared history: times are
 each machine's own clock, so one that runs ahead shows as "before" the moment yours received it.
-`rodu show --activity --local` lists what this machine recorded itself. Workflow rules are enforced
+`rodu show --activity --local` lists what this machine recorded itself. To check the record,
+`rodu audit DEMO-1` (or `get_audit`) lists each change Rodu reads as touching a card, with the
+machine that wrote it, its raw times and commit message. It reads the team document's history
+each time, not the activity index, and nothing in Rodu writes to it; when this machine received
+each change, and how the team stands with each machine, are this machine's own notes. Workflow rules are enforced
 in the domain, and refusals carry a hint the agent can act on.
 
 Only run `rodu mcp` against a workspace you trust: it serves whatever `.rodu/` it finds.

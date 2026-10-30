@@ -365,3 +365,27 @@ Any member can run it. Every member holds the whole document (ADR 0002), so limi
 the owner and admins would only hide what each member's own copy already holds.
 
 The audit is step 3.
+
+*As built (3b):*
+- The audit lists the document's changes, not entries: one per change that touched the card, with
+  each of its operations on the card (values as stored, ids included; a description or position
+  says only that it changed). A change is not grouped into a run or split at a cut. An operation
+  past a removed machine's cut is marked as such. The header names the card's id as well as its
+  key, since the key is looked up in this machine's index.
+- It lists the operations Rodu reads as touching a card, the same ones activity is built from.
+  Operations Rodu ignores are not listed: a deleted key, an unknown key, a value a card's field
+  would refuse, a deleted node, or a rewrite of a node's card id (which moves the node's history
+  to the id it now holds, see `card_of`).
+- Members come from the document; names come from this machine's index. Whether the team is
+  signed, and each machine's standing, come from the note the last pull or push wrote, as
+  activity's do (see "Who"). Anyone with access to the machine could edit that note, so the
+  output says where the standing comes from; `rodu audit` pulls first, which writes it again from
+  the folder when the folder can be reached. Before the first pull or push, the audit says the
+  team's standing is not known yet. `received` is this machine's own note.
+- The untimed flag is worked out per machine in counter order, whatever order Lamport times put
+  the changes in. It cannot see an untimed change that Loro joined, on import, to the timed change
+  before it: the joined change has the earlier change's time.
+- It reads the whole history on every run. Step 4 measures that at 20,000 cards.
+- `rodu audit` syncs first, as every command does, so it may number cards or record this machine
+  as a member before it reads. A plain workspace has no team document, so the audit refuses to
+  run there.

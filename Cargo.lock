@@ -2644,6 +2644,7 @@ dependencies = [
  "rmcp",
  "rodu-core",
  "rodu-store",
+ "rodu-sync",
  "rusqlite",
  "serde",
  "serde_json",

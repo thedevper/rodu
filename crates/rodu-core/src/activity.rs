@@ -157,6 +157,63 @@ pub enum Standing {
     AfterRemoval,
 }
 
+/// A card's changes as the team document holds them, with everything known about each, for
+/// `rodu audit` (ADR 0006 "Audit"). Read from the document each time, never from the index.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Audit {
+    pub card_id: String,
+    /// None until this machine's first pull or push says how the team stands with each machine.
+    pub signed: Option<bool>,
+    /// Oldest first, by Lamport timestamp.
+    pub changes: Vec<AuditChange>,
+}
+
+/// One change of the document that touched the card, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditChange {
+    /// The writing machine's peer, as 16 hex digits.
+    pub peer: String,
+    /// Its operations' counters, from `start` up to (not including) `end`.
+    pub start: i64,
+    pub end: i64,
+    pub lamport: i64,
+    /// Unix seconds, as the change says (0 for none), and the greatest among those it built on.
+    pub at: i64,
+    pub deps_at: i64,
+    /// When this machine first held the change, in Unix seconds, if it noted it.
+    pub received: Option<i64>,
+    pub message: Option<String>,
+    /// The person the members map says the machine belongs to, and their name (the service's).
+    pub member: Option<(String, String)>,
+    pub standing: AuditStanding,
+    /// No time (0, or a negative one), from a machine that wrote timed changes before it: Rodu
+    /// never writes one.
+    pub untimed_after_timed: bool,
+    pub ops: Vec<AuditOp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditStanding {
+    /// The team does not admit machines, or how it stands is not known yet.
+    Unchecked,
+    Admitted,
+    NotAdmitted,
+    /// Removed: the team takes in its operations below `cut`.
+    Removed {
+        cut: u64,
+    },
+}
+
+/// One operation of an [`AuditChange`] on the card: values as the document holds them, ids
+/// included; a hidden field's value is not kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditOp {
+    pub counter: i64,
+    pub action: String,
+    pub field: Option<String>,
+    pub value: Option<String>,
+}
+
 /// What a field's value refers to, so an id can be shown as the name people know.
 #[derive(Clone, Copy)]
 pub enum Refers {
