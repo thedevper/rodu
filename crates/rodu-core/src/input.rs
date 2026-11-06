@@ -104,6 +104,8 @@ struct RawNewItem {
     body: Option<String>,
     priority: Option<Priority>,
     assignee: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    reporter: Option<Option<String>>,
     parent: Option<String>,
     estimate: Option<f64>,
     due_at: Option<String>,
@@ -119,6 +121,8 @@ pub struct NewItem {
     pub priority: Priority,
     /// Principal name, id or "me".
     pub assignee: Option<String>,
+    /// Principal name, id or "me"; None means whoever creates the card, Some(None) no one.
+    pub reporter: Option<Option<String>>,
     /// Parent item key (DEMO-3) or id.
     pub parent: Option<String>,
     pub estimate: Option<f64>,
@@ -145,6 +149,8 @@ struct RawPatch {
     #[serde(default, deserialize_with = "double_option")]
     assignee: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
+    reporter: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
     parent: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     estimate: Option<Option<f64>>,
@@ -162,6 +168,7 @@ pub struct ItemPatch {
     pub body: Option<String>,
     pub priority: Option<Priority>,
     pub assignee: Option<Option<String>>,
+    pub reporter: Option<Option<String>>,
     pub parent: Option<Option<String>>,
     pub estimate: Option<Option<f64>>,
     pub due_at: Option<Option<String>>,
@@ -198,6 +205,10 @@ pub fn parse_new_item(input: &serde_json::Value, what: &str) -> Result<NewItem> 
         body: body(what, raw.body.unwrap_or_default())?,
         priority: raw.priority.unwrap_or(Priority::None),
         assignee: raw.assignee.map(|v| field(what, "assignee", check_ref(&v))).transpose()?,
+        reporter: match raw.reporter {
+            Some(Some(v)) => Some(Some(field(what, "reporter", check_ref(&v))?)),
+            other => other,
+        },
         parent: raw.parent.map(|v| field(what, "parent", check_ref(&v))).transpose()?,
         estimate: raw.estimate.map(|v| field(what, "estimate", check_estimate(v))).transpose()?,
         due_at: raw.due_at.map(|v| field(what, "dueAt", check_date(&v))).transpose()?,
@@ -225,6 +236,7 @@ pub fn parse_patch(input: &serde_json::Value) -> Result<ItemPatch> {
         body: raw.body.map(|b| body("patch", b)).transpose()?,
         priority: raw.priority,
         assignee: nullable(raw.assignee, |v| check_ref(&v), "assignee")?,
+        reporter: nullable(raw.reporter, |v| check_ref(&v), "reporter")?,
         parent: nullable(raw.parent, |v| check_ref(&v), "parent")?,
         estimate: nullable(raw.estimate, check_estimate, "estimate")?,
         due_at: nullable(raw.due_at, |v| check_date(&v), "dueAt")?,

@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::compile::{CompileContext, compile_query};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE principals (
@@ -99,6 +99,8 @@ CREATE TABLE items (
   category TEXT NOT NULL,
   priority TEXT NOT NULL,
   assignee_id TEXT REFERENCES principals(id),
+  reporter_id TEXT REFERENCES principals(id),
+  reporter_via_agent_id TEXT REFERENCES principals(id),
   parent_id TEXT REFERENCES items(id),
   cycle_id TEXT REFERENCES cycles(id),
   estimate REAL,
@@ -114,6 +116,7 @@ CREATE TABLE items (
 const ITEMS_INDEXES: &str = "
 CREATE INDEX items_rank ON items (collection_id, rank);
 CREATE INDEX items_assignee ON items (assignee_id);
+CREATE INDEX items_reporter ON items (reporter_id);
 CREATE INDEX items_cycle ON items (cycle_id);
 CREATE INDEX items_parent ON items (parent_id);
 ";
@@ -122,6 +125,23 @@ CREATE INDEX items_parent ON items (parent_id);
 /// in place, so the table is rebuilt (https://sqlite.org/lang_altertable.html#otheralter).
 const ITEMS_COLUMNS_V1: &str = "id, collection_id, number, key, type, title, body, status, category, \
 priority, assignee_id, parent_id, cycle_id, estimate, rank, due_at, created_at, updated_at, version";
+
+/// Gives each card without a reporter the person and agent of the first `item.create` event this
+/// machine recorded for it, when that person is still known.
+const BACKFILL_REPORTERS: &str = "
+WITH first AS (
+  SELECT e.target_id, e.actor_id, e.via_agent_id FROM events e
+  WHERE e.action = 'item.create' AND e.seq = (
+    SELECT min(f.seq) FROM events f WHERE f.target_id = e.target_id AND f.action = 'item.create')
+)
+UPDATE items SET
+  reporter_id = first.actor_id,
+  reporter_via_agent_id = (SELECT id FROM principals WHERE id = first.via_agent_id),
+  version = version + 1
+FROM first
+WHERE items.id = first.target_id AND items.reporter_id IS NULL
+  AND first.actor_id IN (SELECT id FROM principals);
+";
 
 /// Storage failures are internal: the message is for logs and the local CLI, never for remote
 /// callers (HTTP and MCP replace it with a generic one).
@@ -186,6 +206,8 @@ pub(crate) fn to_item(r: &Row<'_>) -> rusqlite::Result<Item> {
         category: parse(r.get("category")?)?,
         priority: parse(r.get("priority")?)?,
         assignee_id: r.get("assignee_id")?,
+        reporter_id: r.get("reporter_id")?,
+        reporter_via_agent_id: r.get("reporter_via_agent_id")?,
         parent_id: r.get("parent_id")?,
         cycle_id: r.get("cycle_id")?,
         estimate: r.get("estimate")?,
@@ -281,7 +303,40 @@ impl SqliteStore {
         if version == 1 {
             self.migrate_to_2()?;
         }
+        if (1..=2).contains(&version) {
+            self.migrate_to_3()?;
+        }
         Ok(())
+    }
+
+    /// Schema 2 -> 3: cards get a reporter (ADR 0007). A card this machine recorded creating gets
+    /// the person, and the agent, of that event; the rest stay without one. A team's cards take
+    /// theirs from the team document when the index is rebuilt.
+    fn migrate_to_3(&self) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            // Schema 1 files were rebuilt with the current table, which has the columns already.
+            let has: i64 = self
+                .one(
+                    "SELECT count(*) FROM pragma_table_info('items') WHERE name = 'reporter_id'",
+                    [],
+                    |r| r.get(0),
+                )?
+                .unwrap_or(0);
+            if has == 0 {
+                self.conn
+                    .execute_batch(
+                        "ALTER TABLE items ADD COLUMN reporter_id TEXT REFERENCES principals(id);
+                         ALTER TABLE items ADD COLUMN reporter_via_agent_id TEXT
+                           REFERENCES principals(id);",
+                    )
+                    .map_err(db)?;
+            }
+            self.conn
+                .execute_batch("CREATE INDEX IF NOT EXISTS items_reporter ON items (reporter_id);")
+                .map_err(db)?;
+            self.conn.execute_batch(BACKFILL_REPORTERS).map_err(db)?;
+            self.conn.pragma_update(None, "user_version", 3).map_err(db)
+        })
     }
 
     fn migrate_to_2(&self) -> Result<()> {
@@ -490,9 +545,9 @@ impl Store for SqliteStore {
     fn insert_item(&self, i: &Item) -> Result<()> {
         self.run(
             "INSERT INTO items (id, collection_id, number, key, provisional_key, type, title, body,
-              status, category, priority, assignee_id, parent_id, cycle_id, estimate, rank, due_at,
-              created_at, updated_at, version)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              status, category, priority, assignee_id, reporter_id, reporter_via_agent_id,
+              parent_id, cycle_id, estimate, rank, due_at, created_at, updated_at, version)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 i.id,
                 i.collection_id,
@@ -506,6 +561,8 @@ impl Store for SqliteStore {
                 i.category.as_str(),
                 i.priority.as_str(),
                 i.assignee_id,
+                i.reporter_id,
+                i.reporter_via_agent_id,
                 i.parent_id,
                 i.cycle_id,
                 i.estimate,
@@ -542,8 +599,9 @@ impl Store for SqliteStore {
     fn save_item(&self, i: &Item, expected_version: i64) -> Result<bool> {
         let changed = self.run(
             "UPDATE items SET number = ?, key = ?, type = ?, title = ?, body = ?, status = ?,
-              category = ?, priority = ?, assignee_id = ?, parent_id = ?, cycle_id = ?, estimate = ?,
-              rank = ?, due_at = ?, updated_at = ?, version = ? WHERE id = ? AND version = ?",
+              category = ?, priority = ?, assignee_id = ?, reporter_id = ?,
+              reporter_via_agent_id = ?, parent_id = ?, cycle_id = ?, estimate = ?, rank = ?,
+              due_at = ?, updated_at = ?, version = ? WHERE id = ? AND version = ?",
             params![
                 i.number,
                 i.key,
@@ -554,6 +612,8 @@ impl Store for SqliteStore {
                 i.category.as_str(),
                 i.priority.as_str(),
                 i.assignee_id,
+                i.reporter_id,
+                i.reporter_via_agent_id,
                 i.parent_id,
                 i.cycle_id,
                 i.estimate,

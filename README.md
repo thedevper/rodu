@@ -66,6 +66,7 @@ In any folder you want to track work in:
 rodu init --name your-name --key DEMO --title "Demo project"
 rodu add Fix login crash --type bug --priority urgent --assignee me
 rodu ls "assignee = me() ORDER BY priority"
+rodu edit DEMO-1 DEMO-2 --assignee ann --reporter me   # none clears either
 rodu show DEMO-1
 rodu show DEMO-1 --activity   # also who changed what and when
 rodu mv DEMO-1 "In Progress"
@@ -74,6 +75,9 @@ rodu web        # opens the board in your browser
 
 `init` creates `.rodu/` (database and `config.json`) in the current directory. Commands use the
 nearest `.rodu/` above the working directory, or `$RODU_DIR`.
+
+A card has an assignee, who does it, and a reporter, who raised it: whoever creates it unless
+`rodu add --reporter <name>` says otherwise. `rodu edit` changes either on existing cards.
 
 A workspace can hold several collections, each with its own card numbers (DEMO-1, OPS-1):
 `rodu collection add OPS --title "Operations"`, the **+** beside the collection list on the board,
@@ -180,9 +184,10 @@ Only run `rodu mcp` against a workspace you trust: it serves whatever `.rodu/` i
 assignee = me() AND category != done AND updated > -7d ORDER BY priority
 text ~ "login" AND type IN (bug, story)
 cycle = currentCycle() AND assignee IS EMPTY
+reporter = me() AND category != done
 ```
 
-Fields: key, title, body, text, type, status, category, priority, estimate, assignee,
+Fields: key, title, body, text, type, status, category, priority, estimate, assignee, reporter,
 collection, cycle, parent, created, updated, due.
 
 ## Build from source

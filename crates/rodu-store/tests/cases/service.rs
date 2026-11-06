@@ -278,6 +278,41 @@ fn refuses_neighbours_from_another_collection_or_out_of_order() {
     );
 }
 
+// --- reporter ---
+
+#[test]
+fn the_reporter_is_whoever_creates_a_card_and_the_agent_it_went_through() {
+    let f = fixture();
+    let bob = f.service.create_principal("bob", PrincipalKind::Human, None).unwrap();
+    let made = f.service.create_items(&f.agent, "DEMO", &items(&["By agent"]), None).unwrap();
+    assert_eq!(made[0].reporter_id, Some(f.alice.principal_id.clone()));
+    assert_eq!(made[0].reporter_via_agent_id, f.agent.via_agent_id);
+    assert_eq!(f.service.reporter_label(&made[0]).unwrap().as_deref(), Some("alice via alice-claude"));
+
+    let named = json!({ "title": "For bob", "reporter": "bob" });
+    let made = f.service.create_items(&f.agent, "DEMO", &[named], None).unwrap();
+    assert_eq!((made[0].reporter_id.as_deref(), made[0].reporter_via_agent_id.as_deref()), (Some(bob.id.as_str()), None));
+
+    let back = f.service.update_item(&f.agent, "DEMO-2", &json!({ "reporter": "me" }), None).unwrap();
+    assert_eq!(back.reporter_via_agent_id, f.agent.via_agent_id);
+    let cleared = f.service.update_item(&f.alice, "DEMO-2", &json!({ "reporter": null }), None).unwrap();
+    assert_eq!((cleared.reporter_id, cleared.reporter_via_agent_id), (None, None));
+    assert_eq!(err(f.service.update_item(&f.alice, "DEMO-1", &json!({ "reporter": "nobody" }), None)).code, ErrorCode::NotFound);
+    assert!(f.service.context("DEMO-1", None).unwrap().contains("- reporter: alice via alice-claude"));
+
+    // Another person's agent stands for that person, who never used it here; one's own keeps it.
+    let bobs = f.service.create_principal("bob-agent", PrincipalKind::Agent, Some(&bob.id)).unwrap();
+    let theirs = f.service.update_item(&f.alice, "DEMO-2", &json!({ "reporter": "bob-agent" }), None).unwrap();
+    assert_eq!((theirs.reporter_id.as_deref(), theirs.reporter_via_agent_id), (Some(bob.id.as_str()), None));
+    let bob_actor = Actor { principal_id: bob.id.clone(), via_agent_id: None };
+    let own = json!({ "title": "Own agent", "reporter": "bob-agent" });
+    let made = f.service.create_items(&bob_actor, "DEMO", &[own], None).unwrap();
+    assert_eq!(made[0].reporter_via_agent_id, Some(bobs.id));
+    let nobody = json!({ "title": "Nobody's", "reporter": null });
+    let made = f.service.create_items(&f.alice, "DEMO", &[nobody], None).unwrap();
+    assert_eq!(made[0].reporter_id, None);
+}
+
 // --- workflow ---
 
 #[test]

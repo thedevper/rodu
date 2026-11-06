@@ -362,6 +362,13 @@ pre {
   color: var(--cat-review);
 }
 
+.card-bottom .reporter {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .avatar {
   margin-left: auto;
   width: 22px;

@@ -718,6 +718,8 @@ impl<S: Store> Ctx<'_, S> {
             category: item.category.as_str().to_owned(),
             priority: item.priority.as_str().to_owned(),
             assignee: self.name(item.assignee_id.as_deref())?,
+            reporter: self.name(item.reporter_id.as_deref())?,
+            reporter_via: self.name(item.reporter_via_agent_id.as_deref())?,
             estimate: item.estimate,
             due: item.due_at.clone(),
             rank: item.rank.clone(),

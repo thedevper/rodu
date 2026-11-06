@@ -153,6 +153,10 @@ pub struct Item {
     pub category: Category,
     pub priority: Priority,
     pub assignee_id: Option<String>,
+    /// Who reported the card: the person who created it unless someone changed it, and the agent
+    /// it went through, if any (ADR 0007). None for a card nobody knows the reporter of.
+    pub reporter_id: Option<String>,
+    pub reporter_via_agent_id: Option<String>,
     pub parent_id: Option<String>,
     pub cycle_id: Option<String>,
     pub estimate: Option<f64>,

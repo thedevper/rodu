@@ -91,6 +91,8 @@ struct Changes {
     priority: Option<crate::model::Priority>,
     status: Option<(String, Category)>,
     assignee_id: Option<Option<String>>,
+    /// The reporter and the agent it went through.
+    reporter: Option<(Option<String>, Option<String>)>,
     parent_id: Option<Option<String>>,
     cycle_id: Option<Option<String>>,
     estimate: Option<Option<f64>>,
@@ -210,12 +212,48 @@ impl<S: Store> RoduService<S> {
         }
     }
 
+    /// Who reported a card, as people read it: `ann`, or `ann via ann-agent`.
+    pub fn reporter_label(&self, item: &Item) -> Result<Option<String>> {
+        let Some(reporter) = self.principal_name(item.reporter_id.as_deref())? else {
+            return Ok(None);
+        };
+        Ok(Some(match self.principal_name(item.reporter_via_agent_id.as_deref())? {
+            Some(agent) => format!("{reporter} via {agent}"),
+            None => reporter,
+        }))
+    }
+
     fn resolve_assignee(&self, reference: &str, actor: &Actor) -> Result<String> {
         if reference.eq_ignore_ascii_case("me") {
             Ok(actor.principal_id.clone())
         } else {
             Ok(self.principal(reference)?.id)
         }
+    }
+
+    /// A card's reporter and the agent it went through: the actor when `reference` is None. An
+    /// agent named as the reporter stands for its person. An agent, the actor's or the one named,
+    /// is kept only when the reporter is the actor's own person (ADR 0007): no one else is said
+    /// to have used an agent they did not.
+    fn resolve_reporter(
+        &self,
+        reference: Option<&str>,
+        actor: &Actor,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let id = match reference {
+            None => actor.principal_id.clone(),
+            Some(r) if r.eq_ignore_ascii_case("me") => actor.principal_id.clone(),
+            Some(r) => {
+                let principal = self.principal(r)?;
+                if let (PrincipalKind::Agent, Some(owner)) = (principal.kind, principal.owner_id) {
+                    let via = (owner == actor.principal_id).then_some(principal.id);
+                    return Ok((Some(owner), via));
+                }
+                principal.id
+            }
+        };
+        let via = actor.via_agent_id.clone().filter(|_| id == actor.principal_id);
+        Ok((Some(id), via))
     }
 
     // --- collections and cycles ------------------------------------------------------------
@@ -564,6 +602,12 @@ impl<S: Store> RoduService<S> {
                 };
                 let next_rank = rank_between(rank.as_deref(), None)?;
                 rank = Some(next_rank.clone());
+                let (reporter_id, reporter_via_agent_id) = match &input.reporter {
+                    Some(None) => (None, None),
+                    named => {
+                        self.resolve_reporter(named.as_ref().and_then(Option::as_deref), actor)?
+                    }
+                };
                 let item = Item {
                     id,
                     collection_id: collection.id.clone(),
@@ -581,6 +625,8 @@ impl<S: Store> RoduService<S> {
                         .as_deref()
                         .map(|a| self.resolve_assignee(a, actor))
                         .transpose()?,
+                    reporter_id,
+                    reporter_via_agent_id,
                     parent_id: input
                         .parent
                         .as_deref()
@@ -702,6 +748,15 @@ impl<S: Store> RoduService<S> {
                 .assignee
                 .map(|a| a.map(|r| self.resolve_assignee(&r, actor)).transpose())
                 .transpose()?,
+            reporter: patch
+                .reporter
+                .map(|r| match r {
+                    Some(r) => self.resolve_reporter(Some(&r), actor),
+                    None => Ok((None, None)),
+                })
+                .transpose()?
+                // Naming the reporter it already has changes nothing, not even the agent.
+                .filter(|(id, _)| *id != item.reporter_id),
             parent_id: patch
                 .parent
                 .map(|p| p.map(|r| self.checked_parent(&item, &r).map(|i| i.id)).transpose())
@@ -935,6 +990,7 @@ impl<S: Store> RoduService<S> {
             .collect::<Result<_>>()?;
         let parts = ContextParts {
             assignee: name(item.assignee_id.as_deref())?,
+            reporter: self.reporter_label(&item)?,
             parent: match &item.parent_id {
                 Some(id) => self.store.get_item(id)?,
                 None => None,
@@ -1206,6 +1262,10 @@ impl<S: Store> RoduService<S> {
         }
         if let Some(v) = changes.assignee_id {
             next.assignee_id = v;
+        }
+        if let Some((id, via)) = changes.reporter {
+            next.reporter_id = id;
+            next.reporter_via_agent_id = via;
         }
         if let Some(v) = changes.parent_id {
             next.parent_id = v;

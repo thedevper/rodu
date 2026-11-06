@@ -31,7 +31,8 @@ const DEFAULT_WEB_PORT: u16 = 4870;
 pub const USAGE: &str = "Usage: rodu <command> [options]
 
   init --name <you> --key <KEY> [--title <collection name>]   create a workspace here
-  add <title> [--type bug] [--priority high] [--assignee me] [--collection KEY]
+  add <title> [--type bug] [--priority high] [--assignee me] [--reporter <name>] [--collection KEY]
+  edit <key>... [--assignee <name|me|none>] [--reporter <name|me|none>]   change who does or reported items (reporter defaults to you on add)
   ls [query] [--limit 50]    list items (JQL-lite, e.g. \"assignee = me() ORDER BY priority\")
   show <key> [--activity [--local]] [--limit 50]   item with its context; --activity adds its history (in a team, across the team; --local: as this machine recorded it)
   audit <key>                team workspace: every change to an item, with the machine that wrote it (read-only)
@@ -99,6 +100,7 @@ const STRING_OPTIONS: &[&str] = &[
     "type",
     "priority",
     "assignee",
+    "reporter",
     "collection",
     "limit",
     "port",
@@ -421,7 +423,7 @@ async fn command_result(
             team::after_reopen(io, true);
             served.map(|()| 0)
         }
-        "add" | "ls" | "show" | "audit" | "mv" | "collection" | "collections" => {
+        "add" | "edit" | "ls" | "show" | "audit" | "mv" | "collection" | "collections" => {
             let ws = open(io, false)?;
             team::before(io, &ws);
             let result = item_command(command, rest, args, &ws, io);
@@ -447,9 +449,9 @@ fn item_command(
         "add" => {
             let mut item = Map::new();
             item.insert("title".into(), Value::String(rest.join(" ")));
-            for field in ["type", "priority", "assignee"] {
+            for field in ["type", "priority", "assignee", "reporter"] {
                 if let Some(value) = args.value(field) {
-                    item.insert(field.into(), Value::String(value.to_owned()));
+                    item.insert(field.into(), person_or_none(field, value));
                 }
             }
             let collection = args.value("collection").unwrap_or(&ws.config.collection);
@@ -471,11 +473,48 @@ fn item_command(
             };
             let result = ws.service.search(&ws.actor, &rest.join(" "), Some(limit), None)?;
             for item in &result.items {
-                (io.out)(&item_line(item));
+                (io.out)(&people_line(ws, item)?);
             }
             let shown = result.items.len() as u64;
             if result.total > shown {
                 (io.out)(&format!("… {} more (use --limit)", result.total - shown));
+            }
+            Ok(0)
+        }
+        "edit" => {
+            if rest.is_empty() {
+                return Err(RoduError::invalid("edit needs one or more item keys")
+                    .with_hint("e.g. rodu edit DEMO-3 --assignee ann --reporter me"));
+            }
+            let mut patch = Map::new();
+            for field in ["assignee", "reporter"] {
+                if let Some(value) = args.value(field) {
+                    patch.insert(field.into(), person_or_none(field, value));
+                }
+            }
+            if patch.is_empty() {
+                return Err(RoduError::invalid("edit needs --assignee or --reporter")
+                    .with_hint("--assignee none clears the assignee"));
+            }
+            let patch = Value::Object(patch);
+            // Every key is looked up first, so a typo changes nothing. A card that then fails to
+            // change stops the rest, and the error says which cards did change.
+            for key in rest {
+                ws.service.item(key)?;
+            }
+            for (done, key) in rest.iter().enumerate() {
+                let item =
+                    ws.service.update_item(&ws.actor, key, &patch, None).map_err(
+                        |e| match done {
+                            0 => e,
+                            _ => e.with_hint(format!(
+                                "Changed already: {}; not changed: {}",
+                                rest[..done].join(", "),
+                                rest[done..].join(", ")
+                            )),
+                        },
+                    )?;
+                (io.out)(&people_line(ws, &item)?);
             }
             Ok(0)
         }
@@ -545,6 +584,31 @@ fn item_command(
             Ok(0)
         }
     }
+}
+
+/// A person option's value: `none` means no one.
+fn person_or_none(field: &str, value: &str) -> Value {
+    match value {
+        v if matches!(field, "assignee" | "reporter") && v.eq_ignore_ascii_case("none") => {
+            Value::Null
+        }
+        v => Value::String(v.to_owned()),
+    }
+}
+
+/// An item's line with who does it and who reported it, as `ls` and `edit` print it.
+fn people_line(ws: &Workspace, item: &rodu_core::Item) -> Result<String> {
+    let mut line = item_line(item);
+    let assignee = ws.service.principal_name(item.assignee_id.as_deref())?;
+    let reporter = ws.service.reporter_label(item)?;
+    let people: Vec<String> = [("assignee", assignee), ("reporter", reporter)]
+        .into_iter()
+        .filter_map(|(what, who)| who.map(|who| format!("{what} {who}")))
+        .collect();
+    if !people.is_empty() {
+        line.push_str(&format!(" · {}", people.join(", ")));
+    }
+    Ok(line)
 }
 
 /// The board files: `$RODU_WEB_DIST` on disk when set, else the copy built into this binary.
