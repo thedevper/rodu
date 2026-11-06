@@ -119,6 +119,8 @@ pub fn item_fields(i: &Item) -> Fields {
         ("category", text(i.category.as_str())),
         ("priority", text(i.priority.as_str())),
         ("assignee_id", opt_text(i.assignee_id.as_deref())),
+        ("reporter_id", opt_text(i.reporter_id.as_deref())),
+        ("reporter_via_agent_id", opt_text(i.reporter_via_agent_id.as_deref())),
         ("cycle_id", opt_text(i.cycle_id.as_deref())),
         ("estimate", i.estimate.map_or(LoroValue::Null, LoroValue::from)),
         ("rank", text(&i.rank)),
@@ -314,11 +316,22 @@ pub fn cycle(id: &str, map: &LoroMap) -> Result<Cycle, String> {
     })
 }
 
+/// Where the fill-in keeps the reporter it found for a card from before Rodu kept them: keys of
+/// their own, so it never overwrites a reporter someone set, whatever order the two arrive in, and
+/// activity, which does not know them, shows nothing of it (ADR 0007).
+pub const FOUND_REPORTER: &str = "reporter_found_id";
+pub const FOUND_REPORTER_VIA: &str = "reporter_found_via_agent_id";
+
 /// A card read from its node's map; `parent_id` comes from the tree, `version` is set by the caller.
 pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
     let id = Reader::new(map, "card").id("id")?;
     let r = Reader::new(map, format!("card {id}"));
     let key = r.line("key", 64)?;
+    // A reporter someone set, or cleared, wins over the one filled in from history (ADR 0007).
+    let reporter = match map.get("reporter_id") {
+        Some(_) => ("reporter_id", "reporter_via_agent_id"),
+        None => (FOUND_REPORTER, FOUND_REPORTER_VIA),
+    };
     Ok(Item {
         collection_id: r.id("collection_id")?,
         number: r.opt_number("number")?,
@@ -330,6 +343,8 @@ pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
         category: r.parsed("category")?,
         priority: r.parsed("priority")?,
         assignee_id: r.opt_id("assignee_id")?,
+        reporter_id: r.opt_id(reporter.0)?,
+        reporter_via_agent_id: r.opt_id(reporter.1)?,
         parent_id,
         cycle_id: r.opt_id("cycle_id")?,
         estimate: r.opt_estimate("estimate")?,
@@ -368,7 +383,7 @@ pub fn item_field(field: &str, value: &LoroValue) -> FieldValue {
         "type" => r.parsed::<ItemType>(field).map(|t| Some(t.as_str().to_string())),
         "priority" => r.parsed::<Priority>(field).map(|p| Some(p.as_str().to_string())),
         "number" => r.opt_number(field).map(|n| n.map(|n| n.to_string())),
-        "assignee_id" | "cycle_id" => r.opt_id(field),
+        "assignee_id" | "reporter_id" | "cycle_id" => r.opt_id(field),
         "estimate" => r.opt_estimate(field).map(|n| n.map(|n| n.to_string())),
         "due_at" => r.opt_date(field),
         "body" => {

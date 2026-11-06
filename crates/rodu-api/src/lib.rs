@@ -17,6 +17,9 @@ pub struct ItemView {
     pub category: String,
     pub priority: String,
     pub assignee: Option<String>,
+    /// Who reported the card, and the agent it went through (ADR 0007).
+    pub reporter: Option<String>,
+    pub reporter_via: Option<String>,
     pub estimate: Option<f64>,
     pub due: Option<String>,
     pub rank: String,

@@ -485,6 +485,14 @@ pub(crate) fn render_card(item: &Item, card: &Card<'_>) -> String {
     field("Type", Some(item.item_type.as_str().to_owned()));
     field("Priority", Some(item.priority.as_str().to_owned()));
     field("Assignee", name(&item.assignee_id));
+    let via = name(&item.reporter_via_agent_id);
+    field(
+        "Reporter",
+        name(&item.reporter_id).map(|r| match via {
+            Some(agent) => format!("{r} via {agent}"),
+            None => r,
+        }),
+    );
     field("Cycle", card.cycle.map(str::to_owned));
     field("Parent", item.parent_id.as_deref().map(key));
     field("Estimate", item.estimate.map(|e| e.to_string()));
@@ -580,6 +588,8 @@ mod tests {
             category: Category::Active,
             priority: Priority::High,
             assignee_id: Some("p1".into()),
+            reporter_id: Some("p2".into()),
+            reporter_via_agent_id: Some("a2".into()),
             parent_id: Some("i0".into()),
             cycle_id: Some("y1".into()),
             estimate: Some(2.5),
@@ -589,7 +599,12 @@ mod tests {
             updated_at: "2026-10-02T00:00:00.000Z".into(),
             version: 2,
         };
-        let names: HashMap<String, String> = [("p1".to_owned(), "ann".to_owned())].into();
+        let names: HashMap<String, String> = [
+            ("p1".to_owned(), "ann".to_owned()),
+            ("p2".to_owned(), "bob".to_owned()),
+            ("a2".to_owned(), "bob-agent".to_owned()),
+        ]
+        .into();
         let keys: HashMap<&str, &str> = [("i0", "DEMO-1"), ("i2", "DEMO-2")].into();
         let card = Card {
             names: &names,
@@ -615,6 +630,7 @@ mod tests {
             render_card(&item, &card),
             "# DEMO-3: Login 'fails' on Safari\n\n\
              - Status: In Progress\n- Type: bug\n- Priority: high\n- Assignee: ann\n\
+             - Reporter: bob via bob-agent\n\
              - Cycle: Sprint 1\n- Parent: DEMO-1\n- Estimate: 2.5\n- Due: 2026-11-01\n\
              - Created: 2026-10-01T00:00:00.000Z\n- Updated: 2026-10-02T00:00:00.000Z\n\
              \n## Description\n\nSteps:\n1. open\n\

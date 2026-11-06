@@ -1799,3 +1799,193 @@ fn the_audit_flags_an_untimed_change_after_timed_ones_from_its_machine() {
     assert!(!of("\"Timed\"").contains("FLAG"), "{text}");
     assert_eq!(text.matches("FLAG").count(), 1, "{text}");
 }
+
+#[test]
+fn a_reporter_syncs_and_a_change_to_it_is_activity() {
+    let a = Peer::first();
+    a.create(&["Fence"]);
+    let b = Peer::join(&a, "bob");
+    let card = b.svc.item("DEMO-1").unwrap();
+    assert_eq!(card.reporter_id.as_deref(), Some(a.me.principal_id.as_str()));
+    b.patch("DEMO-1", json!({ "reporter": "me" }));
+    exchange(&a, &b);
+    let card = a.svc.item("DEMO-1").unwrap();
+    assert_eq!(card.reporter_id.as_deref(), Some(b.me.principal_id.as_str()));
+    let shown = format_activity(&a.svc.activity("DEMO-1", None).unwrap());
+    assert!(shown.contains("reporter: ann → bob"), "{shown}");
+    assert_eq!(a.dump(), b.dump());
+    assert_rebuild_matches(&a);
+}
+
+impl Peer {
+    /// The same machine opened again and caught up, as a new Rodu's first command would after an
+    /// upgrade: `forget` drops its note that it filled in reporters.
+    fn reopen(self, forget: bool) -> Self {
+        let Peer { svc, me, dir } = self;
+        drop(svc);
+        if forget {
+            rusqlite::Connection::open(dir.path().join("rodu.db"))
+                .unwrap()
+                .execute("DELETE FROM index_meta WHERE key = 'local/reporters-backfilled'", [])
+                .unwrap();
+        }
+        let store = LoroStore::open(dir.path()).unwrap();
+        store.backfill_reporters().unwrap();
+        Self { svc: RoduService::new(store), me, dir }
+    }
+}
+
+#[test]
+fn cards_from_before_reporters_get_the_one_their_history_names_once() {
+    let a = Peer::first();
+    a.create(&["Ann's card"]);
+    let b = Peer::join(&a, "bob");
+    b.create(&["Bob's card"]);
+    a.store().set_member(b.store().peer(), &b.me.principal_id).unwrap();
+    exchange(&a, &b);
+
+    // The document as Rodu wrote it before cards had a reporter.
+    let (raw, start) = raw_copy(&a);
+    let tree = raw.get_tree("items");
+    for node in tree.get_nodes(false) {
+        let meta = tree.get_meta(node.id).unwrap();
+        meta.delete("reporter_id").unwrap();
+        meta.delete("reporter_via_agent_id").unwrap();
+    }
+    send_raw(&raw, &start, &a);
+    send_raw(&raw, &start, &b);
+    assert_eq!(a.svc.item("DEMO-1").unwrap().reporter_id, None);
+
+    // Ann's machine knows her card from its events, and Bob's from the team history.
+    let a = a.reopen(true);
+    let reporter = |p: &Peer, key: &str| p.svc.item(key).unwrap().reporter_id;
+    assert_eq!(reporter(&a, "DEMO-1").as_deref(), Some(a.me.principal_id.as_str()));
+    let bobs = b.svc.search(&b.me, "title ~ Bob", None, None).unwrap().items[0].key.clone();
+    assert_eq!(reporter(&a, &bobs).as_deref(), Some(b.me.principal_id.as_str()));
+    let shown = format_activity(&a.svc.activity("DEMO-1", None).unwrap());
+    assert!(!shown.contains("reporter"), "filling it in is not activity: {shown}");
+
+    // Once per machine: opening again writes nothing.
+    let version = |p: &Peer| loro::VersionVector::decode(&p.store().version()).unwrap();
+    let before = version(&a);
+    let a = a.reopen(false);
+    assert_eq!(version(&a), before);
+
+    let b = b.reopen(true);
+    exchange(&a, &b);
+    assert_eq!(a.dump(), b.dump());
+    assert_rebuild_matches(&a);
+    assert_rebuild_matches(&b);
+}
+
+#[test]
+fn only_the_machine_that_made_the_board_fills_in_the_reporter_of_its_cards() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain =
+        RoduService::new(rodu_store::SqliteStore::open(&dir.path().join("rodu.db")).unwrap());
+    let ann = plain.create_principal("ann", PrincipalKind::Human, None).unwrap();
+    let me = Actor { principal_id: ann.id.clone(), via_agent_id: None };
+    plain.create_collection(&me, "demo", "Demo").unwrap();
+    plain.create_items(&me, "DEMO", &[json!({ "title": "Made alone" })], None).unwrap();
+    drop(plain);
+    let svc = RoduService::new(LoroStore::adopt(dir.path()).unwrap());
+    svc.store.set_member(svc.store.peer(), &ann.id).unwrap();
+    let a = Peer { svc, me, dir };
+    let b = Peer::join(&a, "bob");
+
+    // The board as an older Rodu made it: its card has no reporter.
+    let (raw, start) = raw_copy(&a);
+    let tree = raw.get_tree("items");
+    for node in tree.get_nodes(false) {
+        let meta = tree.get_meta(node.id).unwrap();
+        meta.delete("reporter_id").unwrap();
+        meta.delete("reporter_via_agent_id").unwrap();
+    }
+    send_raw(&raw, &start, &a);
+    send_raw(&raw, &start, &b);
+
+    // Another machine reads the card as added to the board, not created: it leaves it alone.
+    let b = b.reopen(true);
+    assert_eq!(b.svc.item("DEMO-1").unwrap().reporter_id, None);
+    let a = a.reopen(true);
+    assert_eq!(a.svc.item("DEMO-1").unwrap().reporter_id.as_deref(), Some(ann.id.as_str()));
+    exchange(&a, &b);
+    assert_eq!(b.svc.item("DEMO-1").unwrap().reporter_id.as_deref(), Some(ann.id.as_str()));
+}
+
+#[test]
+fn a_reporters_agent_shows_only_when_it_is_that_persons() {
+    let a = Peer::first();
+    let agent = a.svc.create_principal("ann-agent", PrincipalKind::Agent, Some(&a.me.principal_id));
+    let agent = agent.unwrap();
+    let via = Actor { principal_id: a.me.principal_id.clone(), via_agent_id: Some(agent.id) };
+    a.svc.create_items(&via, "DEMO", &[json!({ "title": "By agent" })], None).unwrap();
+    let b = Peer::join(&a, "bob");
+    let card = b.svc.item("DEMO-1").unwrap();
+    assert_eq!(b.svc.reporter_label(&card).unwrap().as_deref(), Some("ann via ann-agent"));
+
+    // A machine that names bob the reporter but keeps ann's agent: the agent is not shown.
+    let (raw, start) = raw_copy(&a);
+    let tree = raw.get_tree("items");
+    let node = tree.get_nodes(false)[0].id;
+    tree.get_meta(node).unwrap().insert("reporter_id", b.me.principal_id.as_str()).unwrap();
+    send_raw(&raw, &start, &b);
+    let card = b.svc.item("DEMO-1").unwrap();
+    assert_eq!((card.reporter_id, card.reporter_via_agent_id), (Some(b.me.principal_id), None));
+}
+
+#[test]
+fn a_change_calling_itself_a_backfill_is_shown_unless_it_only_fills_in_reporters() {
+    let a = Peer::first();
+    a.create(&["Fence"]);
+    a.store().set_member(99, &a.me.principal_id).unwrap();
+    let (raw, start) = raw_copy(&a);
+    let tree = raw.get_tree("items");
+    let node = tree.get_nodes(false)[0].id;
+    tree.get_meta(node).unwrap().insert("title", "Quietly renamed").unwrap();
+    raw.set_next_commit_message("1 backfill");
+    send_raw(&raw, &start, &a);
+    let shown = format_activity(&a.svc.activity("DEMO-1", None).unwrap());
+    assert!(shown.contains("title: Fence → Quietly renamed"), "{shown}");
+}
+
+#[test]
+fn a_reporter_someone_sets_wins_over_a_fill_in_whatever_arrives_first() {
+    let a = Peer::first();
+    a.create(&["Fence", "Gate"]);
+    let b = Peer::join(&a, "bob");
+    exchange(&a, &b);
+    let (raw, start) = raw_copy(&a);
+    let tree = raw.get_tree("items");
+    for node in tree.get_nodes(false) {
+        let meta = tree.get_meta(node.id).unwrap();
+        meta.delete("reporter_id").unwrap();
+        meta.delete("reporter_via_agent_id").unwrap();
+    }
+    send_raw(&raw, &start, &a);
+    send_raw(&raw, &start, &b);
+
+    // Bob names himself before his machine hears of the fill-in Ann's machine does meanwhile.
+    b.patch("DEMO-1", json!({ "reporter": "me" }));
+    let a = a.reopen(true);
+    let ann = a.me.principal_id.clone();
+    assert_eq!(a.svc.item("DEMO-1").unwrap().reporter_id.as_deref(), Some(ann.as_str()));
+    exchange(&a, &b);
+    for p in [&a, &b] {
+        let card = p.svc.item("DEMO-1").unwrap();
+        assert_eq!(card.reporter_id.as_deref(), Some(b.me.principal_id.as_str()));
+        let shown = format_activity(&p.svc.activity("DEMO-1", None).unwrap());
+        assert!(shown.contains("bob") && !shown.contains("→ ann"), "{shown}");
+    }
+    // The fill-in shows nowhere; a card filled in is still Ann's, and clearing it holds.
+    let shown = format_activity(&a.svc.activity("DEMO-2", None).unwrap());
+    assert!(!shown.contains("reporter"), "{shown}");
+    assert_eq!(a.svc.item("DEMO-2").unwrap().reporter_id.as_deref(), Some(ann.as_str()));
+    a.patch("DEMO-2", json!({ "reporter": null }));
+    let b = b.reopen(true);
+    exchange(&a, &b);
+    assert_eq!(b.svc.item("DEMO-2").unwrap().reporter_id, None);
+    assert_eq!(a.dump(), b.dump());
+    assert_rebuild_matches(&a);
+    assert_rebuild_matches(&b);
+}

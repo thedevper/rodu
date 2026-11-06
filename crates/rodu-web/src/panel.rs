@@ -23,6 +23,23 @@ const WIDE: f64 = 1080.0;
 /// The narrowest the panel can be dragged; it is never wider than the window.
 const MIN_WIDTH: f64 = 360.0;
 
+/// One option per person and agent, with `chosen` selected.
+fn principal_options(principals: Vec<PrincipalView>, chosen: &str) -> impl IntoView {
+    principals
+        .into_iter()
+        .map(|p| {
+            let selected = p.name == chosen;
+            let label =
+                if p.kind == "agent" { format!("{} (agent)", p.name) } else { p.name.clone() };
+            view! {
+                <option value=p.name prop:selected=selected>
+                    {label}
+                </option>
+            }
+        })
+        .collect_view()
+}
+
 /// `createdAt` in the browser's locale and time zone, like `Date#toLocaleString`.
 fn local_time(timestamp: &str) -> String {
     js_sys::Date::new(&timestamp.into())
@@ -385,6 +402,8 @@ pub fn ItemPanel(
             s.iter().find(|s| s.name.to_lowercase() == status).map(|s| s.name.clone())
         });
         let assignee = current.assignee.clone().unwrap_or_default();
+        let reporter = current.reporter.clone().unwrap_or_default();
+        let reporter_via = current.reporter_via.clone();
         let estimate = current.estimate;
         let body = current.body.clone();
 
@@ -527,24 +546,25 @@ pub fn ItemPanel(
                             <option value="" prop:selected=assignee.is_empty()>
                                 "Unassigned"
                             </option>
-                            {principals
-                                .get_untracked()
-                                .into_iter()
-                                .map(|p| {
-                                    let chosen = p.name == assignee;
-                                    let label = if p.kind == "agent" {
-                                        format!("{} (agent)", p.name)
-                                    } else {
-                                        p.name.clone()
-                                    };
-                                    view! {
-                                        <option value=p.name prop:selected=chosen>
-                                            {label}
-                                        </option>
-                                    }
-                                })
-                                .collect_view()}
+                            {principal_options(principals.get_untracked(), &assignee)}
                         </select>
+                    </dd>
+                    <dt>"Reporter"</dt>
+                    <dd>
+                        <select
+                            aria-label="Reporter"
+                            on:change=move |e| {
+                                let value = event_target_value(&e);
+                                let value = if value.is_empty() { Value::Null } else { Value::String(value) };
+                                update(json!({ "reporter": value }));
+                            }
+                        >
+                            <option value="" prop:selected=reporter.is_empty()>
+                                "Unknown"
+                            </option>
+                            {principal_options(principals.get_untracked(), &reporter)}
+                        </select>
+                        {reporter_via.map(|agent| view! { <span class="via">{format!("via {agent}")}</span> })}
                     </dd>
                     <dt>"Priority"</dt>
                     <dd>

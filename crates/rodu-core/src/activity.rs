@@ -233,6 +233,7 @@ const FIELDS: &[(&str, &str, Refers)] = &[
     ("status", "status", Refers::Text),
     ("priority", "priority", Refers::Text),
     ("assigneeId", "assignee", Refers::Principal),
+    ("reporterId", "reporter", Refers::Principal),
     ("parentId", "parent", Refers::Item),
     ("cycleId", "cycle", Refers::Cycle),
     ("estimate", "estimate", Refers::Text),
@@ -247,6 +248,7 @@ const FIELDS: &[(&str, &str, Refers)] = &[
 pub fn document_field(field: &str) -> Option<(&'static str, bool)> {
     let shown = match field {
         "assignee_id" => "assignee",
+        "reporter_id" => "reporter",
         "cycle_id" => "cycle",
         "due_at" => "due",
         "body" => "description",

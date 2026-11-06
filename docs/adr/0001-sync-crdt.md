@@ -362,8 +362,9 @@ Step 4a: sync through a folder the team already shares, and the commands to set 
     swaps in a symlink at that moment could redirect a write; folder apps do not sync symlinks as
     symlinks. Any member can turn the copy on, and the numbering machine then writes it without
     asking its user, even for an encrypted team; the warning is shown where it was turned on.
-  - A card file shows the fields a card has. Cards have no reporter or labels, and a reporter
-    cannot be derived on the numbering machine, since the event log is local to each machine.
+  - A card file shows the fields a card has. Cards have no labels. When this was written they had
+    no reporter either, and one could not be derived on the numbering machine, since the event log
+    is local to each machine; ADR 0007 gives cards a reporter, and the copy lists it.
     There is no archive, so every card is in the copy; a file is removed when its card's name
     leaves the copy, which no flow does today (tested by planting such a file).
   - Problems writing the copy are warnings; the pull never reads `readable/`. Changes made to the

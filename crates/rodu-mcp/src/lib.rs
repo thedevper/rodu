@@ -314,6 +314,8 @@ struct Summary {
     category: &'static str,
     priority: &'static str,
     assignee: Option<String>,
+    /// Who reported it: `ann`, or `ann via ann-agent` (ADR 0007).
+    reporter: Option<String>,
     estimate: Option<Num>,
     due: Option<String>,
     version: i64,
@@ -372,6 +374,7 @@ fn summarize<S: Store>(service: &RoduService<S>, item: &Item) -> Result<Summary,
         category: item.category.as_str(),
         priority: item.priority.as_str(),
         assignee: service.principal_name(item.assignee_id.as_deref())?,
+        reporter: service.reporter_label(item)?,
         estimate: item.estimate.map(Num),
         due: item.due_at.clone(),
         version: item.version,
@@ -534,6 +537,10 @@ fn tools(max_batch: usize) -> Vec<Tool> {
             "body": { "type": "string", "maxLength": 100_000, "default": "" },
             "priority": { "type": "string", "enum": priorities, "default": "none" },
             "assignee": { "type": "string", "minLength": 1 },
+            "reporter": {
+                "type": "string", "minLength": 1,
+                "description": "Who reported it; defaults to you"
+            },
             "parent": { "type": "string", "minLength": 1 },
             "estimate": estimate,
             "dueAt": date,
@@ -550,6 +557,7 @@ fn tools(max_batch: usize) -> Vec<Tool> {
             "body": { "type": "string", "maxLength": 100_000 },
             "priority": { "type": "string", "enum": priorities },
             "assignee": nullable(json!({ "type": "string", "minLength": 1 })),
+            "reporter": nullable(json!({ "type": "string", "minLength": 1 })),
             "parent": nullable(json!({ "type": "string", "minLength": 1 })),
             "estimate": nullable(estimate),
             "dueAt": nullable(date),
@@ -773,7 +781,7 @@ fn schema_text<S: Store>(service: &RoduService<S>) -> Result<String, RoduError> 
         "# JQL-lite
 
 Fields: key, title, body, text (full text), type, status, category, priority, estimate,
-assignee, collection, cycle (sprint), parent, created, updated, due.
+assignee, reporter, collection, cycle (sprint), parent, created, updated, due.
 Operators: = != ~ !~ < <= > >= IN (...) NOT IN (...) IS EMPTY, IS NOT EMPTY; combine with AND, OR, NOT, ( ).
 Values: \"quoted text\", bare words, numbers, dates (2026-01-31), offsets (-7d, -2w, 3h),
 me(), currentCycle(), now(), today().

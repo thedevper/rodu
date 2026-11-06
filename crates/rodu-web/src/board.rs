@@ -84,6 +84,8 @@ mod tests {
             category: "backlog".into(),
             priority: "none".into(),
             assignee: None,
+            reporter: None,
+            reporter_via: None,
             estimate: None,
             due: None,
             rank: key.into(),

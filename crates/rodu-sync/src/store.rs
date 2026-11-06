@@ -31,7 +31,7 @@ use loro::{
     Counter, ExportMode, Frontiers, IdSpan, Index, LoroDoc, LoroMap, LoroTree, LoroValue, TreeID,
     TreeParentId, ValueOrContainer, VersionVector,
 };
-use rodu_core::activity::{Audit, TeamActivity};
+use rodu_core::activity::{Audit, Standing, TeamActivity, Writer};
 use rodu_core::ids::{is_uuid, uuidv7};
 use rodu_core::{
     Collection, Comment, Cycle, Event, Item, Link, Principal, Result, RoduError, SearchRequest,
@@ -76,6 +76,8 @@ const NOTE_TRUST: &str = "trust";
 /// The local note, on the machine that made the team board from its workspace, holding the time
 /// of the last event it had recorded then: its events up to then come first in a card's activity.
 const NOTE_ADOPTED_EVENTS: &str = "adopted-events";
+/// The local note saying this machine has given the team's cards the reporters it knows (ADR 0007).
+const NOTE_REPORTERS: &str = "reporters-backfilled";
 
 /// This machine's clock, in whole seconds since 1970.
 fn unix_now() -> i64 {
@@ -159,6 +161,8 @@ enum Change {
     Collection(Collection),
     Cycle(Option<Cycle>, Cycle),
     Item(Box<(Option<Item>, Item)>),
+    /// The reporter the fill-in found for a card, and its agent (ADR 0007).
+    FoundReporter(String, String, Option<String>),
     Comment(Comment),
     Link(Link),
     NumberingPeer(u64),
@@ -199,6 +203,8 @@ pub struct LoroStore {
     node_problems: RefCell<Vec<String>>,
     /// [`LoroStore::adopt`] is building the document from a plain workspace's index.
     adopting: Cell<bool>,
+    /// [`LoroStore::backfill_reporters`] is giving cards the reporters this machine knows.
+    backfilling: Cell<bool>,
     /// The most bytes [`LoroStore::import_batch`] sends to the child in one check.
     group_cap: Cell<usize>,
     /// The in-memory document holds pending operations no check has replayed: it is reloaded
@@ -301,6 +307,82 @@ impl LoroStore {
         Ok(store)
     }
 
+    /// Once per machine: gives each card the document holds no reporter for the one its history
+    /// names (ADR 0007). That is the person whose admitted machine created the card in the team's
+    /// history, with the agent its change names, else the person and agent of the `item.create`
+    /// event this machine recorded: a card the team board was made with is known only to the
+    /// machine that made it. Run it after taking in what teammates wrote, so a reporter one of
+    /// them set is there to keep. A failure leaves it undone, for the next run.
+    pub fn backfill_reporters(&self) -> Result<()> {
+        self.backfilling.set(true);
+        let result = self.transaction(TxMode::Write, || {
+            // Read inside the write lock, so two processes opening the board do it once.
+            if self.local_note(NOTE_REPORTERS)?.is_some() {
+                return Ok(());
+            }
+            let missing: Vec<String> = {
+                let doc = self.doc.borrow();
+                let tree = doc.get_tree(ITEMS);
+                let mut ids: Vec<(String, TreeID)> =
+                    self.nodes.borrow().iter().map(|(id, node)| (id.clone(), *node)).collect();
+                ids.sort();
+                ids.into_iter()
+                    .filter(|(_, node)| {
+                        tree.get_meta(*node).is_ok_and(|meta| {
+                            meta.get("reporter_id").is_none()
+                                && meta.get(layout::FOUND_REPORTER).is_none()
+                        })
+                    })
+                    .map(|(id, _)| id)
+                    .collect()
+            };
+            for id in missing {
+                let Some(item) = self.sql.get_item(&id)? else { continue };
+                // The index may hold one its own migration found in this machine's events.
+                let indexed =
+                    item.reporter_id.clone().map(|r| (r, item.reporter_via_agent_id.clone()));
+                let Some((reporter, via)) = self.first_reporter(&id)?.or(indexed) else { continue };
+                let next = Item {
+                    reporter_id: Some(reporter.clone()),
+                    reporter_via_agent_id: via.clone(),
+                    version: item.version + 1,
+                    ..item.clone()
+                };
+                if self.sql.save_item(&next, item.version)? {
+                    self.pending.borrow_mut().push(Change::FoundReporter(id, reporter, via));
+                }
+            }
+            self.set_local_note(NOTE_REPORTERS, "1")
+        });
+        self.backfilling.set(false);
+        result
+    }
+
+    /// Who created a card, as [`LoroStore::backfill_reporters`] reads it, if anyone knows.
+    fn first_reporter(&self, id: &str) -> Result<Option<(String, Option<String>)>> {
+        let known = |p: &Option<String>| -> Result<Option<String>> {
+            Ok(match p {
+                Some(p) if self.has_principal(p)? => Some(p.clone()),
+                _ => None,
+            })
+        };
+        // The team's history first: every machine reads the same one, so they agree.
+        if let Some(activity) = self.team_activity(id)?
+            && let Some(created) = activity.entries.iter().find(|e| e.action == "item.create")
+            && let Writer::Member { principal_id, standing: Standing::Admitted } = &created.writer
+            && self.has_principal(principal_id)?
+        {
+            return Ok(Some((principal_id.clone(), known(&created.via_agent_id)?)));
+        }
+        let events = self.sql.list_events(id)?;
+        Ok(match events.iter().find(|e| e.action == "item.create") {
+            Some(e) if self.has_principal(&e.actor_id)? => {
+                Some((e.actor_id.clone(), known(&e.via_agent_id)?))
+            }
+            _ => None,
+        })
+    }
+
     /// Turns the plain workspace in `dir` into a team workspace: builds the document from every
     /// row of its index, keeping the index itself (and so events, idempotency records and card
     /// versions) as it is.
@@ -358,6 +440,7 @@ impl LoroStore {
             unsettled: Cell::new(0),
             node_problems: RefCell::new(Vec::new()),
             adopting: Cell::new(false),
+            backfilling: Cell::new(false),
             group_cap: Cell::new(MAX_IMPORT_BYTES),
             forget_pending: Cell::new(false),
             context: RefCell::new(None),
@@ -1070,6 +1153,8 @@ impl LoroStore {
                 // The change that makes the team board from a workspace: its cards were not
                 // created then, but added (ADR 0006).
                 None if self.adopting.get() => format!("{parity} adopt"),
+                // Filling in reporters cards had before Rodu kept them is not activity (ADR 0007).
+                None if self.backfilling.get() => format!("{parity} backfill"),
                 None => parity.to_string(),
             }
         };
@@ -1145,6 +1230,20 @@ impl LoroStore {
             }
             Change::Authority(key, record) => {
                 doc.get_map(AUTHORITY).insert(key, record.as_str()).map_err(internal)
+            }
+            Change::FoundReporter(id, reporter, via) => {
+                let node = *self
+                    .nodes
+                    .borrow()
+                    .get(id)
+                    .ok_or_else(|| internal(format!("card {id} is not in the document")))?;
+                let meta = doc.get_tree(ITEMS).get_meta(node).map_err(internal)?;
+                meta.insert(layout::FOUND_REPORTER, reporter.as_str()).map_err(internal)?;
+                meta.insert(
+                    layout::FOUND_REPORTER_VIA,
+                    via.as_deref().map_or(LoroValue::Null, LoroValue::from),
+                )
+                .map_err(internal)
             }
             Change::Item(change) => {
                 let (old, i) = &**change;
@@ -1365,6 +1464,22 @@ impl LoroStore {
             self.unsettled(report, format!("card {}: unknown assignee cleared", item.id));
             item.assignee_id = None;
             clean = false;
+        }
+        if let Some(r) = &item.reporter_id
+            && !self.has_principal(r)?
+        {
+            self.unsettled(report, format!("card {}: unknown reporter cleared", item.id));
+            item.reporter_id = None;
+            item.reporter_via_agent_id = None;
+            clean = false;
+        }
+        // An agent is shown only as its own person's, as with a change's agent (ADR 0006).
+        if let Some(v) = &item.reporter_via_agent_id
+            && self.sql.find_principal(v)?.is_none_or(|agent| {
+                agent.id != *v || agent.owner_id.is_none() || agent.owner_id != item.reporter_id
+            })
+        {
+            item.reporter_via_agent_id = None;
         }
         if let Some(c) = &item.cycle_id
             && self.sql.find_cycle(&item.collection_id, c)?.is_none_or(|found| found.id != *c)

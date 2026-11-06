@@ -76,6 +76,7 @@ const FIELDS: &[(&str, FieldSpec)] = &[
     ("updated", FieldSpec { kind: Kind::Date, column: "i.updated_at" }),
     ("due", FieldSpec { kind: Kind::Day, column: "i.due_at" }),
     ("assignee", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: "i.assignee_id" }),
+    ("reporter", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: "i.reporter_id" }),
     ("collection", FieldSpec { kind: Kind::Ref(RefKind::Collection), column: "i.collection_id" }),
     ("cycle", FieldSpec { kind: Kind::Ref(RefKind::Cycle), column: "i.cycle_id" }),
     ("parent", FieldSpec { kind: Kind::Ref(RefKind::Item), column: "i.parent_id" }),
@@ -105,7 +106,8 @@ const ORDER_FIELDS: &[(&str, &str)] = &[
     ("status", "i.status COLLATE NOCASE"),
 ];
 
-const NULLABLE: &[&str] = &["i.assignee_id", "i.parent_id", "i.cycle_id", "i.estimate", "i.due_at"];
+const NULLABLE: &[&str] =
+    &["i.assignee_id", "i.reporter_id", "i.parent_id", "i.cycle_id", "i.estimate", "i.due_at"];
 
 // The enum lists above must match the model; checked here so they cannot drift.
 const _: () = {
@@ -326,7 +328,7 @@ impl Compiler<'_> {
             return Err(self.error(
                 "this field is never empty",
                 pos,
-                Some("IS EMPTY works on assignee, parent, cycle, estimate, due, body"),
+                Some("IS EMPTY works on assignee, reporter, parent, cycle, estimate, due, body"),
             ));
         }
         let not = if negated { "NOT " } else { "" };

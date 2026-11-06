@@ -749,6 +749,16 @@ fn Card(item: ItemView, on_open: Callback<String>) -> impl IntoView {
                     .filter(|d| !d.is_empty())
                     .map(|d| view! { <span class="due">{format!("due {d}")}</span> })}
                 {item
+                    .reporter
+                    .filter(|r| !r.is_empty())
+                    .map(|r| {
+                        view! {
+                            <span class="reporter" title=format!("Reported by {r}")>
+                                {format!("by {r}")}
+                            </span>
+                        }
+                    })}
+                {item
                     .assignee
                     .filter(|a| !a.is_empty())
                     .map(|a| {

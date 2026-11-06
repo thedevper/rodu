@@ -41,7 +41,7 @@ fn upgrades_a_version_1_workspace_and_keeps_every_row() {
     assert_eq!(card[0].number, None);
     drop(offline);
 
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
     let conn = Connection::open(&path).unwrap();
     let broken: i64 =
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
@@ -51,7 +51,10 @@ fn upgrades_a_version_1_workspace_and_keeps_every_row() {
         .unwrap();
     let indexes: Vec<String> =
         stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
-    assert_eq!(indexes, ["items_assignee", "items_cycle", "items_parent", "items_rank"]);
+    assert_eq!(
+        indexes,
+        ["items_assignee", "items_cycle", "items_parent", "items_rank", "items_reporter"]
+    );
 }
 
 #[test]
@@ -68,8 +71,76 @@ fn upgrades_a_version_1_workspace_whose_keys_differ_only_by_case() {
         )
         .unwrap();
     let service = RoduService::new(SqliteStore::open(&path).unwrap());
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
     assert_eq!(service.item("demo-1").unwrap().id, "i-1");
+}
+
+/// The schema 1 fixture rebuilt as schema 2 had it: before cards had a reporter.
+fn v2_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (dir, path) = v1_workspace();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE items_v2 (
+               id TEXT PRIMARY KEY,
+               collection_id TEXT NOT NULL REFERENCES collections(id),
+               number INTEGER,
+               key TEXT NOT NULL UNIQUE,
+               provisional_key TEXT UNIQUE COLLATE NOCASE,
+               type TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL,
+               category TEXT NOT NULL, priority TEXT NOT NULL,
+               assignee_id TEXT REFERENCES principals(id),
+               parent_id TEXT REFERENCES items(id),
+               cycle_id TEXT REFERENCES cycles(id),
+               estimate REAL, rank TEXT NOT NULL, due_at TEXT,
+               created_at TEXT NOT NULL, updated_at TEXT NOT NULL, version INTEGER NOT NULL,
+               UNIQUE (collection_id, number)
+             );
+             INSERT INTO items_v2 (id, collection_id, number, key, type, title, body, status,
+               category, priority, assignee_id, parent_id, cycle_id, estimate, rank, due_at,
+               created_at, updated_at, version)
+             SELECT * FROM items;
+             DROP TABLE items;
+             ALTER TABLE items_v2 RENAME TO items;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    (dir, path)
+}
+
+#[test]
+fn upgrades_a_version_2_workspace_giving_cards_the_reporter_of_their_events() {
+    let (_dir, path) = v2_workspace();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO principals VALUES ('p-bot', 'agent', 'ann-agent', 'p-ann');
+             INSERT INTO events (id, request_id, actor_id, via_agent_id, action, target_id, at)
+             VALUES ('e-1', 'r-1', 'p-gone', NULL, 'item.create', 'i-1', '2026-01-01T00:00:00Z'),
+                    ('e-2', 'r-2', 'p-ann', 'p-bot', 'item.create', 'i-2', '2026-01-02T00:00:00Z'),
+                    ('e-3', 'r-3', 'p-ann', NULL, 'item.update', 'i-2', '2026-01-03T00:00:00Z');",
+        )
+        .unwrap();
+    let service = RoduService::new(SqliteStore::open(&path).unwrap());
+    assert_eq!(user_version(&path), 3);
+
+    let task = service.item("DEMO-2").unwrap();
+    assert_eq!(task.reporter_id.as_deref(), Some("p-ann"));
+    assert_eq!(task.reporter_via_agent_id.as_deref(), Some("p-bot"));
+    assert_eq!(task.version, 4);
+    // Its creator is not a person this workspace knows: no reporter rather than a broken one.
+    let epic = service.item("DEMO-1").unwrap();
+    assert_eq!((epic.reporter_id, epic.version), (None, 1));
+
+    let ann = Actor { principal_id: "p-ann".into(), via_agent_id: None };
+    let found = service.search(&ann, "reporter = me()", None, None).unwrap();
+    assert_eq!(found.items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(), ["DEMO-2"]);
+    let broken: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(broken, 0);
 }
 
 #[test]
@@ -85,7 +156,7 @@ fn opening_a_current_workspace_again_changes_nothing() {
 
     let again = RoduService::new(SqliteStore::open(&path).unwrap());
     assert_eq!(again.item("DEMO-1").unwrap().title, "Kept");
-    assert_eq!(user_version(&path), 2);
+    assert_eq!(user_version(&path), 3);
 }
 
 #[test]

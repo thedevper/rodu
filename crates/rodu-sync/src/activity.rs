@@ -49,6 +49,9 @@ pub struct Message {
     pub parity: Option<i64>,
     pub via: Option<String>,
     pub adopt: bool,
+    /// Filled in reporters cards had before Rodu kept them (ADR 0007). It writes only fields
+    /// activity ignores, so the word itself hides nothing.
+    pub backfill: bool,
 }
 
 pub fn read_message(message: Option<&str>) -> Message {
@@ -58,16 +61,18 @@ pub fn read_message(message: Option<&str>) -> Message {
         Some(b'1') => 1,
         _ => return Message::default(),
     };
-    let said = |via: Option<&str>, adopt| Message {
+    let said = |via: Option<&str>, adopt, backfill| Message {
         parity: Some(parity),
         via: via.map(str::to_string),
         adopt,
+        backfill,
     };
     match &message[1..] {
-        "" => said(None, false),
-        " adopt" => said(None, true),
+        "" => said(None, false, false),
+        " adopt" => said(None, true, false),
+        " backfill" => said(None, false, true),
         rest => match rest.strip_prefix(" via ") {
-            Some(agent) if is_uuid(agent) => said(Some(agent), false),
+            Some(agent) if is_uuid(agent) => said(Some(agent), false, false),
             _ => Message::default(),
         },
     }
@@ -642,12 +647,17 @@ mod tests {
             parity: Some(parity),
             via: via.map(Into::into),
             adopt,
+            backfill: false,
         };
         assert_eq!(read_message(Some("0")), said(0, None, false));
         assert_eq!(read_message(Some("1")), said(1, None, false));
         assert_eq!(read_message(Some("0 adopt")), said(0, None, true));
         assert_eq!(read_message(Some(&format!("1 via {agent}"))), said(1, Some(agent), false));
-        for other in ["", "2", "via x", "1 via not-an-id", "1 by someone", "10", "1 adopted"] {
+        let backfill = Message { backfill: true, ..said(1, None, false) };
+        assert_eq!(read_message(Some("1 backfill")), backfill);
+        for other in
+            ["", "2", "via x", "1 via not-an-id", "1 by someone", "10", "1 adopted", "1 backfilled"]
+        {
             assert_eq!(read_message(Some(other)), Message::default(), "{other:?}");
         }
         assert_eq!(read_message(None), Message::default());

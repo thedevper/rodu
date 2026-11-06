@@ -116,11 +116,15 @@ async fn initialises_a_workspace_and_manages_items_end_to_end() {
 
     let listed = cli(cwd, &["ls", "assignee = me()"]).await;
     assert_eq!(listed.code, 0);
-    assert_eq!(listed.out, ["DEMO-1 [In Progress] Crash on login"]);
+    assert_eq!(
+        listed.out,
+        ["DEMO-1 [In Progress] Crash on login · assignee alice, reporter alice"]
+    );
 
     let shown = cli(cwd, &["show", "DEMO-1"]).await;
     assert_eq!(shown.code, 0);
     assert!(shown.last_out().contains("Crash on login"));
+    assert!(shown.last_out().contains("- reporter: alice"), "{}", shown.last_out());
     assert!(!shown.last_out().contains("## Activity"));
 
     let history = cli(cwd, &["show", "DEMO-1", "--activity", "--limit", "1"]).await;
@@ -145,7 +149,7 @@ async fn finds_the_workspace_from_a_subdirectory_or_rodu_dir() {
     let env = vec![("RODU_DIR", dir.path().join(".rodu").to_string_lossy().into_owned())];
     let added = cli_with(elsewhere.path(), &["add", "Remote"], Extra { env, ..Extra::default() });
     assert_eq!(added.await.code, 0);
-    assert_eq!(cli(dir.path(), &["ls"]).await.out, ["DEMO-1 [Backlog] Remote"]);
+    assert_eq!(cli(dir.path(), &["ls"]).await.out, ["DEMO-1 [Backlog] Remote · reporter alice"]);
 }
 
 #[tokio::test]
@@ -191,6 +195,59 @@ async fn reports_unknown_options_and_commands_with_usage() {
     assert!(unknown.last_err().contains("Unknown command \"frobnicate\""));
     assert_eq!(cli(dir.path(), &[]).await.code, 1);
     assert_eq!(cli(dir.path(), &["--help"]).await.code, 0);
+}
+
+#[tokio::test]
+async fn sets_and_changes_who_does_and_who_reported_an_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    init(cwd).await;
+    assert_eq!(cli(cwd, &["add", "Typo"]).await.code, 0);
+    // An agent named as the reporter stands for its person.
+    let added = cli(cwd, &["add", "Second", "--reporter", "alice-agent"]).await;
+    assert_eq!(added.code, 0);
+    assert_eq!(
+        cli(cwd, &["ls", "reporter = me()"]).await.out,
+        [
+            "DEMO-1 [Backlog] Typo · reporter alice",
+            "DEMO-2 [Backlog] Second · reporter alice via alice-agent",
+        ]
+    );
+
+    let edited = cli(cwd, &["edit", "DEMO-1", "DEMO-2", "--assignee", "me"]).await;
+    assert_eq!(edited.code, 0);
+    assert_eq!(
+        edited.out,
+        [
+            "DEMO-1 [Backlog] Typo · assignee alice, reporter alice",
+            "DEMO-2 [Backlog] Second · assignee alice, reporter alice via alice-agent",
+        ]
+    );
+    let cleared = cli(cwd, &["edit", "DEMO-2", "--assignee", "none", "--reporter", "none"]).await;
+    assert_eq!(cleared.out, ["DEMO-2 [Backlog] Second"]);
+    assert_eq!(cli(cwd, &["ls", "reporter IS EMPTY"]).await.out, ["DEMO-2 [Backlog] Second"]);
+    let history = cli(cwd, &["show", "DEMO-2", "--activity"]).await.last_out().to_owned();
+    assert!(history.contains("reporter: alice →"), "{history}");
+    let back = cli(cwd, &["edit", "DEMO-2", "--reporter", "me"]).await;
+    assert_eq!(back.out, ["DEMO-2 [Backlog] Second · reporter alice"]);
+
+    let unknown = cli(cwd, &["add", "Found", "--reporter", "none"]).await;
+    assert_eq!(unknown.out, ["DEMO-3 [Backlog] Found"]);
+    assert_eq!(cli(cwd, &["ls", "reporter IS EMPTY"]).await.out, ["DEMO-3 [Backlog] Found"]);
+
+    // A typo in one key changes none of them.
+    let typo = cli(cwd, &["edit", "DEMO-2", "DEMO-99", "--assignee", "me"]).await;
+    assert_eq!(typo.code, 1);
+    assert_eq!(
+        cli(cwd, &["ls", "assignee IS EMPTY"]).await.out,
+        ["DEMO-2 [Backlog] Second · reporter alice", "DEMO-3 [Backlog] Found"]
+    );
+
+    let nothing = cli(cwd, &["edit", "DEMO-1"]).await;
+    assert_eq!(nothing.code, 1);
+    assert!(nothing.last_err().contains("--assignee or --reporter"));
+    assert_eq!(cli(cwd, &["edit", "--assignee", "me"]).await.code, 1);
+    assert_eq!(cli(cwd, &["edit", "DEMO-1", "--reporter", "nobody"]).await.code, 1);
 }
 
 #[tokio::test]
