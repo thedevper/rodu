@@ -538,3 +538,84 @@ async fn adds_a_collection_an_agent_can_then_use() {
         assert_eq!(refused.is_error, Some(true), "{bad}: {}", text(&refused));
     }
 }
+
+/// A client that says its name is `name`, talking to a server that names agents (ADR 0008).
+async fn connect_named(
+    service: RoduService<SqliteStore>,
+    actor: Actor,
+    named: Option<&str>,
+    name: &str,
+) -> RunningService<RoleClient, rmcp::model::ClientConfig> {
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    let server = RoduMcp::new(service, actor).naming_agents(named.map(str::to_string));
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let info = rmcp::model::ClientConfig::new(
+        rmcp::model::ClientCapabilities::default(),
+        rmcp::model::Implementation::new(name, "1.0"),
+    );
+    info.serve(client_io).await.unwrap()
+}
+
+fn tool(name: &'static str, arguments: Value) -> CallToolRequestParams {
+    let Value::Object(arguments) = arguments else { panic!("arguments must be an object") };
+    CallToolRequestParams::new(name).with_arguments(arguments)
+}
+
+fn create(title: &str) -> CallToolRequestParams {
+    tool("create_items", json!({ "collection": "DEMO", "items": [{ "title": title }] }))
+}
+
+fn made_by(who: &str) -> CallToolRequestParams {
+    tool("search", json!({ "query": format!("creator = {who}") }))
+}
+
+/// The workspace at `path` again, as alice through her usual agent.
+fn reopen(path: &std::path::Path) -> (RoduService<SqliteStore>, Actor) {
+    let service = RoduService::new(SqliteStore::open(path).unwrap());
+    let human = service.principal("alice").unwrap();
+    let bot = service.principal("alice-claude").unwrap();
+    (service, Actor { principal_id: human.id, via_agent_id: Some(bot.id) })
+}
+
+#[tokio::test]
+async fn each_client_writes_as_an_agent_of_its_own_under_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rodu.db");
+
+    // The client's name gives the agent.
+    let (service, actor) = demo_service(SqliteStore::open(&path).unwrap());
+    let desktop = connect_named(service, actor, None, "Claude Desktop").await;
+    parsed(&desktop.peer().call_tool(create("From desktop")).await.unwrap());
+    let found = desktop.peer().call_tool(made_by("alice-claude-desktop")).await.unwrap();
+    assert_eq!(parsed(&found)["total"], 1);
+    desktop.cancel().await.unwrap();
+
+    // RODU_AGENT wins over the client's name.
+    let (service, actor) = reopen(&path);
+    let named = connect_named(service, actor, Some("ops-bot"), "Claude Desktop").await;
+    parsed(&named.peer().call_tool(create("From ops")).await.unwrap());
+    assert_eq!(
+        parsed(&named.peer().call_tool(made_by("alice-ops-bot")).await.unwrap())["total"],
+        1
+    );
+    assert_eq!(parsed(&named.peer().call_tool(made_by("me()")).await.unwrap())["total"], 2);
+    named.cancel().await.unwrap();
+
+    // A bad RODU_AGENT fails the call, so a wrong setting shows.
+    let (service, actor) = reopen(&path);
+    let bad = connect_named(service, actor, Some("--"), "x").await;
+    let refused = bad.peer().call_tool(create("Nope")).await.unwrap();
+    assert_eq!(refused.is_error, Some(true));
+    assert!(text(&refused).contains("RODU_AGENT"), "{}", text(&refused));
+    bad.cancel().await.unwrap();
+
+    // A client name that cannot be an agent's falls back to the person's usual agent.
+    let (service, actor) = reopen(&path);
+    let odd = connect_named(service, actor, None, "!!").await;
+    parsed(&odd.peer().call_tool(create("Fallback")).await.unwrap());
+    assert_eq!(parsed(&odd.peer().call_tool(made_by("alice-claude")).await.unwrap())["total"], 1);
+}

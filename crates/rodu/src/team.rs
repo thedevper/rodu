@@ -277,11 +277,13 @@ pub(crate) fn before(io: &mut Io<'_>, ws: &Workspace) {
         warn(io, &format!("recording this machine as a member: {}", e.message));
     }
     // On a stale document a fill-in could outrun a reporter a teammate set: only after a pull.
-    if pulled
-        && let Some(store) = ws.service.store.team()
-        && let Err(e) = store.backfill_reporters()
-    {
-        warn(io, &format!("filling in reporters: {}", e.message));
+    if pulled && let Some(store) = ws.service.store.team() {
+        if let Err(e) = store.backfill_reporters() {
+            warn(io, &format!("filling in reporters: {}", e.message));
+        }
+        if let Err(e) = store.backfill_creators() {
+            warn(io, &format!("filling in creators: {}", e.message));
+        }
     }
     if ws.service.numbering()
         && let Err(e) = ws.service.assign_numbers(&user_actor(&ws.config))

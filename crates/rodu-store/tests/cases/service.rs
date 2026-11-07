@@ -278,6 +278,67 @@ fn refuses_neighbours_from_another_collection_or_out_of_order() {
     );
 }
 
+// --- agent identity and creator (ADR 0008) ---
+
+#[test]
+fn an_agent_name_makes_one_agent_per_person_and_name() {
+    let f = fixture();
+    let made = f.service.agent_for(&f.alice.principal_id, "Claude Code").unwrap();
+    assert_eq!((made.name.as_str(), made.kind), ("alice-claude-code", PrincipalKind::Agent));
+    assert_eq!(made.owner_id.as_deref(), Some(f.alice.principal_id.as_str()));
+    // The same name again is the same agent, and the default name is the agent alice already has.
+    assert_eq!(f.service.agent_for(&f.alice.principal_id, "claude-code").unwrap().id, made.id);
+    assert_eq!(f.service.agent_for(&f.alice.principal_id, "claude").unwrap().id, f.agent.via_agent_id.clone().unwrap());
+
+    // Its id comes from the person and the name, so another machine of alice's makes the same one.
+    let seed = format!("agent:{}:alice-claude-code", f.alice.principal_id);
+    assert_eq!(made.id, rodu_core::ids::stable_id(&seed));
+
+    // A name that is a human's, or another person's agent, is refused; so is one with no letters.
+    f.service.create_principal("alice-ops", PrincipalKind::Human, None).unwrap();
+    assert_eq!(err(f.service.agent_for(&f.alice.principal_id, "ops")).code, ErrorCode::Conflict);
+    assert_eq!(err(f.service.agent_for(&f.alice.principal_id, " -- ")).code, ErrorCode::Invalid);
+    let long = f.service.agent_for(&f.alice.principal_id, &"x".repeat(80)).unwrap();
+    assert_eq!(long.name.len(), 40);
+    let long_person = f.service.create_principal(&"p".repeat(39), PrincipalKind::Human, None).unwrap();
+    assert_eq!(err(f.service.agent_for(&long_person.id, "codex")).code, ErrorCode::Invalid);
+}
+
+#[test]
+fn a_card_keeps_who_created_it_and_creator_finds_the_person_or_the_agent() {
+    let f = fixture();
+    let bob = f.service.create_principal("bob", PrincipalKind::Human, None).unwrap();
+    let code = f.service.agent_for(&f.alice.principal_id, "claude-code").unwrap();
+    let via_code = Actor { principal_id: f.alice.principal_id.clone(), via_agent_id: Some(code.id.clone()) };
+    let made = f.service.create_items(&via_code, "DEMO", &items(&["By claude-code"]), None).unwrap();
+    assert_eq!((made[0].creator_id.clone(), made[0].creator_via_agent_id.clone()), (Some(f.alice.principal_id.clone()), Some(code.id)));
+    f.service.create_items(&f.agent, "DEMO", &items(&["By alice-claude"]), None).unwrap();
+    f.service.create_items(&f.alice, "DEMO", &items(&["By hand"]), None).unwrap();
+    let bob_actor = Actor { principal_id: bob.id.clone(), via_agent_id: None };
+    f.service.create_items(&bob_actor, "DEMO", &items(&["By bob"]), None).unwrap();
+
+    // Changing the reporter never changes the creator.
+    let moved = f.service.update_item(&f.alice, "DEMO-1", &json!({ "reporter": "bob" }), None).unwrap();
+    assert_eq!(moved.creator_via_agent_id, made[0].creator_via_agent_id);
+    assert!(f.service.context("DEMO-1", None).unwrap().contains("- created by: alice via alice-claude-code"));
+
+    let keys = |query: &str| -> Vec<String> {
+        let found = f.service.search(&f.alice, &format!("{query} ORDER BY key"), None, None).unwrap();
+        found.items.into_iter().map(|i| i.key).collect()
+    };
+    assert_eq!(keys("creator = me()"), ["DEMO-1", "DEMO-2", "DEMO-3"]);
+    assert_eq!(keys("creator = alice-claude-code"), ["DEMO-1"]);
+    assert_eq!(keys("creator != alice-claude-code"), ["DEMO-2", "DEMO-3", "DEMO-4"]);
+    assert_eq!(keys("creator IN (bob, alice-claude)"), ["DEMO-2", "DEMO-4"]);
+    assert_eq!(keys("creator NOT IN (alice)"), ["DEMO-4"]);
+    // NOT keeps a card made without an agent, as it would for any other field.
+    assert_eq!(keys("NOT creator = alice"), ["DEMO-4"]);
+    assert_eq!(keys("NOT creator = alice-claude-code"), ["DEMO-2", "DEMO-3", "DEMO-4"]);
+    assert!(keys("creator IS EMPTY").is_empty());
+    // A name nobody has finds nothing, not the cards nobody knows the creator of.
+    assert!(keys("creator = nobody").is_empty());
+}
+
 // --- reporter ---
 
 #[test]

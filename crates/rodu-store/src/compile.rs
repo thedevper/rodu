@@ -77,6 +77,7 @@ const FIELDS: &[(&str, FieldSpec)] = &[
     ("due", FieldSpec { kind: Kind::Day, column: "i.due_at" }),
     ("assignee", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: "i.assignee_id" }),
     ("reporter", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: "i.reporter_id" }),
+    ("creator", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: CREATOR }),
     ("collection", FieldSpec { kind: Kind::Ref(RefKind::Collection), column: "i.collection_id" }),
     ("cycle", FieldSpec { kind: Kind::Ref(RefKind::Cycle), column: "i.cycle_id" }),
     ("parent", FieldSpec { kind: Kind::Ref(RefKind::Item), column: "i.parent_id" }),
@@ -106,8 +107,30 @@ const ORDER_FIELDS: &[(&str, &str)] = &[
     ("status", "i.status COLLATE NOCASE"),
 ];
 
-const NULLABLE: &[&str] =
-    &["i.assignee_id", "i.reporter_id", "i.parent_id", "i.cycle_id", "i.estimate", "i.due_at"];
+const NULLABLE: &[&str] = &[
+    "i.assignee_id",
+    "i.reporter_id",
+    CREATOR,
+    "i.parent_id",
+    "i.cycle_id",
+    "i.estimate",
+    "i.due_at",
+];
+
+/// `creator` names a card's person or the agent it went through (ADR 0008): `creator = ann` finds
+/// what ann made, through any agent, and `creator = ann-claude-code` what that agent made.
+const CREATOR: &str = "i.creator_id";
+const CREATOR_AGENT: &str = "i.creator_via_agent_id";
+
+/// `creator <test>`: the person or the agent passes `test` (`= ?`, `IN (?, ?)`). An unknown name
+/// is NULL and matches nothing; negated, a card with no creator is kept, as `!=` keeps empty
+/// fields. A card made without an agent is decided by its person alone, so `NOT creator = x`
+/// keeps it as `NOT assignee = x` would.
+fn creator_either(test: &str, params: Vec<SqlValue>, negated: bool) -> Fragment {
+    let either = format!("({CREATOR} {test} OR IFNULL({CREATOR_AGENT} {test}, 0))");
+    let sql = if negated { format!("NOT IFNULL({either}, 0)") } else { either };
+    Fragment::new(sql, [params.clone(), params].concat())
+}
 
 // The enum lists above must match the model; checked here so they cannot drift.
 const _: () = {
@@ -272,6 +295,9 @@ impl Compiler<'_> {
             let sql = if op == CompareOp::Ne { format!("NOT {either}") } else { either };
             return Ok(Fragment::new(sql, params));
         }
+        if spec.column == CREATOR {
+            return Ok(creator_either(&format!("= {}", rhs.sql), rhs.params, op == CompareOp::Ne));
+        }
         let column = if spec.kind == Kind::Status {
             format!("{} COLLATE NOCASE", spec.column)
         } else {
@@ -306,6 +332,9 @@ impl Compiler<'_> {
             let sql = if negated { format!("NOT {either}") } else { either };
             return Ok(Fragment::new(sql, params));
         }
+        if spec.column == CREATOR {
+            return Ok(creator_either(&format!("IN ({list})"), params, negated));
+        }
         let column = if spec.kind == Kind::Status {
             format!("{} COLLATE NOCASE", spec.column)
         } else {
@@ -328,7 +357,9 @@ impl Compiler<'_> {
             return Err(self.error(
                 "this field is never empty",
                 pos,
-                Some("IS EMPTY works on assignee, reporter, parent, cycle, estimate, due, body"),
+                Some(
+                    "IS EMPTY works on assignee, reporter, creator, parent, cycle, estimate, due, body",
+                ),
             ));
         }
         let not = if negated { "NOT " } else { "" };

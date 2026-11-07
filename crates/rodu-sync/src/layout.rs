@@ -121,6 +121,8 @@ pub fn item_fields(i: &Item) -> Fields {
         ("assignee_id", opt_text(i.assignee_id.as_deref())),
         ("reporter_id", opt_text(i.reporter_id.as_deref())),
         ("reporter_via_agent_id", opt_text(i.reporter_via_agent_id.as_deref())),
+        ("creator_id", opt_text(i.creator_id.as_deref())),
+        ("creator_via_agent_id", opt_text(i.creator_via_agent_id.as_deref())),
         ("cycle_id", opt_text(i.cycle_id.as_deref())),
         ("estimate", i.estimate.map_or(LoroValue::Null, LoroValue::from)),
         ("rank", text(&i.rank)),
@@ -319,8 +321,30 @@ pub fn cycle(id: &str, map: &LoroMap) -> Result<Cycle, String> {
 /// Where the fill-in keeps the reporter it found for a card from before Rodu kept them: keys of
 /// their own, so it never overwrites a reporter someone set, whatever order the two arrive in, and
 /// activity, which does not know them, shows nothing of it (ADR 0007).
-pub const FOUND_REPORTER: &str = "reporter_found_id";
-pub const FOUND_REPORTER_VIA: &str = "reporter_found_via_agent_id";
+pub const REPORTER_KEYS: PersonKeys = PersonKeys {
+    set: ("reporter_id", "reporter_via_agent_id"),
+    found: ("reporter_found_id", "reporter_found_via_agent_id"),
+};
+/// A card's creator is kept the same way (ADR 0008): cards from before have it filled in.
+pub const CREATOR_KEYS: PersonKeys = PersonKeys {
+    set: ("creator_id", "creator_via_agent_id"),
+    found: ("creator_found_id", "creator_found_via_agent_id"),
+};
+
+/// Where a card keeps a person and their agent: the keys a write sets, and the keys the fill-in
+/// sets for a card from before.
+#[derive(Clone, Copy)]
+pub struct PersonKeys {
+    pub set: (&'static str, &'static str),
+    pub found: (&'static str, &'static str),
+}
+
+impl PersonKeys {
+    /// The keys that hold the person: the set ones when the map has them, set or cleared.
+    fn read(self, map: &LoroMap) -> (&'static str, &'static str) {
+        if map.get(self.set.0).is_some() { self.set } else { self.found }
+    }
+}
 
 /// A card read from its node's map; `parent_id` comes from the tree, `version` is set by the caller.
 pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
@@ -328,10 +352,8 @@ pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
     let r = Reader::new(map, format!("card {id}"));
     let key = r.line("key", 64)?;
     // A reporter someone set, or cleared, wins over the one filled in from history (ADR 0007).
-    let reporter = match map.get("reporter_id") {
-        Some(_) => ("reporter_id", "reporter_via_agent_id"),
-        None => (FOUND_REPORTER, FOUND_REPORTER_VIA),
-    };
+    let reporter = REPORTER_KEYS.read(map);
+    let creator = CREATOR_KEYS.read(map);
     Ok(Item {
         collection_id: r.id("collection_id")?,
         number: r.opt_number("number")?,
@@ -345,6 +367,8 @@ pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
         assignee_id: r.opt_id("assignee_id")?,
         reporter_id: r.opt_id(reporter.0)?,
         reporter_via_agent_id: r.opt_id(reporter.1)?,
+        creator_id: r.opt_id(creator.0)?,
+        creator_via_agent_id: r.opt_id(creator.1)?,
         parent_id,
         cycle_id: r.opt_id("cycle_id")?,
         estimate: r.opt_estimate("estimate")?,
