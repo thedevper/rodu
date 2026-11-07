@@ -265,6 +265,7 @@ async fn creates_lists_moves_and_comments_on_items() {
     let board = send(s, "GET", "/api/board?collection=demo", none()).await;
     let states = board.json()["collection"]["states"].clone();
     assert!(states.as_array().unwrap().iter().any(|st| st["name"] == "In Review"));
+    assert_eq!(states[0]["name"], "Triage", "the board's first column");
     assert_eq!(field(&board, "key"), ["DEMO-1", "DEMO-2", "DEMO-3"]);
 
     let moved =

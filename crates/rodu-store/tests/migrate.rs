@@ -41,7 +41,7 @@ fn upgrades_a_version_1_workspace_and_keeps_every_row() {
     assert_eq!(card[0].number, None);
     drop(offline);
 
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), 5);
     let conn = Connection::open(&path).unwrap();
     let broken: i64 =
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
@@ -78,7 +78,7 @@ fn upgrades_a_version_1_workspace_whose_keys_differ_only_by_case() {
         )
         .unwrap();
     let service = RoduService::new(SqliteStore::open(&path).unwrap());
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), 5);
     assert_eq!(service.item("demo-1").unwrap().id, "i-1");
 }
 
@@ -130,7 +130,7 @@ fn upgrades_a_version_2_workspace_giving_cards_the_reporter_of_their_events() {
         )
         .unwrap();
     let service = RoduService::new(SqliteStore::open(&path).unwrap());
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), 5);
 
     let task = service.item("DEMO-2").unwrap();
     assert_eq!(task.reporter_id.as_deref(), Some("p-ann"));
@@ -152,6 +152,10 @@ fn upgrades_a_version_2_workspace_giving_cards_the_reporter_of_their_events() {
         let keys: Vec<&str> = found.items.iter().map(|i| i.key.as_str()).collect();
         assert_eq!(keys, ["DEMO-2"], "{query}");
     }
+    // Schema 5: nothing is snoozed, and the collection, stored before Triage, has it (ADR 0009).
+    assert_eq!(service.search(&ann, "snoozed IS EMPTY", None, None).unwrap().total, 2);
+    let workflow = service.collection("DEMO").unwrap().workflow;
+    assert_eq!(workflow.states[0].name, "Triage");
     let broken: i64 = Connection::open(&path)
         .unwrap()
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
@@ -172,7 +176,7 @@ fn opening_a_current_workspace_again_changes_nothing() {
 
     let again = RoduService::new(SqliteStore::open(&path).unwrap());
     assert_eq!(again.item("DEMO-1").unwrap().title, "Kept");
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), 5);
 }
 
 #[test]

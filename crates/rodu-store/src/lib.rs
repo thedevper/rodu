@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::compile::{CompileContext, compile_query};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE principals (
@@ -108,6 +108,7 @@ CREATE TABLE items (
   estimate REAL,
   rank TEXT NOT NULL,
   due_at TEXT,
+  snoozed_until TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   version INTEGER NOT NULL,
@@ -234,6 +235,7 @@ pub(crate) fn to_item(r: &Row<'_>) -> rusqlite::Result<Item> {
         estimate: r.get("estimate")?,
         rank: r.get("rank")?,
         due_at: r.get("due_at")?,
+        snoozed_until: r.get("snoozed_until")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         version: r.get("version")?,
@@ -330,7 +332,30 @@ impl SqliteStore {
         if (1..=3).contains(&version) {
             self.migrate_to_4()?;
         }
+        if (1..=4).contains(&version) {
+            self.migrate_to_5()?;
+        }
         Ok(())
+    }
+
+    /// Schema 4 -> 5: a card in Triage can be snoozed until a date (ADR 0009).
+    fn migrate_to_5(&self) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            // Files rebuilt by the step to 2 have the current table, with the column already.
+            let has: i64 = self
+                .one(
+                    "SELECT count(*) FROM pragma_table_info('items') WHERE name = 'snoozed_until'",
+                    [],
+                    |r| r.get(0),
+                )?
+                .unwrap_or(0);
+            if has == 0 {
+                self.conn
+                    .execute_batch("ALTER TABLE items ADD COLUMN snoozed_until TEXT;")
+                    .map_err(db)?;
+            }
+            self.conn.pragma_update(None, "user_version", 5).map_err(db)
+        })
     }
 
     /// Schema 3 -> 4: cards keep who created them (ADR 0008), filled in, as the reporter was, from
@@ -600,8 +625,8 @@ impl Store for SqliteStore {
             "INSERT INTO items (id, collection_id, number, key, provisional_key, type, title, body,
               status, category, priority, assignee_id, reporter_id, reporter_via_agent_id,
               creator_id, creator_via_agent_id, parent_id, cycle_id, estimate, rank, due_at,
-              created_at, updated_at, version)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              snoozed_until, created_at, updated_at, version)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 i.id,
                 i.collection_id,
@@ -624,6 +649,7 @@ impl Store for SqliteStore {
                 i.estimate,
                 i.rank,
                 i.due_at,
+                i.snoozed_until,
                 i.created_at,
                 i.updated_at,
                 i.version
@@ -657,7 +683,8 @@ impl Store for SqliteStore {
             "UPDATE items SET number = ?, key = ?, type = ?, title = ?, body = ?, status = ?,
               category = ?, priority = ?, assignee_id = ?, reporter_id = ?,
               reporter_via_agent_id = ?, creator_id = ?, creator_via_agent_id = ?, parent_id = ?,
-              cycle_id = ?, estimate = ?, rank = ?, due_at = ?, updated_at = ?, version = ?
+              cycle_id = ?, estimate = ?, rank = ?, due_at = ?, snoozed_until = ?, updated_at = ?,
+              version = ?
               WHERE id = ? AND version = ?",
             params![
                 i.number,
@@ -678,6 +705,7 @@ impl Store for SqliteStore {
                 i.estimate,
                 i.rank,
                 i.due_at,
+                i.snoozed_until,
                 i.updated_at,
                 i.version,
                 i.id,

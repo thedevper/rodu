@@ -140,8 +140,8 @@ impl SqliteStore {
             "INSERT INTO items (id, collection_id, number, key, provisional_key, type, title, body,
                status, category, priority, assignee_id, reporter_id, reporter_via_agent_id,
                creator_id, creator_via_agent_id, parent_id, cycle_id, estimate, rank, due_at,
-               created_at, updated_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               snoozed_until, created_at, updated_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET collection_id = excluded.collection_id,
                number = excluded.number, key = excluded.key,
                provisional_key = excluded.provisional_key, type = excluded.type,
@@ -153,7 +153,8 @@ impl SqliteStore {
                creator_via_agent_id = excluded.creator_via_agent_id,
                parent_id = excluded.parent_id,
                cycle_id = excluded.cycle_id, estimate = excluded.estimate, rank = excluded.rank,
-               due_at = excluded.due_at, created_at = excluded.created_at,
+               due_at = excluded.due_at, snoozed_until = excluded.snoozed_until,
+               created_at = excluded.created_at,
                updated_at = excluded.updated_at, version = excluded.version",
             params![
                 i.id,
@@ -177,6 +178,7 @@ impl SqliteStore {
                 i.estimate,
                 i.rank,
                 i.due_at,
+                i.snoozed_until,
                 i.created_at,
                 i.updated_at,
                 i.version
@@ -424,8 +426,8 @@ impl SqliteStore {
             "SELECT 'y', id, collection_id, name, starts_on, ends_on, state FROM cycles ORDER BY id",
             "SELECT 'i', id, collection_id, number, key, provisional_key, type, title, body, status,
                category, priority, assignee_id, reporter_id, reporter_via_agent_id, creator_id,
-               creator_via_agent_id, parent_id, cycle_id, estimate, rank, due_at, created_at,
-               updated_at FROM items ORDER BY id",
+               creator_via_agent_id, parent_id, cycle_id, estimate, rank, due_at, snoozed_until,
+               created_at, updated_at FROM items ORDER BY id",
             "SELECT 'm', id, item_id, author_id, via_agent_id, body, created_at
                FROM comments ORDER BY id",
             "SELECT 'l', from_item_id, kind, target, created_at FROM links

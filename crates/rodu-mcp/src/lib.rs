@@ -13,7 +13,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use rodu_core::format::{format_activity, format_audit};
-use rodu_core::service::CategoryCounts;
+use rodu_core::service::{CategoryCounts, Triage};
 use rodu_core::{
     Actor, Cycle, ErrorCode, Item, ItemType, LinkKind, Live, LiveSync, Priority, RoduError,
     RoduService, Rule, Store, TxMode,
@@ -259,6 +259,29 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
                 let to = args.string("to", 1, 40)?;
                 pretty(&summarize(service, &service.transition(actor, &reference, &to)?)?)
             }
+            "triage" => {
+                let action = args.string("action", 1, 20)?;
+                let decision = match action.as_str() {
+                    "list" => {
+                        let collection = args.opt_string("collection", 1, MAX_COLLECTION)?;
+                        let waiting = service.triage_list(actor, collection.as_deref())?;
+                        let items = summarize_all(service, &waiting.items)?;
+                        return pretty(&Page { total: waiting.total, items });
+                    }
+                    "accept" => Triage::Accept,
+                    "decline" => Triage::Decline,
+                    "duplicate" => Triage::Duplicate(args.reference("of")?),
+                    "snooze" => Triage::Snooze(args.int_or("days", 1, 365, 7)? as u32),
+                    _ => {
+                        return Err(args.invalid(
+                            "action",
+                            "must be list, accept, decline, duplicate or snooze",
+                        ));
+                    }
+                };
+                let reference = args.reference("ref")?;
+                pretty(&summarize(service, &service.triage(actor, &reference, &decision)?)?)
+            }
             "comment" => {
                 let reference = args.reference("ref")?;
                 let body = args.string("body", 1, 20000)?;
@@ -379,6 +402,9 @@ struct Summary {
     reporter: Option<String>,
     estimate: Option<Num>,
     due: Option<String>,
+    /// When a snoozed Triage card comes back to the triage list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snoozed: Option<String>,
     version: i64,
 }
 
@@ -438,6 +464,7 @@ fn summarize<S: Store>(service: &RoduService<S>, item: &Item) -> Result<Summary,
         reporter: service.reporter_label(item)?,
         estimate: item.estimate.map(Num),
         due: item.due_at.clone(),
+        snoozed: item.snoozed_until.clone(),
         version: item.version,
     })
 }
@@ -728,6 +755,22 @@ fn tools(max_batch: usize) -> Vec<Tool> {
             write.clone().idempotent(false),
         ),
         tool(
+            "triage",
+            "Triage",
+            "The cards an agent made wait in the Triage status for a person. `list` shows them (oldest first, without snoozed ones); `accept` moves one to Backlog, `decline` cancels it, `duplicate` cancels it as a duplicate of `of`, `snooze` hides it from the list for `days` (default 7). Only a person's go-ahead should accept or decline.".into(),
+            object(
+                json!({
+                    "action": { "type": "string", "enum": ["list", "accept", "decline", "duplicate", "snooze"] },
+                    "ref": reference,
+                    "of": { "type": "string", "minLength": 1, "maxLength": 100, "description": "duplicate: the card it duplicates" },
+                    "days": { "type": "integer", "minimum": 1, "maximum": 365, "description": "snooze: days to hide it, default 7" },
+                    "collection": { "type": "string", "minLength": 1, "maxLength": 40, "description": "list: only this collection" },
+                }),
+                &["action"],
+            ),
+            write.clone().idempotent(false),
+        ),
+        tool(
             "comment",
             "Comment",
             "Add a comment to an item.".into(),
@@ -842,9 +885,11 @@ fn schema_text<S: Store>(service: &RoduService<S>) -> Result<String, RoduError> 
         "# JQL-lite
 
 Fields: key, title, body, text (full text), type, status, category, priority, estimate,
-assignee, reporter, creator, collection, cycle (sprint), parent, created, updated, due.
+assignee, reporter, creator, collection, cycle (sprint), parent, created, updated, due, snoozed.
 creator matches who made a card or the agent it went through: creator = <agent name> finds that
-agent's cards, creator = me() yours through any agent.
+agent's cards, creator = me() yours through any agent. Cards an agent creates start in the
+Triage status until a person accepts them (see the triage tool); snoozed is the date a snoozed
+Triage card shows in the list again.
 Operators: = != ~ !~ < <= > >= IN (...) NOT IN (...) IS EMPTY, IS NOT EMPTY; combine with AND, OR, NOT, ( ).
 Values: \"quoted text\", bare words, numbers, dates (2026-01-31), offsets (-7d, -2w, 3h),
 me(), currentCycle(), now(), today().
