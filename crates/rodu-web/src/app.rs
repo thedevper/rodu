@@ -616,6 +616,8 @@ fn Column(
     };
 
     let add_label = format!("Add item to {}", state.name);
+    // Only an agent's new cards land in Triage (ADR 0009); a person adds to the other columns.
+    let accepts_new = !state.name.eq_ignore_ascii_case("Triage");
 
     view! {
         <section
@@ -644,14 +646,16 @@ fn Column(
                 <span class="dot" aria-hidden="true"></span>
                 <h2>{state.name.clone()}</h2>
                 <span class="count">{move || items.with(Vec::len)}</span>
-                <button
-                    type="button"
-                    class="ghost add"
-                    aria-label=add_label
-                    on:click=move |_| adding.set(true)
-                >
-                    "+"
-                </button>
+                <Show when=move || accepts_new>
+                    <button
+                        type="button"
+                        class="ghost add"
+                        aria-label=add_label.clone()
+                        on:click=move |_| adding.set(true)
+                    >
+                        "+"
+                    </button>
+                </Show>
             </header>
             <ol node_ref=list_ref class="cards">
                 {move || {

@@ -166,6 +166,8 @@ pub struct Item {
     pub estimate: Option<f64>,
     pub rank: String,
     pub due_at: Option<String>,
+    /// A card in Triage hidden from the triage list until this date, `YYYY-MM-DD` (ADR 0009).
+    pub snoozed_until: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub version: i64,

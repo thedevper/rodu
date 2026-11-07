@@ -127,6 +127,7 @@ pub fn item_fields(i: &Item) -> Fields {
         ("estimate", i.estimate.map_or(LoroValue::Null, LoroValue::from)),
         ("rank", text(&i.rank)),
         ("due_at", opt_text(i.due_at.as_deref())),
+        ("snoozed_until", opt_text(i.snoozed_until.as_deref())),
         ("created_at", text(&i.created_at)),
         ("updated_at", text(&i.updated_at)),
     ]
@@ -374,6 +375,7 @@ pub fn item(map: &LoroMap, parent_id: Option<String>) -> Result<Item, String> {
         estimate: r.opt_estimate("estimate")?,
         rank: r.line("rank", MAX_FIELD)?,
         due_at: r.opt_date("due_at")?,
+        snoozed_until: r.opt_date("snoozed_until")?,
         created_at: r.stamp("created_at")?,
         updated_at: r.stamp("updated_at")?,
         version: 0,
@@ -409,7 +411,7 @@ pub fn item_field(field: &str, value: &LoroValue) -> FieldValue {
         "number" => r.opt_number(field).map(|n| n.map(|n| n.to_string())),
         "assignee_id" | "reporter_id" | "cycle_id" => r.opt_id(field),
         "estimate" => r.opt_estimate(field).map(|n| n.map(|n| n.to_string())),
-        "due_at" => r.opt_date(field),
+        "due_at" | "snoozed_until" => r.opt_date(field),
         "body" => {
             return match r.opt_text_max(field, MAX_BODY) {
                 Ok(_) => FieldValue::Hidden,

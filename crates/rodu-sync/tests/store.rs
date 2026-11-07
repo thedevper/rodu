@@ -2004,3 +2004,26 @@ fn a_reporter_someone_sets_wins_over_a_fill_in_whatever_arrives_first() {
     assert_rebuild_matches(&a);
     assert_rebuild_matches(&b);
 }
+
+#[test]
+fn a_snoozed_card_in_triage_and_its_acceptance_reach_every_machine() {
+    use rodu_core::service::Triage;
+    let a = Peer::first();
+    let bot = a.svc.create_principal("ann-codex", PrincipalKind::Agent, Some(&a.me.principal_id));
+    let agent =
+        Actor { principal_id: a.me.principal_id.clone(), via_agent_id: Some(bot.unwrap().id) };
+    let made = a.svc.create_items(&agent, "DEMO", &[json!({ "title": "Idea" })], None).unwrap();
+    let snoozed = a.svc.triage(&a.me, &made[0].key, &Triage::Snooze(2)).unwrap();
+    assert!(snoozed.snoozed_until.is_some());
+
+    let b = Peer::join(&a, "bob");
+    let seen = b.svc.item("DEMO-1").unwrap();
+    assert_eq!((seen.status.as_str(), &seen.snoozed_until), ("Triage", &snoozed.snoozed_until));
+    b.svc.triage(&b.me, "DEMO-1", &Triage::Accept).unwrap();
+    exchange(&a, &b);
+    let accepted = a.svc.item("DEMO-1").unwrap();
+    assert_eq!((accepted.status.as_str(), accepted.snoozed_until), ("Backlog", None));
+    assert_eq!(a.dump(), b.dump());
+    assert_rebuild_matches(&a);
+    assert_rebuild_matches(&b);
+}
