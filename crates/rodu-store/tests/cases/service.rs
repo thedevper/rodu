@@ -184,6 +184,142 @@ fn a_snoozed_card_comes_back_to_triage_on_its_wake_date() {
 }
 
 #[test]
+fn tidy_finds_backlog_cards_with_no_activity_and_acts_only_when_applied() {
+    use rodu_core::service::Triage;
+    use rodu_core::tidy::parse_rules;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let (store, _guard) = memory_store();
+    let days = Arc::new(AtomicI64::new(0));
+    let clock = days.clone();
+    let service = RoduService::with_clock(
+        store,
+        Arc::new(move || {
+            datetime!(2020-01-02 09:00 UTC) + time::Duration::days(clock.load(Ordering::SeqCst))
+        }),
+    );
+    let human = service.create_principal("bob", PrincipalKind::Human, None).unwrap();
+    let bot = service.create_principal("bob-codex", PrincipalKind::Agent, Some(&human.id)).unwrap();
+    let bob = Actor { principal_id: human.id.clone(), via_agent_id: None };
+    let agent = Actor { principal_id: human.id.clone(), via_agent_id: Some(bot.id) };
+    service.create_collection(&bob, "OPS", "Ops").unwrap();
+    service.create_cycle(&bob, "OPS", "Sprint 1", None, None).unwrap();
+    service
+        .create_items(
+            &bob,
+            "OPS",
+            &[
+                json!({ "title": "Stale" }),
+                json!({ "title": "Due", "dueAt": "2020-06-01" }),
+                json!({ "title": "Sprint", "cycle": "Sprint 1" }),
+                json!({ "title": "Blocked" }),
+                json!({ "title": "Talked about" }),
+                json!({ "title": "Urgent", "priority": "urgent" }),
+            ],
+            None,
+        )
+        .unwrap();
+    service.link(&bob, "OPS-1", "blocks", "OPS-4").unwrap();
+    service.create_collection(&bob, "WEB", "Web").unwrap();
+    service.create_items(&bob, "WEB", &items(&["Elsewhere"]), None).unwrap();
+    service.create_items(&agent, "OPS", &items(&["Agent idea", "Sleepy"]), None).unwrap();
+    days.store(20, Ordering::SeqCst);
+    service.comment(&bob, "OPS-5", "Still wanted").unwrap();
+    service.triage(&bob, "OPS-8", &Triage::Snooze(30)).unwrap();
+    days.store(40, Ordering::SeqCst);
+
+    let rules = parse_rules(
+        r#"{"rules": [{"name": "nudge", "collection": "OPS", "stale_after": "30d",
+            "exempt": "priority = urgent", "action": "comment"}]}"#,
+    )
+    .unwrap();
+    let keys = |r: &rodu_core::tidy::TidyReport| -> Vec<String> {
+        r.cards.iter().map(|(i, _)| i.key.clone()).collect()
+    };
+    // A dry run lists, writes nothing, and makes no agent for the rule.
+    let dry = service.tidy(&bob, &rules, false).unwrap();
+    assert_eq!(keys(&dry[0]), ["OPS-1"], "due, cycle, blocked, commented, exempt and Triage stay");
+    assert_eq!(dry[0].stuck_in_triage, 1, "the agent's card waits; the snoozed one sleeps");
+    assert_eq!(service.store.list_comments(&dry[0].cards[0].0.id).unwrap().len(), 0);
+    assert!(service.store.find_principal("bob-tidy-nudge").unwrap().is_none());
+    // An exempt on a field the card leaves empty does not exempt the card.
+    let mine = parse_rules(
+        r#"{"rules": [{"name": "nudge", "collection": "OPS", "stale_after": "30d",
+            "exempt": "priority = urgent OR assignee = bob", "action": "comment"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(keys(&service.tidy(&bob, &mine, false).unwrap()[0]), ["OPS-1"]);
+
+    // An exempt that would break out of its parentheses is refused before anything runs.
+    let escape = parse_rules(
+        r#"{"rules": [{"name": "nudge", "collection": "OPS", "stale_after": "30d",
+            "exempt": "priority = urgent) OR (collection = WEB", "action": "comment"}]}"#,
+    )
+    .unwrap();
+    let refused = err(service.tidy(&bob, &escape, false));
+    assert!(refused.message.contains("exempt of the rule nudge"), "{}", refused.message);
+
+    // Applied, the rule comments once, as itself; a second run finds it done.
+    let applied = service.tidy(&bob, &rules, true).unwrap();
+    assert_eq!(keys(&applied[0]), ["OPS-1"]);
+    let comments = service.store.list_comments(&applied[0].cards[0].0.id).unwrap();
+    let rule_agent = service.store.find_principal("bob-tidy-nudge").unwrap().unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0].via_agent_id.as_deref(), Some(rule_agent.id.as_str()));
+    let again = service.tidy(&bob, &rules, true).unwrap();
+    assert!(again[0].cards.is_empty());
+    // Another rule's nudge is not activity either, even when that rule is gone from the file.
+    let renamed = parse_rules(
+        r#"{"rules": [{"name": "poke", "collection": "OPS", "stale_after": "30d",
+            "exempt": "priority = urgent", "action": "flag"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(keys(&service.tidy(&bob, &renamed, false).unwrap()[0]), ["OPS-1"]);
+    assert_eq!(again[0].already.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(), ["OPS-1"]);
+    assert_eq!(service.store.list_comments(&comments[0].item_id).unwrap().len(), 1);
+
+    // Two rules that plan to close the same card close it once.
+    let twice = parse_rules(
+        r#"{"rules": [{"name": "first", "collection": "WEB", "stale_after": "30d", "action": "close"},
+            {"name": "second", "collection": "WEB", "stale_after": "30d", "action": "close"}]}"#,
+    )
+    .unwrap();
+    let closed_twice = service.tidy(&bob, &twice, true).unwrap();
+    assert_eq!((keys(&closed_twice[0]), closed_twice[1].cards.len()), (vec!["WEB-1".into()], 0));
+    let web = service.item("WEB-1").unwrap();
+    assert_eq!(service.store.list_comments(&web.id).unwrap().len(), 1);
+    // A close rule does not count the nudge as activity, and moves the card as the rule.
+    let both = parse_rules(
+        r#"{"rules": [
+            {"name": "nudge", "collection": "OPS", "stale_after": "30d", "action": "comment"},
+            {"name": "close", "stale_after": "35d", "exempt": "priority = urgent", "action": "close"}]}"#,
+    )
+    .unwrap();
+    service.tidy(&bob, &both, true).unwrap();
+    let closed = service.item("OPS-1").unwrap();
+    assert_eq!(closed.status, "Canceled");
+    let closer = service.store.find_principal("bob-tidy-close").unwrap().unwrap();
+    let said = service.store.list_comments(&closed.id).unwrap();
+    assert_eq!(said.last().unwrap().via_agent_id.as_deref(), Some(closer.id.as_str()));
+    assert!(said.last().unwrap().body.contains("rodu mv OPS-1"), "{said:?}");
+    // Its blocker closed, OPS-4 is now stale too; after that, nothing is done twice.
+    assert_eq!(keys(&service.tidy(&bob, &both, true).unwrap()[1]), ["OPS-4"]);
+    assert!(service.tidy(&bob, &both, true).unwrap()[1].cards.is_empty(), "nothing twice");
+
+    // A rule that fails stops the whole run before anything changes.
+    service.create_items(&bob, "OPS", &items(&["Fresh"]), None).unwrap();
+    days.store(90, Ordering::SeqCst);
+    let broken = parse_rules(
+        r#"{"rules": [
+            {"name": "nudge", "stale_after": "30d", "action": "comment"},
+            {"name": "bad", "stale_after": "30d", "exempt": "nonsense ~~ 1", "action": "close"}]}"#,
+    )
+    .unwrap();
+    assert!(service.tidy(&bob, &broken, true).is_err());
+    let fresh = service.item("OPS-9").unwrap();
+    assert_eq!(service.store.list_comments(&fresh.id).unwrap().len(), 0);
+}
+
+#[test]
 fn refuses_blocking_cycles() {
     let f = fixture();
     f.service.create_items(&f.alice, "DEMO", &items(&["A", "B", "C"]), None).unwrap();

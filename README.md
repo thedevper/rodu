@@ -71,6 +71,7 @@ rodu show DEMO-1
 rodu show DEMO-1 --activity   # also who changed what and when
 rodu mv DEMO-1 "In Progress"
 rodu triage     # the cards an agent made, waiting for you
+rodu tidy       # what your stale rules would do (--apply to do it)
 rodu web        # opens the board in your browser
 ```
 
@@ -179,6 +180,21 @@ decides: `rodu triage` lists them, oldest first; `rodu triage accept DEMO-4` mov
 `decline` cancels it, `duplicate DEMO-4 DEMO-1` cancels it as a duplicate of DEMO-1, and
 `snooze DEMO-4 --days 7` hides it from the list until then (the `triage` MCP tool does the same).
 Cards you create yourself start in Backlog as before.
+
+`rodu tidy` runs the stale rules in `.rodu/tidy.json` against backlog cards with no activity
+(no change and no comment) for a while:
+
+```json
+{"rules": [
+  {"name": "nudge", "stale_after": "30d", "action": "comment"},
+  {"name": "close", "stale_after": "60d", "exempt": "priority = urgent", "action": "close"}
+]}
+```
+
+`action` is `flag`, `comment` or `close`, and `exempt` is JQL for cards to leave alone. Cards with a
+due date, in a cycle, blocked or in Triage are always left alone. On its own, `rodu tidy` only
+shows what it would do; `rodu tidy --apply` does it, as the rule (`you-tidy-close`), so the history
+says which rule closed a card. Running it again does nothing twice (ADR 0010).
 
 `get_activity` (or
 `rodu show --activity`, or Activity on a card in `rodu web`) lists who changed what on a card and

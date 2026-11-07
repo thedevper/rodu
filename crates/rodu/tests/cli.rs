@@ -590,3 +590,39 @@ async fn triage_lists_an_agents_cards_and_a_person_decides_on_them() {
     assert_eq!(cli(cwd, &["triage", "frob"]).await.code, 1);
     assert_eq!(cli(cwd, &["ls", "status = Triage"]).await.out.len(), 1);
 }
+
+#[tokio::test]
+async fn tidy_reads_its_rules_and_only_shows_until_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    init(cwd).await;
+    let missing = cli(cwd, &["tidy"]).await;
+    assert_eq!(missing.code, 1);
+    assert!(missing.err.join("\n").contains("tidy.json"), "{:?}", missing.err);
+
+    let rules = cwd.join(".rodu").join("tidy.json");
+    let close = r#"{"rules": [{"name": "stale", "stale_after": "30d", "action": "close"}]}"#;
+    std::fs::write(&rules, close).unwrap();
+    assert_eq!(cli(cwd, &["add", "Fresh"]).await.code, 0);
+    let dry = cli(cwd, &["tidy"]).await;
+    assert_eq!(
+        dry.out,
+        [
+            "Dry run: nothing was changed. rodu tidy --apply does what it lists.",
+            "rule stale (no activity for 30 days): would close 0 cards",
+        ]
+    );
+    let applied = cli(cwd, &["tidy", "--apply"]).await;
+    assert_eq!(applied.out, ["rule stale (no activity for 30 days): closed 0 cards"]);
+    assert_eq!(cli(cwd, &["tidy", "--apply", "--dry-run"]).await.code, 1);
+    let elsewhere = cli(cwd, &["add", "Other", "--dry-run"]).await;
+    assert_eq!(
+        (elsewhere.code, elsewhere.last_err()),
+        (1, "error: --dry-run is only for rodu tidy")
+    );
+
+    std::fs::write(&rules, close.replace("30d", "30")).unwrap();
+    let bad = cli(cwd, &["tidy"]).await;
+    assert_eq!(bad.code, 1);
+    assert!(bad.last_err().contains("stale_after"), "{:?}", bad.err);
+}
