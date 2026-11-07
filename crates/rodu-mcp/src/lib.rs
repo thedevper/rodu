@@ -51,23 +51,29 @@ pub async fn serve_stdio<S: Store + Send + 'static>(
     service: RoduService<S>,
     actor: Actor,
 ) -> Result<(), ServeError> {
-    serve_stdio_live(service, actor, None).await
+    serve(RoduMcp::new(service, actor)).await
+}
+
+async fn serve<S: Store + Send + 'static>(server: RoduMcp<S>) -> Result<(), ServeError> {
+    let running = server.serve(rmcp::transport::stdio()).await?;
+    running.waiting().await?;
+    Ok(())
 }
 
 /// [`serve_stdio`], taking in teammates' changes before each tool call and sending this
-/// replica's after it when `live` is given.
+/// replica's after it when `live` is given, and writing as the agent the client is (see
+/// [`RoduMcp::naming_agents`]).
 pub async fn serve_stdio_live<S: Store + Send + 'static>(
     service: RoduService<S>,
     actor: Actor,
     live: Option<Arc<dyn LiveSync<S>>>,
+    agent: Option<String>,
 ) -> Result<(), ServeError> {
-    let mut server = RoduMcp::new(service, actor);
+    let mut server = RoduMcp::new(service, actor).naming_agents(agent);
     if let Some(live) = live {
         server = server.with_live(live);
     }
-    let running = server.serve(rmcp::transport::stdio()).await?;
-    running.waiting().await?;
-    Ok(())
+    serve(server).await
 }
 
 /// The MCP server handler. A store need not be `Sync`, so the service sits behind a mutex and
@@ -76,6 +82,13 @@ pub struct RoduMcp<S: Store> {
     service: Arc<Mutex<RoduService<S>>>,
     actor: Actor,
     live: Option<Arc<Live<S>>>,
+    naming: Option<Arc<Naming>>,
+}
+
+/// Which agent this session writes as (ADR 0008): the one named, else the client's.
+struct Naming {
+    named: Option<String>,
+    actor: Mutex<Option<Actor>>,
 }
 
 impl<S: Store> Clone for RoduMcp<S> {
@@ -84,6 +97,7 @@ impl<S: Store> Clone for RoduMcp<S> {
             service: Arc::clone(&self.service),
             actor: self.actor.clone(),
             live: self.live.clone(),
+            naming: self.naming.clone(),
         }
     }
 }
@@ -96,7 +110,47 @@ enum Output {
 
 impl<S: Store + Send + 'static> RoduMcp<S> {
     pub fn new(service: RoduService<S>, actor: Actor) -> Self {
-        Self { service: Arc::new(Mutex::new(service)), actor, live: None }
+        Self { service: Arc::new(Mutex::new(service)), actor, live: None, naming: None }
+    }
+
+    /// Writes as an agent of its own under the actor's person (ADR 0008): the one `named` (from
+    /// `RODU_AGENT`), else the one the MCP client's name gives, made on the first tool call. A
+    /// client name that cannot be an agent's falls back to the actor's own agent; a bad `named`
+    /// fails each call, so a wrong setting is seen.
+    pub fn naming_agents(mut self, named: Option<String>) -> Self {
+        self.naming = Some(Arc::new(Naming { named, actor: Mutex::new(None) }));
+        self
+    }
+
+    /// The actor this session writes as: settled once, then kept.
+    fn session_actor(
+        &self,
+        service: &RoduService<S>,
+        client: Option<&str>,
+    ) -> Result<Actor, RoduError> {
+        let Some(naming) = &self.naming else { return Ok(self.actor.clone()) };
+        let mut slot =
+            naming.actor.lock().map_err(|_| RoduError::internal("agent lock poisoned"))?;
+        if let Some(actor) = &*slot {
+            return Ok(actor.clone());
+        }
+        let person = &self.actor.principal_id;
+        let agent = match (&naming.named, client) {
+            (Some(named), _) => Some(service.agent_for(person, named)?),
+            // Only a name that cannot be an agent's falls back; a storage failure fails the call,
+            // and the next call tries again.
+            (None, Some(client)) => match service.agent_for(person, client) {
+                Err(e) if matches!(e.code, ErrorCode::Invalid | ErrorCode::Conflict) => None,
+                found => Some(found?),
+            },
+            (None, None) => None,
+        };
+        let actor = match agent {
+            Some(agent) => Actor { principal_id: person.clone(), via_agent_id: Some(agent.id) },
+            None => self.actor.clone(),
+        };
+        *slot = Some(actor.clone());
+        Ok(actor)
     }
 
     /// Pulls before each tool call and pushes after it, each under the service lock.
@@ -131,12 +185,19 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
 
     /// Runs a tool under one hold of the service lock: with live sync, a pull before it and a push
     /// after it, so no other tool call or sync step lands in between.
-    fn call(&self, name: &str, args: &JsonObject) -> Result<Output, RoduError> {
+    fn call(
+        &self,
+        name: &str,
+        args: &JsonObject,
+        client: Option<&str>,
+    ) -> Result<Output, RoduError> {
         self.with_service(|service| {
             if let Some(live) = &self.live {
                 live.pull(service);
             }
-            let outcome = self.run(service, name, args);
+            let outcome = self
+                .session_actor(service, client)
+                .and_then(|actor| self.run(service, &actor, name, args));
             if let Some(live) = &self.live {
                 live.push(service);
             }
@@ -147,11 +208,11 @@ impl<S: Store + Send + 'static> RoduMcp<S> {
     fn run(
         &self,
         service: &RoduService<S>,
+        actor: &Actor,
         name: &str,
         args: &JsonObject,
     ) -> Result<Output, RoduError> {
         let args = Args { tool: name, map: args };
-        let actor = &self.actor;
         match name {
             "search" => {
                 let query = args.string_or("query", 0, 2000, "")?;
@@ -781,7 +842,9 @@ fn schema_text<S: Store>(service: &RoduService<S>) -> Result<String, RoduError> 
         "# JQL-lite
 
 Fields: key, title, body, text (full text), type, status, category, priority, estimate,
-assignee, reporter, collection, cycle (sprint), parent, created, updated, due.
+assignee, reporter, creator, collection, cycle (sprint), parent, created, updated, due.
+creator matches who made a card or the agent it went through: creator = <agent name> finds that
+agent's cards, creator = me() yours through any agent.
 Operators: = != ~ !~ < <= > >= IN (...) NOT IN (...) IS EMPTY, IS NOT EMPTY; combine with AND, OR, NOT, ( ).
 Values: \"quoted text\", bare words, numbers, dates (2026-01-31), offsets (-7d, -2w, 3h),
 me(), currentCycle(), now(), today().
@@ -814,11 +877,13 @@ impl<S: Store + Send + 'static> ServerHandler for RoduMcp<S> {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
-        let outcome = self.blocking(move |server| server.call(&name, &args)).await;
+        let client = context.peer.peer_info().map(|info| info.client_info.name.clone());
+        let outcome =
+            self.blocking(move |server| server.call(&name, &args, client.as_deref())).await;
         Ok(tool_result(outcome).into())
     }
 

@@ -77,7 +77,8 @@ rodu web        # opens the board in your browser
 nearest `.rodu/` above the working directory, or `$RODU_DIR`.
 
 A card has an assignee, who does it, and a reporter, who raised it: whoever creates it unless
-`rodu add --reporter <name>` says otherwise. `rodu edit` changes either on existing cards.
+`rodu add --reporter <name>` says otherwise. `rodu edit` changes either on existing cards. It also
+keeps who created it, which nobody edits (`rodu show` prints `created by:`).
 
 A workspace can hold several collections, each with its own card numbers (DEMO-1, OPS-1):
 `rodu collection add OPS --title "Operations"`, the **+** beside the collection list on the board,
@@ -165,7 +166,13 @@ claude mcp add rodu -- rodu mcp
 
 Tools: `search`, `get_my_work`, `get_context`, `get_activity`, `get_audit`, `create_items`, `update_item`, `transition`,
 `comment`, `link`, `list_collections`, `create_collection`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
-Every change an agent makes is recorded as "owner via agent", and `get_activity` (or
+Every change an agent makes is recorded as "owner via agent". Each agent has a name of its own
+under you: `ann-claude-code` for the MCP client called `claude-code`, or what `RODU_AGENT` says
+(`RODU_AGENT=codex` makes `ann-codex`). The CLI does the same when an agent runs it from a shell:
+`rodu add` in Claude Code's shell is `ann via ann-claude-code`, and any other agent's shell says
+who it is with `RODU_AGENT`. A person at a terminal is just `ann`. `creator = ann-claude-code`
+finds the cards that agent made, and `creator = me()` everything you made, through any agent.
+`get_activity` (or
 `rodu show --activity`, or Activity on a card in `rodu web`) lists who changed what on a card and
 when. In a team it lists every machine's changes, read from the team's shared history: times are
 each machine's own clock, so one that runs ahead shows as "before" the moment yours received it.
@@ -185,10 +192,12 @@ assignee = me() AND category != done AND updated > -7d ORDER BY priority
 text ~ "login" AND type IN (bug, story)
 cycle = currentCycle() AND assignee IS EMPTY
 reporter = me() AND category != done
+creator = ann-claude-code AND created > -1d
 ```
 
 Fields: key, title, body, text, type, status, category, priority, estimate, assignee, reporter,
-collection, cycle, parent, created, updated, due.
+creator, collection, cycle, parent, created, updated, due. `creator` is the person who made the
+card, or the agent it went through: `creator = ann` matches both.
 
 ## Build from source
 

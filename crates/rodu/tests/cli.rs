@@ -198,6 +198,42 @@ async fn reports_unknown_options_and_commands_with_usage() {
 }
 
 #[tokio::test]
+async fn an_agent_in_the_shell_writes_as_its_own_agent_under_the_person() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    init(cwd).await;
+    let as_env = |name: &'static str, value: &str| Extra {
+        env: vec![(name, value.to_owned())],
+        ..Extra::default()
+    };
+    assert_eq!(cli(cwd, &["add", "By hand"]).await.code, 0);
+    // Claude Code's shell says CLAUDECODE=1; RODU_AGENT names any other agent, and wins.
+    let coded = cli_with(cwd, &["add", "From Claude Code"], as_env("CLAUDECODE", "1")).await;
+    assert_eq!(coded.out, ["DEMO-2 [Backlog] From Claude Code"]);
+    let named = cli_with(cwd, &["add", "From Codex"], as_env("RODU_AGENT", "Codex")).await;
+    assert_eq!(named.code, 0);
+    let moved = cli_with(cwd, &["mv", "DEMO-1", "Todo"], as_env("RODU_AGENT", "codex")).await;
+    assert_eq!(moved.code, 0);
+
+    assert_eq!(
+        cli(cwd, &["ls", "creator = alice-claude-code"]).await.out,
+        ["DEMO-2 [Backlog] From Claude Code · reporter alice via alice-claude-code"]
+    );
+    assert_eq!(cli(cwd, &["ls", "creator = me()"]).await.out.len(), 3);
+    let shown = cli(cwd, &["show", "DEMO-3"]).await.last_out().to_owned();
+    assert!(shown.contains("- created by: alice via alice-codex"), "{shown}");
+    let history = cli(cwd, &["show", "DEMO-1", "--activity"]).await.last_out().to_owned();
+    assert!(history.contains("via alice-codex"), "{history}");
+    // Reading makes no agent: only a write does.
+    let read = cli_with(cwd, &["ls"], as_env("RODU_AGENT", "reader")).await;
+    assert_eq!(read.code, 0);
+    assert!(cli(cwd, &["ls", "creator = alice-reader"]).await.out.is_empty());
+    let bad = cli_with(cwd, &["add", "Nope"], as_env("RODU_AGENT", "--")).await;
+    assert_eq!(bad.code, 1);
+    assert!(bad.last_err().contains("RODU_AGENT"), "{:?}", bad.err);
+}
+
+#[tokio::test]
 async fn sets_and_changes_who_does_and_who_reported_an_item() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();

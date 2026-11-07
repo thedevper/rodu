@@ -13,6 +13,8 @@ pub struct ContextParts {
     pub assignee: Option<String>,
     /// The reporter as [`crate::RoduService::reporter_label`] gives it.
     pub reporter: Option<String>,
+    /// Who created the card, as [`crate::RoduService::creator_label`] gives it.
+    pub creator: Option<String>,
     pub parent: Option<Item>,
     pub children: Vec<Item>,
     pub cycle: Option<Cycle>,
@@ -90,6 +92,7 @@ pub fn format_context(parts: &ContextParts, max_chars: usize) -> String {
         ),
         format!("- assignee: {}", parts.assignee.as_deref().unwrap_or("unassigned")),
         format!("- reporter: {}", parts.reporter.as_deref().unwrap_or("unknown")),
+        format!("- created by: {}", parts.creator.as_deref().unwrap_or("unknown")),
         format!("- estimate: {}; due: {}", or_none(item.estimate), or_none(item.due_at.as_ref())),
         format!(
             "- cycle: {}",

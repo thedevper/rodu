@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::compile::{CompileContext, compile_query};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE principals (
@@ -101,6 +101,8 @@ CREATE TABLE items (
   assignee_id TEXT REFERENCES principals(id),
   reporter_id TEXT REFERENCES principals(id),
   reporter_via_agent_id TEXT REFERENCES principals(id),
+  creator_id TEXT REFERENCES principals(id),
+  creator_via_agent_id TEXT REFERENCES principals(id),
   parent_id TEXT REFERENCES items(id),
   cycle_id TEXT REFERENCES cycles(id),
   estimate REAL,
@@ -117,6 +119,7 @@ const ITEMS_INDEXES: &str = "
 CREATE INDEX items_rank ON items (collection_id, rank);
 CREATE INDEX items_assignee ON items (assignee_id);
 CREATE INDEX items_reporter ON items (reporter_id);
+CREATE INDEX items_creator ON items (creator_id);
 CREATE INDEX items_cycle ON items (cycle_id);
 CREATE INDEX items_parent ON items (parent_id);
 ";
@@ -140,6 +143,22 @@ UPDATE items SET
   version = version + 1
 FROM first
 WHERE items.id = first.target_id AND items.reporter_id IS NULL
+  AND first.actor_id IN (SELECT id FROM principals);
+";
+
+/// Gives each card without a creator the person and agent of the first `item.create` event this
+/// machine recorded for it, when that person is still known (ADR 0008).
+const BACKFILL_CREATORS: &str = "
+WITH first AS (
+  SELECT e.target_id, e.actor_id, e.via_agent_id FROM events e
+  WHERE e.action = 'item.create' AND e.seq = (
+    SELECT min(f.seq) FROM events f WHERE f.target_id = e.target_id AND f.action = 'item.create')
+)
+UPDATE items SET
+  creator_id = first.actor_id,
+  creator_via_agent_id = (SELECT id FROM principals WHERE id = first.via_agent_id)
+FROM first
+WHERE items.id = first.target_id AND items.creator_id IS NULL
   AND first.actor_id IN (SELECT id FROM principals);
 ";
 
@@ -208,6 +227,8 @@ pub(crate) fn to_item(r: &Row<'_>) -> rusqlite::Result<Item> {
         assignee_id: r.get("assignee_id")?,
         reporter_id: r.get("reporter_id")?,
         reporter_via_agent_id: r.get("reporter_via_agent_id")?,
+        creator_id: r.get("creator_id")?,
+        creator_via_agent_id: r.get("creator_via_agent_id")?,
         parent_id: r.get("parent_id")?,
         cycle_id: r.get("cycle_id")?,
         estimate: r.get("estimate")?,
@@ -306,7 +327,39 @@ impl SqliteStore {
         if (1..=2).contains(&version) {
             self.migrate_to_3()?;
         }
+        if (1..=3).contains(&version) {
+            self.migrate_to_4()?;
+        }
         Ok(())
+    }
+
+    /// Schema 3 -> 4: cards keep who created them (ADR 0008), filled in, as the reporter was, from
+    /// this machine's `item.create` events. It never changes a card's version: nobody edited it.
+    fn migrate_to_4(&self) -> Result<()> {
+        self.transaction(TxMode::Write, || {
+            // Files rebuilt by the step to 2 have the current table, with the columns already.
+            let has: i64 = self
+                .one(
+                    "SELECT count(*) FROM pragma_table_info('items') WHERE name = 'creator_id'",
+                    [],
+                    |r| r.get(0),
+                )?
+                .unwrap_or(0);
+            if has == 0 {
+                self.conn
+                    .execute_batch(
+                        "ALTER TABLE items ADD COLUMN creator_id TEXT REFERENCES principals(id);
+                         ALTER TABLE items ADD COLUMN creator_via_agent_id TEXT
+                           REFERENCES principals(id);",
+                    )
+                    .map_err(db)?;
+            }
+            self.conn
+                .execute_batch("CREATE INDEX IF NOT EXISTS items_creator ON items (creator_id);")
+                .map_err(db)?;
+            self.conn.execute_batch(BACKFILL_CREATORS).map_err(db)?;
+            self.conn.pragma_update(None, "user_version", 4).map_err(db)
+        })
     }
 
     /// Schema 2 -> 3: cards get a reporter (ADR 0007). A card this machine recorded creating gets
@@ -546,8 +599,9 @@ impl Store for SqliteStore {
         self.run(
             "INSERT INTO items (id, collection_id, number, key, provisional_key, type, title, body,
               status, category, priority, assignee_id, reporter_id, reporter_via_agent_id,
-              parent_id, cycle_id, estimate, rank, due_at, created_at, updated_at, version)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              creator_id, creator_via_agent_id, parent_id, cycle_id, estimate, rank, due_at,
+              created_at, updated_at, version)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 i.id,
                 i.collection_id,
@@ -563,6 +617,8 @@ impl Store for SqliteStore {
                 i.assignee_id,
                 i.reporter_id,
                 i.reporter_via_agent_id,
+                i.creator_id,
+                i.creator_via_agent_id,
                 i.parent_id,
                 i.cycle_id,
                 i.estimate,
@@ -600,8 +656,9 @@ impl Store for SqliteStore {
         let changed = self.run(
             "UPDATE items SET number = ?, key = ?, type = ?, title = ?, body = ?, status = ?,
               category = ?, priority = ?, assignee_id = ?, reporter_id = ?,
-              reporter_via_agent_id = ?, parent_id = ?, cycle_id = ?, estimate = ?, rank = ?,
-              due_at = ?, updated_at = ?, version = ? WHERE id = ? AND version = ?",
+              reporter_via_agent_id = ?, creator_id = ?, creator_via_agent_id = ?, parent_id = ?,
+              cycle_id = ?, estimate = ?, rank = ?, due_at = ?, updated_at = ?, version = ?
+              WHERE id = ? AND version = ?",
             params![
                 i.number,
                 i.key,
@@ -614,6 +671,8 @@ impl Store for SqliteStore {
                 i.assignee_id,
                 i.reporter_id,
                 i.reporter_via_agent_id,
+                i.creator_id,
+                i.creator_via_agent_id,
                 i.parent_id,
                 i.cycle_id,
                 i.estimate,

@@ -139,8 +139,9 @@ impl SqliteStore {
         self.run(
             "INSERT INTO items (id, collection_id, number, key, provisional_key, type, title, body,
                status, category, priority, assignee_id, reporter_id, reporter_via_agent_id,
-               parent_id, cycle_id, estimate, rank, due_at, created_at, updated_at, version)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               creator_id, creator_via_agent_id, parent_id, cycle_id, estimate, rank, due_at,
+               created_at, updated_at, version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET collection_id = excluded.collection_id,
                number = excluded.number, key = excluded.key,
                provisional_key = excluded.provisional_key, type = excluded.type,
@@ -148,6 +149,8 @@ impl SqliteStore {
                category = excluded.category, priority = excluded.priority,
                assignee_id = excluded.assignee_id, reporter_id = excluded.reporter_id,
                reporter_via_agent_id = excluded.reporter_via_agent_id,
+               creator_id = excluded.creator_id,
+               creator_via_agent_id = excluded.creator_via_agent_id,
                parent_id = excluded.parent_id,
                cycle_id = excluded.cycle_id, estimate = excluded.estimate, rank = excluded.rank,
                due_at = excluded.due_at, created_at = excluded.created_at,
@@ -167,6 +170,8 @@ impl SqliteStore {
                 i.assignee_id,
                 i.reporter_id,
                 i.reporter_via_agent_id,
+                i.creator_id,
+                i.creator_via_agent_id,
                 i.parent_id,
                 i.cycle_id,
                 i.estimate,
@@ -418,8 +423,9 @@ impl SqliteStore {
             "SELECT 'c', id, key, name, preset, workflow, created_at FROM collections ORDER BY id",
             "SELECT 'y', id, collection_id, name, starts_on, ends_on, state FROM cycles ORDER BY id",
             "SELECT 'i', id, collection_id, number, key, provisional_key, type, title, body, status,
-               category, priority, assignee_id, reporter_id, reporter_via_agent_id, parent_id,
-               cycle_id, estimate, rank, due_at, created_at, updated_at FROM items ORDER BY id",
+               category, priority, assignee_id, reporter_id, reporter_via_agent_id, creator_id,
+               creator_via_agent_id, parent_id, cycle_id, estimate, rank, due_at, created_at,
+               updated_at FROM items ORDER BY id",
             "SELECT 'm', id, item_id, author_id, via_agent_id, body, created_at
                FROM comments ORDER BY id",
             "SELECT 'l', from_item_id, kind, target, created_at FROM links

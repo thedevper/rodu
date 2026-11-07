@@ -41,7 +41,7 @@ fn upgrades_a_version_1_workspace_and_keeps_every_row() {
     assert_eq!(card[0].number, None);
     drop(offline);
 
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), 4);
     let conn = Connection::open(&path).unwrap();
     let broken: i64 =
         conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
@@ -53,7 +53,14 @@ fn upgrades_a_version_1_workspace_and_keeps_every_row() {
         stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(
         indexes,
-        ["items_assignee", "items_cycle", "items_parent", "items_rank", "items_reporter"]
+        [
+            "items_assignee",
+            "items_creator",
+            "items_cycle",
+            "items_parent",
+            "items_rank",
+            "items_reporter"
+        ]
     );
 }
 
@@ -71,7 +78,7 @@ fn upgrades_a_version_1_workspace_whose_keys_differ_only_by_case() {
         )
         .unwrap();
     let service = RoduService::new(SqliteStore::open(&path).unwrap());
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), 4);
     assert_eq!(service.item("demo-1").unwrap().id, "i-1");
 }
 
@@ -123,7 +130,7 @@ fn upgrades_a_version_2_workspace_giving_cards_the_reporter_of_their_events() {
         )
         .unwrap();
     let service = RoduService::new(SqliteStore::open(&path).unwrap());
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), 4);
 
     let task = service.item("DEMO-2").unwrap();
     assert_eq!(task.reporter_id.as_deref(), Some("p-ann"));
@@ -136,6 +143,15 @@ fn upgrades_a_version_2_workspace_giving_cards_the_reporter_of_their_events() {
     let ann = Actor { principal_id: "p-ann".into(), via_agent_id: None };
     let found = service.search(&ann, "reporter = me()", None, None).unwrap();
     assert_eq!(found.items.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(), ["DEMO-2"]);
+    // The same events give each card its creator (ADR 0008), without counting as an edit.
+    assert_eq!(task.creator_id.as_deref(), Some("p-ann"));
+    assert_eq!(task.creator_via_agent_id.as_deref(), Some("p-bot"));
+    assert_eq!(epic.creator_id, None);
+    for query in ["creator = me()", "creator = ann-agent"] {
+        let found = service.search(&ann, query, None, None).unwrap();
+        let keys: Vec<&str> = found.items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["DEMO-2"], "{query}");
+    }
     let broken: i64 = Connection::open(&path)
         .unwrap()
         .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
@@ -156,7 +172,7 @@ fn opening_a_current_workspace_again_changes_nothing() {
 
     let again = RoduService::new(SqliteStore::open(&path).unwrap());
     assert_eq!(again.item("DEMO-1").unwrap().title, "Kept");
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), 4);
 }
 
 #[test]
