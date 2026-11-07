@@ -376,7 +376,8 @@ fn render<S: Store>(service: &RoduService<S>) -> Result<BTreeMap<String, String>
     service.store.transaction(TxMode::Read, || {
         let names: HashMap<String, String> =
             service.store.list_principals()?.into_iter().map(|p| (p.id, p.name)).collect();
-        let mut collections = service.store.list_collections()?;
+        // Through the service, so a collection made before Triage still lists its Triage cards.
+        let mut collections = service.list_collections()?;
         collections.sort_by(|a, b| a.key.cmp(&b.key));
         let items = all_items(service)?;
         let keys: HashMap<&str, &str> =
@@ -592,6 +593,7 @@ mod tests {
             reporter_via_agent_id: Some("a2".into()),
             creator_id: None,
             creator_via_agent_id: None,
+            snoozed_until: None,
             parent_id: Some("i0".into()),
             cycle_id: Some("y1".into()),
             estimate: Some(2.5),

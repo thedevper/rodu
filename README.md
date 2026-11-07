@@ -70,6 +70,7 @@ rodu edit DEMO-1 DEMO-2 --assignee ann --reporter me   # none clears either
 rodu show DEMO-1
 rodu show DEMO-1 --activity   # also who changed what and when
 rodu mv DEMO-1 "In Progress"
+rodu triage     # the cards an agent made, waiting for you
 rodu web        # opens the board in your browser
 ```
 
@@ -165,13 +166,20 @@ claude mcp add rodu -- rodu mcp
 ```
 
 Tools: `search`, `get_my_work`, `get_context`, `get_activity`, `get_audit`, `create_items`, `update_item`, `transition`,
-`comment`, `link`, `list_collections`, `create_collection`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
+`triage`, `comment`, `link`, `list_collections`, `create_collection`, `cycle_report`, `plan_cycle`; resource `rodu://schema`.
 Every change an agent makes is recorded as "owner via agent". Each agent has a name of its own
 under you: `ann-claude-code` for the MCP client called `claude-code`, or what `RODU_AGENT` says
 (`RODU_AGENT=codex` makes `ann-codex`). The CLI does the same when an agent runs it from a shell:
 `rodu add` in Claude Code's shell is `ann via ann-claude-code`, and any other agent's shell says
 who it is with `RODU_AGENT`. A person at a terminal is just `ann`. `creator = ann-claude-code`
 finds the cards that agent made, and `creator = me()` everything you made, through any agent.
+
+A card an agent creates starts in **Triage**, a column of its own before Backlog, until a person
+decides: `rodu triage` lists them, oldest first; `rodu triage accept DEMO-4` moves one to Backlog,
+`decline` cancels it, `duplicate DEMO-4 DEMO-1` cancels it as a duplicate of DEMO-1, and
+`snooze DEMO-4 --days 7` hides it from the list until then (the `triage` MCP tool does the same).
+Cards you create yourself start in Backlog as before.
+
 `get_activity` (or
 `rodu show --activity`, or Activity on a card in `rodu web`) lists who changed what on a card and
 when. In a team it lists every machine's changes, read from the team's shared history: times are
@@ -196,8 +204,9 @@ creator = ann-claude-code AND created > -1d
 ```
 
 Fields: key, title, body, text, type, status, category, priority, estimate, assignee, reporter,
-creator, collection, cycle, parent, created, updated, due. `creator` is the person who made the
-card, or the agent it went through: `creator = ann` matches both.
+creator, collection, cycle, parent, created, updated, due, snoozed. `creator` is the person who
+made the card, or the agent it went through: `creator = ann` matches both. `snoozed` is the date a
+snoozed Triage card comes back.
 
 ## Build from source
 

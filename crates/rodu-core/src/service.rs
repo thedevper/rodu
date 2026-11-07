@@ -17,12 +17,13 @@ use crate::ids::{format_key, free_provisional_key, is_uuid, stable_id, uuidv7};
 use crate::input::{ItemPatch, NewItem, check_name, parse_date, parse_new_item, parse_patch};
 use crate::model::{
     Actor, Category, Collection, Comment, Cycle, CycleState, Event, Item, Link, LinkKind,
-    Principal, PrincipalKind,
+    Principal, PrincipalKind, State, Workflow,
 };
 use crate::rank::rank_between;
 use crate::store::{SearchRequest, SearchResult, Side, Store, TxMode};
 use crate::workflow::{
-    TransitionSubject, check_transition, dev_workflow, find_state, validate_workflow,
+    TRIAGE, TransitionSubject, check_transition, dev_workflow, find_state, validate_workflow,
+    with_triage,
 };
 
 static PRINCIPAL_NAME: LazyLock<Regex> =
@@ -117,7 +118,43 @@ struct Changes {
     cycle_id: Option<Option<String>>,
     estimate: Option<Option<f64>>,
     due_at: Option<Option<String>>,
+    snoozed_until: Option<Option<String>>,
     rank: Option<String>,
+}
+
+/// What a person decides about a card waiting in Triage (ADR 0009).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Triage {
+    /// Onto the board, in the workflow's initial status.
+    Accept,
+    /// Canceled.
+    Decline,
+    /// Canceled as a duplicate of this card (a key or id).
+    Duplicate(String),
+    /// Out of the triage list for this many days, 1 to 365.
+    Snooze(u32),
+}
+
+/// Refuses a card that is not waiting in Triage, so a triage decision cannot move a card on
+/// the board (ADR 0009).
+pub fn waiting_in_triage(item: &Item) -> Result<()> {
+    if item.status.eq_ignore_ascii_case(TRIAGE) {
+        return Ok(());
+    }
+    Err(RoduError::invalid(format!(
+        "{} is not waiting in {TRIAGE}: it is {}",
+        item.key, item.status
+    ))
+    .with_hint(format!("Use rodu mv to move {} instead", item.key)))
+}
+
+/// Where a new card starts: Triage when it is made through an agent, else the workflow's initial
+/// status (ADR 0009). A check on cards entering Triage, such as finding duplicates, belongs here.
+fn start_state(workflow: &Workflow, actor: &Actor) -> Result<State> {
+    let name = if actor.via_agent_id.is_some() { TRIAGE } else { workflow.initial.as_str() };
+    find_state(workflow, name)
+        .cloned()
+        .ok_or_else(|| RoduError::invalid(format!("Collection workflow has no {name} state")))
 }
 
 /// The single command layer. The CLI, the MCP server and the web API call these methods, so every
@@ -359,7 +396,8 @@ impl<S: Store> RoduService<S> {
     }
 
     pub fn collection(&self, reference: &str) -> Result<Collection> {
-        if let Some(found) = self.store.find_collection(reference)? {
+        if let Some(mut found) = self.store.find_collection(reference)? {
+            found.workflow = with_triage(found.workflow);
             return Ok(found);
         }
         let keys: Vec<String> = self.store.list_collections()?.into_iter().map(|c| c.key).collect();
@@ -371,8 +409,10 @@ impl<S: Store> RoduService<S> {
         Err(RoduError::not_found(format!("No collection \"{reference}\"")).with_hint(hint))
     }
 
+    /// Every collection, its workflow with Triage (ADR 0009).
     pub fn list_collections(&self) -> Result<Vec<Collection>> {
-        self.store.list_collections()
+        let all = self.store.list_collections()?;
+        Ok(all.into_iter().map(|c| Collection { workflow: with_triage(c.workflow), ..c }).collect())
     }
 
     pub fn cycle(&self, collection: &Collection, reference: &str) -> Result<Cycle> {
@@ -624,9 +664,7 @@ impl<S: Store> RoduService<S> {
             .enumerate()
             .map(|(i, input)| parse_new_item(input, &format!("items[{i}]")))
             .collect::<Result<_>>()?;
-        let initial = find_state(&collection.workflow, &collection.workflow.initial)
-            .ok_or_else(|| RoduError::invalid("Collection workflow has no initial state"))?
-            .clone();
+        let initial = start_state(&collection.workflow, actor)?;
         let request = self.new_id();
         let scoped_key =
             idempotency_key.map(|k| format!("{}:create_items:{k}", actor.principal_id));
@@ -707,6 +745,7 @@ impl<S: Store> RoduService<S> {
                     estimate: input.estimate,
                     rank: next_rank,
                     due_at: input.due_at.clone(),
+                    snoozed_until: None,
                     created_at: now.clone(),
                     updated_at: now,
                     version: 1,
@@ -892,9 +931,8 @@ impl<S: Store> RoduService<S> {
         )
     }
 
-    pub fn transition(&self, actor: &Actor, reference: &str, to: &str) -> Result<Item> {
-        let item = self.item(reference)?;
-        let collection = self.collection(&item.collection_id)?;
+    /// The state a card may move to under its workflow's rules, or the rule that refuses it.
+    fn allowed_move(&self, workflow: &Workflow, item: &Item, to: &str) -> Result<State> {
         let links = self.store.list_links(&item.id)?;
         let subject = TransitionSubject {
             key: &item.key,
@@ -902,10 +940,86 @@ impl<S: Store> RoduService<S> {
             assignee_id: item.assignee_id.as_deref(),
             estimate: item.estimate,
         };
-        let target = check_transition(&collection.workflow, &subject, to, &links)?.clone();
+        Ok(check_transition(workflow, &subject, to, &links)?.clone())
+    }
+
+    pub fn transition(&self, actor: &Actor, reference: &str, to: &str) -> Result<Item> {
+        let item = self.item(reference)?;
+        let collection = self.collection(&item.collection_id)?;
+        let target = self.allowed_move(&collection.workflow, &item, to)?;
         self.write(Some(actor), || {
             let changes = Changes {
                 status: Some((target.name.clone(), target.category)),
+                ..Changes::default()
+            };
+            self.write_item(&self.new_id(), actor, &item, changes)
+        })
+    }
+
+    /// The cards waiting in Triage, oldest first, without the ones snoozed past today: at most
+    /// 100, with the total waiting.
+    pub fn triage_list(&self, actor: &Actor, collection: Option<&str>) -> Result<SearchResult> {
+        let scope = match collection {
+            Some(c) => format!("collection = {} AND ", self.collection(c)?.key),
+            None => String::new(),
+        };
+        let query = format!(
+            "{scope}status = {TRIAGE} AND (snoozed IS EMPTY OR snoozed <= today()) ORDER BY created"
+        );
+        self.search(actor, &query, Some(100), None)
+    }
+
+    /// Decides about one card waiting in Triage; any other card is refused (ADR 0009).
+    pub fn triage(&self, actor: &Actor, reference: &str, decision: &Triage) -> Result<Item> {
+        let item = self.item(reference)?;
+        let collection = self.collection(&item.collection_id)?;
+        let workflow = &collection.workflow;
+        waiting_in_triage(&item)?;
+        // (status to move to, wake date, the card it duplicates)
+        let (target, snoozed_until, of) = match decision {
+            Triage::Accept => (Some(workflow.initial.clone()), None, None),
+            Triage::Decline | Triage::Duplicate(_) => {
+                let declined = find_state(workflow, "Canceled")
+                    .or_else(|| workflow.states.iter().find(|s| s.category == Category::Done))
+                    .ok_or_else(|| {
+                        RoduError::invalid("The workflow has no status to decline into")
+                    })?;
+                let of = match decision {
+                    Triage::Duplicate(of) => Some(self.item(of)?),
+                    _ => None,
+                };
+                (Some(declined.name.clone()), None, of)
+            }
+            Triage::Snooze(days @ 1..=365) => {
+                // The UTC day, as today() in a query and the stored timestamps use.
+                let today = self.now().to_offset(time::UtcOffset::UTC).date();
+                let wake = today + time::Duration::days(i64::from(*days));
+                (None, Some(wake.to_string()), None)
+            }
+            Triage::Snooze(_) => return Err(RoduError::invalid("Snooze for 1 to 365 days")),
+        };
+        self.write(Some(actor), || {
+            // A duplicates link made before (by hand or an earlier try) is kept, not refused.
+            if let Some(of) = &of {
+                let linked = self
+                    .store
+                    .list_links(&item.id)?
+                    .iter()
+                    .any(|l| l.kind == LinkKind::Duplicates && l.target == of.id);
+                if !linked {
+                    self.link(actor, &item.id, "duplicates", &of.id)?;
+                }
+            }
+            let status = match &target {
+                Some(to) => {
+                    let state = self.allowed_move(workflow, &item, to)?;
+                    Some((state.name, state.category))
+                }
+                None => None,
+            };
+            let changes = Changes {
+                status,
+                snoozed_until: Some(snoozed_until.clone()),
                 ..Changes::default()
             };
             self.write_item(&self.new_id(), actor, &item, changes)
@@ -1346,6 +1460,14 @@ impl<S: Store> RoduService<S> {
         }
         if let Some(v) = changes.due_at {
             next.due_at = v;
+        }
+        if let Some(v) = changes.snoozed_until {
+            next.snoozed_until = v;
+        }
+        // Only a card waiting in Triage sleeps: leaving it by any path (mv, the board, an
+        // update) drops the wake date.
+        if !next.status.eq_ignore_ascii_case(TRIAGE) {
+            next.snoozed_until = None;
         }
         if let Some(v) = changes.rank {
             next.rank = v;

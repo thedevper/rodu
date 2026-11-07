@@ -238,6 +238,7 @@ const FIELDS: &[(&str, &str, Refers)] = &[
     ("cycleId", "cycle", Refers::Cycle),
     ("estimate", "estimate", Refers::Text),
     ("dueAt", "due", Refers::Text),
+    ("snoozedUntil", "snoozed", Refers::Text),
     ("body", "description", Refers::Hidden),
     ("rank", "position", Refers::Hidden),
 ];
@@ -251,6 +252,7 @@ pub fn document_field(field: &str) -> Option<(&'static str, bool)> {
         "reporter_id" => "reporter",
         "cycle_id" => "cycle",
         "due_at" => "due",
+        "snoozed_until" => "snoozed",
         "body" => "description",
         "rank" => "position",
         other => FIELDS.iter().map(|f| f.1).find(|name| *name == other)?,

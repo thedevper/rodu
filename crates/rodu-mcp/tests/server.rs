@@ -80,6 +80,7 @@ async fn lists_the_tools_with_annotations_and_instructions() {
             "plan_cycle",
             "search",
             "transition",
+            "triage",
             "update_item",
         ]
     );
@@ -99,7 +100,7 @@ async fn lists_the_tools_with_annotations_and_instructions() {
         assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
         let destructive = if is_read { None } else { Some(false) };
         assert_eq!(annotations.destructive_hint, destructive, "{}", tool.name);
-        let idempotent = (tool.name == "transition").then_some(false);
+        let idempotent = ["transition", "triage"].contains(&tool.name.as_ref()).then_some(false);
         assert_eq!(annotations.idempotent_hint, idempotent, "{}", tool.name);
     }
     let create = tools.iter().find(|t| t.name == "create_items").unwrap();
@@ -133,8 +134,7 @@ async fn creates_searches_and_moves_items() {
     assert!(raw.starts_with("[\n  {\n    \"key\": \"DEMO-1\""), "{raw}");
     assert_eq!(serde_json::from_str::<Value>(&raw).unwrap().as_array().unwrap().len(), 1);
 
-    let found =
-        call(&client, "search", json!({ "query": "type = bug AND status = Backlog" })).await;
+    let found = call(&client, "search", json!({ "query": "type = bug AND status = Triage" })).await;
     assert_eq!(parsed(&found)["total"], 1);
 
     let context = call(&client, "get_context", json!({ "ref": "DEMO-1" })).await;
@@ -147,7 +147,7 @@ async fn creates_searches_and_moves_items() {
     let activity = text(&call(&client, "get_activity", json!({ "ref": "DEMO-1" })).await);
     assert!(activity.starts_with("## Activity"), "{activity}");
     assert!(activity.contains("· alice via alice-claude · created"), "{activity}");
-    assert!(activity.contains("status: Backlog → In Progress"), "{activity}");
+    assert!(activity.contains("status: Triage → In Progress"), "{activity}");
     let open = activity.find("<untrusted-content source=\"DEMO-1:activity\">").unwrap();
     assert!(open < activity.find("· created").unwrap(), "{activity}");
     let last = text(&call(&client, "get_activity", json!({ "ref": "DEMO-1", "limit": 1 })).await);
@@ -618,4 +618,25 @@ async fn each_client_writes_as_an_agent_of_its_own_under_the_person() {
     let odd = connect_named(service, actor, None, "!!").await;
     parsed(&odd.peer().call_tool(create("Fallback")).await.unwrap());
     assert_eq!(parsed(&odd.peer().call_tool(made_by("alice-claude")).await.unwrap())["total"], 1);
+}
+
+#[tokio::test]
+async fn an_agent_lists_and_triages_the_cards_waiting_for_a_person() {
+    let client = connect().await;
+    parsed(&client.peer().call_tool(create("Idea")).await.unwrap());
+    parsed(&client.peer().call_tool(create("Other idea")).await.unwrap());
+    let waiting = parsed(&call(&client, "triage", json!({ "action": "list" })).await);
+    let keys: Vec<&str> =
+        waiting["items"].as_array().unwrap().iter().map(|i| i["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, ["DEMO-1", "DEMO-2"]);
+    let accepted = call(&client, "triage", json!({ "action": "accept", "ref": "DEMO-1" })).await;
+    assert_eq!(parsed(&accepted)["status"], "Backlog");
+    let snoozed = call(&client, "triage", json!({ "action": "snooze", "ref": "DEMO-2" })).await;
+    assert_eq!(parsed(&snoozed)["status"], "Triage");
+    let waiting = parsed(&call(&client, "triage", json!({ "action": "list" })).await);
+    assert_eq!(waiting, json!({ "total": 0, "items": [] }));
+    let wrong = call(&client, "triage", json!({ "action": "approve", "ref": "DEMO-2" })).await;
+    assert_eq!(wrong.is_error, Some(true));
+    let missing = call(&client, "triage", json!({ "action": "accept" })).await;
+    assert_eq!(missing.is_error, Some(true));
 }

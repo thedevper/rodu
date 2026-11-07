@@ -1,12 +1,16 @@
 use crate::error::{Result, RoduError};
 use crate::model::{Category, Link, LinkKind, Rule, State, Transition, Workflow};
 
+/// Where the cards an agent creates wait for a person (ADR 0009).
+pub const TRIAGE: &str = "Triage";
+
 /// Workflow for software teams: review needs a linked pull request, work needs an owner.
 pub fn dev_workflow() -> Workflow {
     let state = |name: &str, category| State { name: name.into(), category };
     let rule = |from: &str, to: &str, rules| Transition { from: from.into(), to: to.into(), rules };
     Workflow {
         states: vec![
+            state(TRIAGE, Category::Backlog),
             state("Backlog", Category::Backlog),
             state("Todo", Category::Backlog),
             state("In Progress", Category::Active),
@@ -29,6 +33,15 @@ pub fn dev_workflow() -> Workflow {
             rule("*", "Canceled", vec![]),
         ],
     }
+}
+
+/// The workflow with a Triage status first, for collections made before it existed (ADR 0009).
+/// No transition leads into it: a card only starts there.
+pub fn with_triage(mut workflow: Workflow) -> Workflow {
+    if find_state(&workflow, TRIAGE).is_none() {
+        workflow.states.insert(0, State { name: TRIAGE.into(), category: Category::Backlog });
+    }
+    workflow
 }
 
 fn same(a: &str, b: &str) -> bool {
@@ -181,6 +194,10 @@ mod tests {
     #[test]
     fn the_dev_workflow_is_valid() {
         validate_workflow(&dev_workflow()).unwrap();
+        assert_eq!(with_triage(dev_workflow()), dev_workflow());
+        let mut old = dev_workflow();
+        old.states.remove(0);
+        assert_eq!(with_triage(old), dev_workflow());
     }
 
     #[test]

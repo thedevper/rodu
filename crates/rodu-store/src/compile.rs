@@ -75,6 +75,7 @@ const FIELDS: &[(&str, FieldSpec)] = &[
     ("created", FieldSpec { kind: Kind::Date, column: "i.created_at" }),
     ("updated", FieldSpec { kind: Kind::Date, column: "i.updated_at" }),
     ("due", FieldSpec { kind: Kind::Day, column: "i.due_at" }),
+    ("snoozed", FieldSpec { kind: Kind::Day, column: "i.snoozed_until" }),
     ("assignee", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: "i.assignee_id" }),
     ("reporter", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: "i.reporter_id" }),
     ("creator", FieldSpec { kind: Kind::Ref(RefKind::Principal), column: CREATOR }),
@@ -115,6 +116,7 @@ const NULLABLE: &[&str] = &[
     "i.cycle_id",
     "i.estimate",
     "i.due_at",
+    "i.snoozed_until",
 ];
 
 /// `creator` names a card's person or the agent it went through (ADR 0008): `creator = ann` finds
@@ -358,7 +360,7 @@ impl Compiler<'_> {
                 "this field is never empty",
                 pos,
                 Some(
-                    "IS EMPTY works on assignee, reporter, creator, parent, cycle, estimate, due, body",
+                    "IS EMPTY works on assignee, reporter, creator, parent, cycle, estimate, due, snoozed, body",
                 ),
             ));
         }

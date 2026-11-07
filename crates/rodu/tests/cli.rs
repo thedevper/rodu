@@ -209,7 +209,7 @@ async fn an_agent_in_the_shell_writes_as_its_own_agent_under_the_person() {
     assert_eq!(cli(cwd, &["add", "By hand"]).await.code, 0);
     // Claude Code's shell says CLAUDECODE=1; RODU_AGENT names any other agent, and wins.
     let coded = cli_with(cwd, &["add", "From Claude Code"], as_env("CLAUDECODE", "1")).await;
-    assert_eq!(coded.out, ["DEMO-2 [Backlog] From Claude Code"]);
+    assert_eq!(coded.out, ["DEMO-2 [Triage] From Claude Code"]);
     let named = cli_with(cwd, &["add", "From Codex"], as_env("RODU_AGENT", "Codex")).await;
     assert_eq!(named.code, 0);
     let moved = cli_with(cwd, &["mv", "DEMO-1", "Todo"], as_env("RODU_AGENT", "codex")).await;
@@ -217,7 +217,7 @@ async fn an_agent_in_the_shell_writes_as_its_own_agent_under_the_person() {
 
     assert_eq!(
         cli(cwd, &["ls", "creator = alice-claude-code"]).await.out,
-        ["DEMO-2 [Backlog] From Claude Code · reporter alice via alice-claude-code"]
+        ["DEMO-2 [Triage] From Claude Code · reporter alice via alice-claude-code"]
     );
     assert_eq!(cli(cwd, &["ls", "creator = me()"]).await.out.len(), 3);
     let shown = cli(cwd, &["show", "DEMO-3"]).await.last_out().to_owned();
@@ -541,4 +541,52 @@ async fn adds_and_lists_collections_after_init() {
     let unknown = cli(cwd, &["collection", "drop", "OPS"]).await;
     assert_ne!(unknown.code, 0);
     assert!(unknown.err.join("\n").contains("Unknown collection command"), "{:?}", unknown.err);
+}
+
+#[tokio::test]
+async fn triage_lists_an_agents_cards_and_a_person_decides_on_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    init(cwd).await;
+    let codex = || Extra { env: vec![("RODU_AGENT", "codex".to_owned())], ..Extra::default() };
+    for title in ["One", "Two", "Three", "Four"] {
+        assert_eq!(cli_with(cwd, &["add", title], codex()).await.code, 0);
+    }
+    let waiting = cli(cwd, &["triage"]).await.out;
+    let keys: Vec<&str> = waiting.iter().map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(keys, ["DEMO-1", "DEMO-2", "DEMO-3", "DEMO-4"]);
+    assert!(waiting[0].starts_with("DEMO-1 [Triage] One"), "{waiting:?}");
+
+    assert_eq!(
+        cli(cwd, &["triage", "accept", "DEMO-1"]).await.out,
+        ["DEMO-1 [Backlog] One · reporter alice via alice-codex"]
+    );
+    assert_eq!(
+        cli(cwd, &["triage", "decline", "DEMO-2"]).await.out,
+        ["DEMO-2 [Canceled] Two · reporter alice via alice-codex"]
+    );
+    let dup = cli(cwd, &["triage", "duplicate", "DEMO-3", "DEMO-1"]).await;
+    assert_eq!(dup.out, ["DEMO-3 [Canceled] Three · reporter alice via alice-codex"]);
+    // A batch with a card not in Triage, or a key named twice, changes nothing.
+    assert_eq!(cli(cwd, &["triage", "accept", "DEMO-4", "DEMO-1"]).await.code, 1);
+    assert_eq!(cli(cwd, &["triage", "accept", "DEMO-4", "DEMO-4"]).await.code, 1);
+    assert_eq!(cli(cwd, &["ls", "status = Triage"]).await.out.len(), 1);
+    let snoozed = cli(cwd, &["triage", "snooze", "DEMO-4", "--days", "3"]).await;
+    assert!(
+        snoozed
+            .last_out()
+            .starts_with("DEMO-4 [Triage] Four · reporter alice via alice-codex · until 20"),
+        "{:?}",
+        snoozed.out
+    );
+    assert_eq!(cli(cwd, &["triage"]).await.out, ["Nothing is waiting in Triage."]);
+
+    // Refusals change nothing: a card not in Triage, a missing --days, a mistyped key.
+    let moved = cli(cwd, &["triage", "decline", "DEMO-1"]).await;
+    assert_eq!(moved.code, 1);
+    assert!(moved.last_err().contains("not waiting in Triage"), "{:?}", moved.err);
+    assert_eq!(cli(cwd, &["triage", "snooze", "DEMO-4"]).await.code, 1);
+    assert_eq!(cli(cwd, &["triage", "accept", "DEMO-4", "DEMO-9"]).await.code, 1);
+    assert_eq!(cli(cwd, &["triage", "frob"]).await.code, 1);
+    assert_eq!(cli(cwd, &["ls", "status = Triage"]).await.out.len(), 1);
 }

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rodu_core::format::{format_activity, format_audit, item_line};
+use rodu_core::service::Triage;
 use rodu_core::store::{Store, TxMode};
 use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
 use rodu_http::{
@@ -37,6 +38,10 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   show <key> [--activity [--local]] [--limit 50]   item with its context; --activity adds its history (in a team, across the team; --local: as this machine recorded it)
   audit <key>                team workspace: every change to an item, with the machine that wrote it (read-only)
   mv <key> <status>          move an item, e.g. rodu mv DEMO-3 \"In Progress\"
+  triage [--collection KEY]  the cards an agent made, waiting for you (oldest first)
+  triage accept|decline <key>...   move waiting cards to Backlog, or cancel them
+  triage duplicate <key> <of>      cancel a waiting card as a duplicate of another
+  triage snooze <key>... --days N  hide waiting cards from the list for N days (1-365)
   collections                the collections in this workspace, key and name
   collection add <KEY> [--title <name>]   add a collection (a project with its own card numbers)
   mcp                        serve MCP over stdio for your agent
@@ -445,13 +450,15 @@ async fn command_result(
             team::after_reopen(io, true);
             served.map(|()| 0)
         }
-        "add" | "edit" | "ls" | "show" | "audit" | "mv" | "collection" | "collections" => {
+        "add" | "edit" | "ls" | "show" | "audit" | "mv" | "triage" | "collection"
+        | "collections" => {
             let mut ws = open(io, false)?;
             team::before(io, &ws);
             // Reading makes no agent; every other command writes as it, after the pull that may
             // bring it, so a new write command cannot forget to.
             let result = match command {
                 "ls" | "show" | "audit" | "collections" => Ok(()),
+                "triage" if rest.is_empty() => Ok(()),
                 _ => as_named_agent(io, &mut ws),
             }
             .and_then(|()| item_command(command, rest, args, &ws, io));
@@ -543,6 +550,72 @@ fn item_command(
                         },
                     )?;
                 (io.out)(&people_line(ws, &item)?);
+            }
+            Ok(0)
+        }
+        "triage" => {
+            let Some((action, keys)) = rest.split_first() else {
+                let waiting = ws.service.triage_list(&ws.actor, args.value("collection"))?;
+                if waiting.items.is_empty() {
+                    (io.out)("Nothing is waiting in Triage.");
+                }
+                for item in &waiting.items {
+                    (io.out)(&people_line(ws, item)?);
+                }
+                let more = waiting.total.saturating_sub(waiting.items.len() as u64);
+                if more > 0 {
+                    (io.out)(&format!("… and {more} more waiting; decide on these first."));
+                }
+                return Ok(0);
+            };
+            let (keys, decision) = match (action.as_str(), keys) {
+                ("accept", [_, ..]) => (keys, Triage::Accept),
+                ("decline", [_, ..]) => (keys, Triage::Decline),
+                ("duplicate", [key, of]) => {
+                    (std::slice::from_ref(key), Triage::Duplicate(of.clone()))
+                }
+                ("snooze", [_, ..]) => {
+                    let days = args
+                        .value("days")
+                        .and_then(|raw| raw.parse::<u32>().ok())
+                        .ok_or_else(|| {
+                            RoduError::invalid("snooze needs --days, a whole number from 1 to 365")
+                        })?;
+                    (keys, Triage::Snooze(days))
+                }
+                _ => {
+                    return Err(RoduError::invalid(format!(
+                        "Unknown triage command \"{} {}\"",
+                        action,
+                        keys.join(" ")
+                    ))
+                    .with_hint(
+                        "rodu triage accept|decline <key>..., rodu triage duplicate <key> <of>, \
+                         rodu triage snooze <key>... --days N",
+                    ));
+                }
+            };
+            // As with edit: every key is checked first, so a typo, a card not in Triage or a
+            // repeated key changes nothing.
+            for (i, key) in keys.iter().enumerate() {
+                let item = ws.service.item(key)?;
+                rodu_core::service::waiting_in_triage(&item)?;
+                if keys[..i].iter().any(|k| ws.service.item(k).is_ok_and(|k| k.id == item.id)) {
+                    return Err(RoduError::invalid(format!("{key} is named twice")));
+                }
+            }
+            for (done, key) in keys.iter().enumerate() {
+                let item =
+                    ws.service.triage(&ws.actor, key, &decision).map_err(|e| match done {
+                        0 => e,
+                        _ => e.with_hint(format!(
+                            "Triaged already: {}; not triaged: {}",
+                            keys[..done].join(", "),
+                            keys[done..].join(", ")
+                        )),
+                    })?;
+                let snoozed = item.snoozed_until.as_deref().map(|d| format!(" · until {d}"));
+                (io.out)(&format!("{}{}", people_line(ws, &item)?, snoozed.unwrap_or_default()));
             }
             Ok(0)
         }
