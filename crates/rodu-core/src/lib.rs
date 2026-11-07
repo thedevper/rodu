@@ -12,6 +12,7 @@ pub mod query;
 pub mod rank;
 pub mod service;
 pub mod store;
+pub mod tidy;
 pub mod workflow;
 
 pub use error::{ErrorCode, Result, RoduError};

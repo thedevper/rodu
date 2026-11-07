@@ -21,6 +21,7 @@ use crate::model::{
 };
 use crate::rank::rank_between;
 use crate::store::{SearchRequest, SearchResult, Side, Store, TxMode};
+use crate::tidy::{TidyAction, TidyReport, TidyRule, stale_days};
 use crate::workflow::{
     TRIAGE, TransitionSubject, check_transition, dev_workflow, find_state, validate_workflow,
     with_triage,
@@ -133,6 +134,23 @@ pub enum Triage {
     Duplicate(String),
     /// Out of the triage list for this many days, 1 to 365.
     Snooze(u32),
+}
+
+/// JQL for the cards waiting in Triage and not snoozed past today, after `scope`.
+fn waiting_query(scope: &str) -> String {
+    format!("{scope}status = {TRIAGE} AND (snoozed IS EMPTY OR snoozed <= today())")
+}
+
+/// Whether `principal` is an agent that `owner` owns.
+fn is_agent_of(principal: &Principal, owner: &Principal) -> bool {
+    principal.kind == PrincipalKind::Agent && principal.owner_id.as_deref() == Some(&owner.id)
+}
+
+/// Where a card nobody will do goes: `Canceled`, else the first done status.
+fn declined_state(workflow: &Workflow) -> Result<&State> {
+    find_state(workflow, "Canceled")
+        .or_else(|| workflow.states.iter().find(|s| s.category == Category::Done))
+        .ok_or_else(|| RoduError::invalid("The workflow has no status to cancel into"))
 }
 
 /// Refuses a card that is not waiting in Triage, so a triage decision cannot move a card on
@@ -283,7 +301,7 @@ impl<S: Store> RoduService<S> {
                 .with_hint("Set RODU_AGENT to letters and digits, e.g. RODU_AGENT=claude-code")
         })?;
         if let Some(found) = self.store.find_principal(&name)? {
-            if found.kind == PrincipalKind::Agent && found.owner_id.as_deref() == Some(&owner.id) {
+            if is_agent_of(&found, &owner) {
                 return Ok(found);
             }
             return Err(RoduError::conflict(format!("\"{name}\" is someone else's name"))
@@ -606,19 +624,7 @@ impl<S: Store> RoduService<S> {
             items.into_iter().filter(|i| i.category != Category::Done).collect();
         let mut blocked = Vec::new();
         for item in &remaining {
-            let mut is_blocked = false;
-            for link in self.store.list_incoming_links(&item.id)? {
-                if link.kind != LinkKind::Blocks {
-                    continue;
-                }
-                if let Some(blocker) = self.store.get_item(&link.from_item_id)?
-                    && blocker.category != Category::Done
-                {
-                    is_blocked = true;
-                    break;
-                }
-            }
-            if is_blocked {
+            if self.is_blocked(item)? {
                 blocked.push(item.clone());
             }
         }
@@ -963,10 +969,7 @@ impl<S: Store> RoduService<S> {
             Some(c) => format!("collection = {} AND ", self.collection(c)?.key),
             None => String::new(),
         };
-        let query = format!(
-            "{scope}status = {TRIAGE} AND (snoozed IS EMPTY OR snoozed <= today()) ORDER BY created"
-        );
-        self.search(actor, &query, Some(100), None)
+        self.search(actor, &format!("{} ORDER BY created", waiting_query(&scope)), Some(100), None)
     }
 
     /// Decides about one card waiting in Triage; any other card is refused (ADR 0009).
@@ -979,11 +982,7 @@ impl<S: Store> RoduService<S> {
         let (target, snoozed_until, of) = match decision {
             Triage::Accept => (Some(workflow.initial.clone()), None, None),
             Triage::Decline | Triage::Duplicate(_) => {
-                let declined = find_state(workflow, "Canceled")
-                    .or_else(|| workflow.states.iter().find(|s| s.category == Category::Done))
-                    .ok_or_else(|| {
-                        RoduError::invalid("The workflow has no status to decline into")
-                    })?;
+                let declined = declined_state(workflow)?;
                 let of = match decision {
                     Triage::Duplicate(of) => Some(self.item(of)?),
                     _ => None,
@@ -1024,6 +1023,245 @@ impl<S: Store> RoduService<S> {
             };
             self.write_item(&self.new_id(), actor, &item, changes)
         })
+    }
+
+    /// Whether a card not yet done blocks this one.
+    fn is_blocked(&self, item: &Item) -> Result<bool> {
+        for link in self.store.list_incoming_links(&item.id)? {
+            if link.kind == LinkKind::Blocks
+                && let Some(blocker) = self.store.get_item(&link.from_item_id)?
+                && blocker.category != Category::Done
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // --- tidy (ADR 0010) ---------------------------------------------------------------------
+
+    /// Runs the stale rules: finds the backlog cards with no activity for each rule's age and,
+    /// when `apply` is set, comments on or closes them as the rule says. Without `apply` nothing
+    /// is written. Every rule is checked before anything is written; applied, each rule's changes
+    /// are one write, made by `actor`'s person via the rule's own agent, so a rule that fails
+    /// changes nothing.
+    pub fn tidy(&self, actor: &Actor, rules: &[TidyRule], apply: bool) -> Result<Vec<TidyReport>> {
+        let owner = self.principal(&actor.principal_id)?;
+        // Each rule's agent, if a run applied it before; looked up, never made, so a dry run
+        // writes nothing. Each rule's agent name must be its own: a long person's name can cut two apart.
+        let mut agents = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for rule in rules {
+            let name = agent_name(&owner.name, &format!("tidy-{}", rule.name))
+                .filter(|n| !names.contains(n))
+                .ok_or_else(|| {
+                    RoduError::invalid(format!(
+                        "The rule {} has no agent name of its own for {}",
+                        rule.name, owner.name
+                    ))
+                    .with_hint("Give the rules shorter names that differ in their first letters")
+                })?;
+            let found = self.store.find_principal(&name)?;
+            if found.as_ref().is_some_and(|p| !is_agent_of(p, &owner)) {
+                return Err(RoduError::conflict(format!(
+                    "The rule {} would act as \"{name}\", which is someone else's name",
+                    rule.name
+                )));
+            }
+            agents.push(found.map(|p| p.id));
+            names.push(name);
+        }
+        // No tidy rule's comments are activity, whoever ran it and whatever the rule is called
+        // now, or a comment rule would keep a card fresh.
+        let principals = self.store.list_principals()?;
+        let rule_agents: Vec<&str> = principals
+            .iter()
+            .filter(|p| p.kind == PrincipalKind::Agent && p.name.contains("-tidy-"))
+            .map(|p| p.id.as_str())
+            .collect();
+        let mut reports = Vec::new();
+        for (rule, own) in rules.iter().zip(&agents) {
+            reports.push(self.tidy_rule(actor, rule, &rule_agents, own.as_deref())?);
+        }
+        if !apply {
+            return Ok(reports);
+        }
+        // One write per rule, made via the rule's agent, so a team's history names the rule too.
+        let mut done: Vec<String> = Vec::new();
+        for (rule, report) in rules.iter().zip(reports.iter_mut()) {
+            if report.action == TidyAction::Flag || report.cards.is_empty() {
+                continue;
+            }
+            let agent = self.agent_for(&owner.id, &format!("tidy-{}", rule.name))?;
+            let by_rule = Actor { principal_id: owner.id.clone(), via_agent_id: Some(agent.id) };
+            let planned = std::mem::take(&mut report.cards);
+            report.cards = self.write(Some(&by_rule), || {
+                let mut acted = Vec::new();
+                for (item, last) in planned {
+                    // A card changed since the plan, by a person or an earlier rule, is skipped.
+                    let fresh = self.store.get_item(&item.id)?;
+                    if fresh.as_ref().is_none_or(|f| f.version != item.version) {
+                        continue;
+                    }
+                    self.tidy_card(&by_rule, rule, report.days, &item).map_err(|e| {
+                        let before = match done.as_slice() {
+                            [] => String::new(),
+                            names => format!(" (the rules {} were applied)", names.join(", ")),
+                        };
+                        let stopped = format!(
+                            "The rule {} stopped at {} and changed nothing{before}",
+                            rule.name, item.key
+                        );
+                        let hint = match &e.hint {
+                            Some(h) => format!("{h}. {stopped}"),
+                            None => stopped,
+                        };
+                        e.with_hint(hint)
+                    })?;
+                    acted.push((item, last));
+                }
+                Ok(acted)
+            })?;
+            done.push(rule.name.clone());
+        }
+        Ok(reports)
+    }
+
+    fn tidy_rule(
+        &self,
+        actor: &Actor,
+        rule: &TidyRule,
+        rule_agents: &[&str],
+        own: Option<&str>,
+    ) -> Result<TidyReport> {
+        let days = stale_days(rule)?;
+        let only = rule.collection.as_deref().map(|c| self.collection(c)).transpose()?;
+        let scope = match &only {
+            Some(c) => format!("collection = {} AND ", c.key),
+            None => String::new(),
+        };
+        // The cards the exempt matches are left out by id, not with NOT (...) in the query:
+        // there `assignee = bob` would also leave out every card with no assignee.
+        let mut exempt = HashSet::new();
+        if let Some(q) = &rule.exempt {
+            self.search(actor, q, Some(1), None).map_err(|e| {
+                RoduError::invalid(format!("The exempt of the rule {}: {}", rule.name, e.message))
+            })?;
+            let query = format!("{scope}category = backlog AND ({q})");
+            self.each_found(actor, &query, |item| {
+                exempt.insert(item.id);
+                Ok(())
+            })?;
+        }
+        let query = format!(
+            "{scope}category = backlog AND status != {TRIAGE} AND due IS EMPTY AND cycle IS EMPTY \
+             AND updated < -{days}d ORDER BY updated"
+        );
+        let cutoff = iso(self.now() - time::Duration::days(i64::from(days)));
+        let mut report = TidyReport {
+            rule: rule.name.clone(),
+            action: rule.action,
+            days,
+            cards: Vec::new(),
+            already: Vec::new(),
+            stuck_in_triage: 0,
+        };
+        self.each_found(actor, &query, |item| {
+            // The exemptions hold whatever the exempt JQL says.
+            if exempt.contains(&item.id)
+                || item.category != Category::Backlog
+                || only.as_ref().is_some_and(|c| c.id != item.collection_id)
+                || item.status.eq_ignore_ascii_case(TRIAGE)
+                || item.due_at.is_some()
+                || item.cycle_id.is_some()
+                || item.updated_at >= cutoff
+                || self.is_blocked(&item)?
+            {
+                return Ok(());
+            }
+            let comments = self.store.list_comments(&item.id)?;
+            let by_rule =
+                |c: &Comment| c.via_agent_id.as_deref().is_some_and(|id| rule_agents.contains(&id));
+            let last = comments
+                .iter()
+                .filter(|c| !by_rule(c))
+                .map(|c| c.created_at.clone())
+                .chain([item.updated_at.clone()])
+                .max()
+                .unwrap_or_default();
+            if last >= cutoff {
+                return Ok(());
+            }
+            let commented = own.is_some_and(|own| {
+                comments
+                    .iter()
+                    .any(|c| c.via_agent_id.as_deref() == Some(own) && c.created_at >= last)
+            });
+            if commented && rule.action == TidyAction::Comment {
+                report.already.push(item);
+            } else {
+                // A close the workflow refuses stops the run before anything is written.
+                if rule.action == TidyAction::Close {
+                    let collection = self.collection(&item.collection_id)?;
+                    let to = &declined_state(&collection.workflow)?.name;
+                    self.allowed_move(&collection.workflow, &item, to)?;
+                }
+                report.cards.push((item, last));
+            }
+            Ok(())
+        })?;
+        report.cards.sort_by(|a, b| a.1.cmp(&b.1));
+        let stuck = format!("{} AND created < -{days}d", waiting_query(&scope));
+        report.stuck_in_triage = self.search(actor, &stuck, Some(1), None)?.total;
+        Ok(report)
+    }
+
+    /// Calls `each` with every card `query` finds, 100 at a time.
+    fn each_found(
+        &self,
+        actor: &Actor,
+        query: &str,
+        mut each: impl FnMut(Item) -> Result<()>,
+    ) -> Result<()> {
+        let mut offset = 0;
+        loop {
+            let page = self.search(actor, query, Some(100), Some(offset))?;
+            offset += 100;
+            for item in page.items {
+                each(item)?;
+            }
+            if u64::from(offset) >= page.total {
+                return Ok(());
+            }
+        }
+    }
+
+    fn tidy_card(&self, actor: &Actor, rule: &TidyRule, days: u32, item: &Item) -> Result<()> {
+        match rule.action {
+            TidyAction::Flag => Ok(()),
+            TidyAction::Comment => {
+                let text = format!(
+                    "No activity for {days} days or more (tidy rule {}). Comment or move the card \
+                     to keep it.",
+                    rule.name
+                );
+                self.comment(actor, &item.id, &text).map(|_| ())
+            }
+            TidyAction::Close => {
+                let collection = self.collection(&item.collection_id)?;
+                let to = declined_state(&collection.workflow)?.name.clone();
+                let state = self.allowed_move(&collection.workflow, item, &to)?;
+                let text = format!(
+                    "Closed by the tidy rule {}: no activity for {days} days or more. To bring it \
+                     back: rodu mv {} \"{}\"",
+                    rule.name, item.key, item.status
+                );
+                self.comment(actor, &item.id, &text)?;
+                let changes =
+                    Changes { status: Some((state.name, state.category)), ..Changes::default() };
+                self.write_item(&self.new_id(), actor, item, changes).map(|_| ())
+            }
+        }
     }
 
     pub fn comment(&self, actor: &Actor, reference: &str, body: &str) -> Result<Comment> {
