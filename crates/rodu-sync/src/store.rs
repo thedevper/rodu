@@ -78,6 +78,39 @@ const NOTE_TRUST: &str = "trust";
 const NOTE_ADOPTED_EVENTS: &str = "adopted-events";
 /// The local note saying this machine has given the team's cards the reporters it knows (ADR 0007).
 const NOTE_REPORTERS: &str = "reporters-backfilled";
+/// The same for the cards' creators (ADR 0008).
+const NOTE_CREATORS: &str = "creators-backfilled";
+
+/// Which person the fill-in gives cards from before Rodu kept it.
+#[derive(Clone, Copy)]
+enum Fill {
+    Reporter,
+    Creator,
+}
+
+impl Fill {
+    fn keys(self) -> layout::PersonKeys {
+        match self {
+            Fill::Reporter => layout::REPORTER_KEYS,
+            Fill::Creator => layout::CREATOR_KEYS,
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            Fill::Reporter => NOTE_REPORTERS,
+            Fill::Creator => NOTE_CREATORS,
+        }
+    }
+
+    /// The card's person and agent for this fill.
+    fn of(self, item: &mut Item) -> (&mut Option<String>, &mut Option<String>) {
+        match self {
+            Fill::Reporter => (&mut item.reporter_id, &mut item.reporter_via_agent_id),
+            Fill::Creator => (&mut item.creator_id, &mut item.creator_via_agent_id),
+        }
+    }
+}
 
 /// This machine's clock, in whole seconds since 1970.
 fn unix_now() -> i64 {
@@ -161,8 +194,8 @@ enum Change {
     Collection(Collection),
     Cycle(Option<Cycle>, Cycle),
     Item(Box<(Option<Item>, Item)>),
-    /// The reporter the fill-in found for a card, and its agent (ADR 0007).
-    FoundReporter(String, String, Option<String>),
+    /// The reporter, or creator, the fill-in found for a card, and its agent (ADRs 0007, 0008).
+    Found(Fill, String, String, Option<String>),
     Comment(Comment),
     Link(Link),
     NumberingPeer(u64),
@@ -314,10 +347,26 @@ impl LoroStore {
     /// machine that made it. Run it after taking in what teammates wrote, so a reporter one of
     /// them set is there to keep. A failure leaves it undone, for the next run.
     pub fn backfill_reporters(&self) -> Result<()> {
+        self.backfill(Fill::Reporter)
+    }
+
+    /// Once per machine: gives each card the document holds no creator for the one its history
+    /// names, found as [`LoroStore::backfill_reporters`] finds a reporter (ADR 0008). Nobody edits
+    /// a creator, so the fill-in only has to agree with the other machines', which it does.
+    pub fn backfill_creators(&self) -> Result<()> {
+        self.backfill(Fill::Creator)
+    }
+
+    fn backfill(&self, fill: Fill) -> Result<()> {
+        // Done already, as on every command after the first: no write lock for nothing.
+        if self.local_note(fill.note())?.is_some() {
+            return Ok(());
+        }
+        let keys = fill.keys();
         self.backfilling.set(true);
         let result = self.transaction(TxMode::Write, || {
             // Read inside the write lock, so two processes opening the board do it once.
-            if self.local_note(NOTE_REPORTERS)?.is_some() {
+            if self.local_note(fill.note())?.is_some() {
                 return Ok(());
             }
             let missing: Vec<String> = {
@@ -329,37 +378,37 @@ impl LoroStore {
                 ids.into_iter()
                     .filter(|(_, node)| {
                         tree.get_meta(*node).is_ok_and(|meta| {
-                            meta.get("reporter_id").is_none()
-                                && meta.get(layout::FOUND_REPORTER).is_none()
+                            meta.get(keys.set.0).is_none() && meta.get(keys.found.0).is_none()
                         })
                     })
                     .map(|(id, _)| id)
                     .collect()
             };
             for id in missing {
-                let Some(item) = self.sql.get_item(&id)? else { continue };
+                let Some(mut item) = self.sql.get_item(&id)? else { continue };
                 // The index may hold one its own migration found in this machine's events.
-                let indexed =
-                    item.reporter_id.clone().map(|r| (r, item.reporter_via_agent_id.clone()));
-                let Some((reporter, via)) = self.first_reporter(&id)?.or(indexed) else { continue };
-                let next = Item {
-                    reporter_id: Some(reporter.clone()),
-                    reporter_via_agent_id: via.clone(),
-                    version: item.version + 1,
-                    ..item.clone()
-                };
+                let (person, agent) = fill.of(&mut item);
+                let indexed = person.clone().map(|p| (p, agent.clone()));
+                let Some((found, via)) = self.first_creator(&id)?.or(indexed) else { continue };
+                let mut next = item.clone();
+                let (person, agent) = fill.of(&mut next);
+                (*person, *agent) = (Some(found.clone()), via.clone());
+                // A found reporter is a change people see; a creator never is (ADR 0008).
+                if matches!(fill, Fill::Reporter) {
+                    next.version += 1;
+                }
                 if self.sql.save_item(&next, item.version)? {
-                    self.pending.borrow_mut().push(Change::FoundReporter(id, reporter, via));
+                    self.pending.borrow_mut().push(Change::Found(fill, id, found, via));
                 }
             }
-            self.set_local_note(NOTE_REPORTERS, "1")
+            self.set_local_note(fill.note(), "1")
         });
         self.backfilling.set(false);
         result
     }
 
-    /// Who created a card, as [`LoroStore::backfill_reporters`] reads it, if anyone knows.
-    fn first_reporter(&self, id: &str) -> Result<Option<(String, Option<String>)>> {
+    /// Who created a card, which the fill-ins give as its reporter and creator, if anyone knows.
+    fn first_creator(&self, id: &str) -> Result<Option<(String, Option<String>)>> {
         let known = |p: &Option<String>| -> Result<Option<String>> {
             Ok(match p {
                 Some(p) if self.has_principal(p)? => Some(p.clone()),
@@ -1231,19 +1280,17 @@ impl LoroStore {
             Change::Authority(key, record) => {
                 doc.get_map(AUTHORITY).insert(key, record.as_str()).map_err(internal)
             }
-            Change::FoundReporter(id, reporter, via) => {
+            Change::Found(fill, id, person, via) => {
                 let node = *self
                     .nodes
                     .borrow()
                     .get(id)
                     .ok_or_else(|| internal(format!("card {id} is not in the document")))?;
                 let meta = doc.get_tree(ITEMS).get_meta(node).map_err(internal)?;
-                meta.insert(layout::FOUND_REPORTER, reporter.as_str()).map_err(internal)?;
-                meta.insert(
-                    layout::FOUND_REPORTER_VIA,
-                    via.as_deref().map_or(LoroValue::Null, LoroValue::from),
-                )
-                .map_err(internal)
+                let (person_key, via_key) = fill.keys().found;
+                meta.insert(person_key, person.as_str()).map_err(internal)?;
+                meta.insert(via_key, via.as_deref().map_or(LoroValue::Null, LoroValue::from))
+                    .map_err(internal)
             }
             Change::Item(change) => {
                 let (old, i) = &**change;
@@ -1465,21 +1512,27 @@ impl LoroStore {
             item.assignee_id = None;
             clean = false;
         }
-        if let Some(r) = &item.reporter_id
-            && !self.has_principal(r)?
-        {
-            self.unsettled(report, format!("card {}: unknown reporter cleared", item.id));
-            item.reporter_id = None;
-            item.reporter_via_agent_id = None;
-            clean = false;
-        }
-        // An agent is shown only as its own person's, as with a change's agent (ADR 0006).
-        if let Some(v) = &item.reporter_via_agent_id
-            && self.sql.find_principal(v)?.is_none_or(|agent| {
-                agent.id != *v || agent.owner_id.is_none() || agent.owner_id != item.reporter_id
-            })
-        {
-            item.reporter_via_agent_id = None;
+        let people = [
+            ("reporter", &mut item.reporter_id, &mut item.reporter_via_agent_id),
+            ("creator", &mut item.creator_id, &mut item.creator_via_agent_id),
+        ];
+        for (what, person, via) in people {
+            if let Some(p) = person
+                && !self.has_principal(p)?
+            {
+                self.unsettled(report, format!("card {}: unknown {what} cleared", item.id));
+                *person = None;
+                *via = None;
+                clean = false;
+            }
+            // An agent is shown only as its own person's, as with a change's agent (ADR 0006).
+            if let Some(v) = via
+                && self.sql.find_principal(v)?.is_none_or(|agent| {
+                    agent.id != *v || agent.owner_id.is_none() || agent.owner_id != *person
+                })
+            {
+                *via = None;
+            }
         }
         if let Some(c) = &item.cycle_id
             && self.sql.find_cycle(&item.collection_id, c)?.is_none_or(|found| found.id != *c)

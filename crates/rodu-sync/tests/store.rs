@@ -1819,18 +1819,23 @@ fn a_reporter_syncs_and_a_change_to_it_is_activity() {
 
 impl Peer {
     /// The same machine opened again and caught up, as a new Rodu's first command would after an
-    /// upgrade: `forget` drops its note that it filled in reporters.
+    /// upgrade: `forget` drops its notes that it filled in reporters and creators.
     fn reopen(self, forget: bool) -> Self {
         let Peer { svc, me, dir } = self;
         drop(svc);
         if forget {
             rusqlite::Connection::open(dir.path().join("rodu.db"))
                 .unwrap()
-                .execute("DELETE FROM index_meta WHERE key = 'local/reporters-backfilled'", [])
+                .execute(
+                    "DELETE FROM index_meta
+                     WHERE key IN ('local/reporters-backfilled', 'local/creators-backfilled')",
+                    [],
+                )
                 .unwrap();
         }
         let store = LoroStore::open(dir.path()).unwrap();
         store.backfill_reporters().unwrap();
+        store.backfill_creators().unwrap();
         Self { svc: RoduService::new(store), me, dir }
     }
 }
@@ -1851,19 +1856,29 @@ fn cards_from_before_reporters_get_the_one_their_history_names_once() {
         let meta = tree.get_meta(node.id).unwrap();
         meta.delete("reporter_id").unwrap();
         meta.delete("reporter_via_agent_id").unwrap();
+        meta.delete("creator_id").unwrap();
+        meta.delete("creator_via_agent_id").unwrap();
     }
     send_raw(&raw, &start, &a);
     send_raw(&raw, &start, &b);
     assert_eq!(a.svc.item("DEMO-1").unwrap().reporter_id, None);
+    assert_eq!(a.svc.item("DEMO-1").unwrap().creator_id, None);
 
-    // Ann's machine knows her card from its events, and Bob's from the team history.
+    // Ann's machine knows her card from its events, and Bob's from the team history; the
+    // creators are filled in the same way (ADR 0008).
     let a = a.reopen(true);
     let reporter = |p: &Peer, key: &str| p.svc.item(key).unwrap().reporter_id;
+    let creator = |p: &Peer, key: &str| p.svc.item(key).unwrap().creator_id;
     assert_eq!(reporter(&a, "DEMO-1").as_deref(), Some(a.me.principal_id.as_str()));
     let bobs = b.svc.search(&b.me, "title ~ Bob", None, None).unwrap().items[0].key.clone();
     assert_eq!(reporter(&a, &bobs).as_deref(), Some(b.me.principal_id.as_str()));
+    assert_eq!(creator(&a, "DEMO-1").as_deref(), Some(a.me.principal_id.as_str()));
+    assert_eq!(creator(&a, &bobs).as_deref(), Some(b.me.principal_id.as_str()));
+    let found = a.svc.search(&a.me, "creator = bob", None, None).unwrap();
+    assert_eq!(found.items.len(), 1);
     let shown = format_activity(&a.svc.activity("DEMO-1", None).unwrap());
     assert!(!shown.contains("reporter"), "filling it in is not activity: {shown}");
+    assert!(!shown.contains("creator"), "filling it in is not activity: {shown}");
 
     // Once per machine: opening again writes nothing.
     let version = |p: &Peer| loro::VersionVector::decode(&p.store().version()).unwrap();

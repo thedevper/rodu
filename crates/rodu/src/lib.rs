@@ -59,7 +59,9 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   sync                       sync with the team folder now (every command also does)
   --version                  print the version
 
-The workspace is the nearest .rodu directory, or $RODU_DIR.";
+The workspace is the nearest .rodu directory, or $RODU_DIR.
+An agent says who it is with RODU_AGENT (claude-code inside Claude Code's shell): its changes are
+recorded as you via <you>-<agent>, and `rodu ls 'creator = <you>-<agent>'` lists what it made.";
 
 /// Where the CLI reads its surroundings and writes its output, so tests can run it in-process.
 pub struct Io<'a> {
@@ -224,6 +226,23 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
 /// An environment variable, treating an empty value as unset.
 fn var<'a>(io: &'a Io<'_>, name: &str) -> Option<&'a str> {
     io.env.get(name).map(String::as_str).filter(|v| !v.is_empty())
+}
+
+/// The agent a command runs for, as the environment names it (ADR 0008): `RODU_AGENT`, else
+/// `claude-code` in a shell Claude Code started. None for a person at a terminal.
+fn agent_label(io: &Io<'_>) -> Option<String> {
+    var(io, "RODU_AGENT")
+        .map(str::to_string)
+        .or_else(|| (var(io, "CLAUDECODE") == Some("1")).then(|| "claude-code".to_string()))
+}
+
+/// Makes `ws` write as the agent the environment names, under the person, if it names one.
+fn as_named_agent(io: &Io<'_>, ws: &mut Workspace) -> Result<()> {
+    if let Some(label) = agent_label(io) {
+        let agent = ws.service.agent_for(&ws.config.user_id, &label)?;
+        ws.actor.via_agent_id = Some(agent.id);
+    }
+    Ok(())
 }
 
 fn find_dir(io: &Io<'_>) -> Option<PathBuf> {
@@ -417,16 +436,25 @@ async fn command_result(
             // Only MCP messages may go to stdout; the status line goes to stderr.
             (io.err)(&format!("rodu mcp: serving {} on stdio", ws.dir.display()));
             let live = team::live(&ws);
-            let served = rodu_mcp::serve_stdio_live(ws.service, ws.actor, live)
+            // Not agent_label: without RODU_AGENT the client's own name says which agent it is,
+            // which is better than CLAUDECODE (ADR 0008).
+            let agent = var(io, "RODU_AGENT").map(str::to_string);
+            let served = rodu_mcp::serve_stdio_live(ws.service, ws.actor, live, agent)
                 .await
                 .map_err(|e| RoduError::internal(format!("MCP server stopped: {e}")));
             team::after_reopen(io, true);
             served.map(|()| 0)
         }
         "add" | "edit" | "ls" | "show" | "audit" | "mv" | "collection" | "collections" => {
-            let ws = open(io, false)?;
+            let mut ws = open(io, false)?;
             team::before(io, &ws);
-            let result = item_command(command, rest, args, &ws, io);
+            // Reading makes no agent; every other command writes as it, after the pull that may
+            // bring it, so a new write command cannot forget to.
+            let result = match command {
+                "ls" | "show" | "audit" | "collections" => Ok(()),
+                _ => as_named_agent(io, &mut ws),
+            }
+            .and_then(|()| item_command(command, rest, args, &ws, io));
             team::after(io, &ws);
             result
         }

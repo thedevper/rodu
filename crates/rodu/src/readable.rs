@@ -590,6 +590,8 @@ mod tests {
             assignee_id: Some("p1".into()),
             reporter_id: Some("p2".into()),
             reporter_via_agent_id: Some("a2".into()),
+            creator_id: None,
+            creator_via_agent_id: None,
             parent_id: Some("i0".into()),
             cycle_id: Some("y1".into()),
             estimate: Some(2.5),

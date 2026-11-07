@@ -1,7 +1,8 @@
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 use regex::Regex;
-use uuid::{ContextV7, Timestamp, Uuid};
+use sha2::{Digest, Sha256};
+use uuid::{Builder, ContextV7, Timestamp, Uuid};
 
 /// Keeps ids made in one millisecond in the order they were made (a counter in the bits after the
 /// time), so the oldest-wins rules hold within a batch too.
@@ -19,6 +20,15 @@ pub fn uuidv7(unix_ms: u64) -> String {
 static UUID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap()
 });
+
+/// An id every replica derives alike from the same `seed`: the first 16 bytes of its SHA-256, as an
+/// RFC 9562 version 8 UUID. For things two machines may make at once that must end up as one.
+pub fn stable_id(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Builder::from_custom_bytes(bytes).into_uuid().to_string()
+}
 
 pub fn is_uuid(value: &str) -> bool {
     UUID.is_match(value)
@@ -69,6 +79,15 @@ pub fn free_provisional_key<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stable_id_is_the_same_uuid_for_the_same_seed() {
+        let id = stable_id("agent:p-ann:ann-claude-code");
+        assert!(is_uuid(&id));
+        assert_eq!(id, stable_id("agent:p-ann:ann-claude-code"));
+        assert_ne!(id, stable_id("agent:p-bob:ann-claude-code"));
+        assert_eq!(Uuid::parse_str(&id).unwrap().get_version_num(), 8);
+    }
 
     #[test]
     fn makes_time_ordered_version_7_ids() {

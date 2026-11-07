@@ -157,6 +157,10 @@ pub struct Item {
     /// it went through, if any (ADR 0007). None for a card nobody knows the reporter of.
     pub reporter_id: Option<String>,
     pub reporter_via_agent_id: Option<String>,
+    /// Who created the card and the agent it went through, if any (ADR 0008). Set once, never
+    /// edited; None for a card made before Rodu kept it, when nobody knows.
+    pub creator_id: Option<String>,
+    pub creator_via_agent_id: Option<String>,
     pub parent_id: Option<String>,
     pub cycle_id: Option<String>,
     pub estimate: Option<f64>,

@@ -13,7 +13,7 @@ use crate::activity::{
 use crate::clock::{Clock, iso, system_clock, unix_ms};
 use crate::error::{Result, RoduError};
 use crate::format::{ContextParts, format_context, links_to_item};
-use crate::ids::{format_key, free_provisional_key, is_uuid, uuidv7};
+use crate::ids::{format_key, free_provisional_key, is_uuid, stable_id, uuidv7};
 use crate::input::{ItemPatch, NewItem, check_name, parse_date, parse_new_item, parse_patch};
 use crate::model::{
     Actor, Category, Collection, Comment, Cycle, CycleState, Event, Item, Link, LinkKind,
@@ -33,6 +33,26 @@ static COLLECTION_KEY: LazyLock<Regex> =
 /// Whether `name` is a valid principal name.
 pub fn valid_principal_name(name: &str) -> bool {
     PRINCIPAL_NAME.is_match(name)
+}
+
+/// `<owner>-<label>` as a principal name: `label` lowercased, every run of other characters made
+/// one dash, cut to 40 characters. None when `label` has no letter or digit.
+fn agent_name(owner: &str, label: &str) -> Option<String> {
+    let mut slug = String::new();
+    for c in label.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    if !slug.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let name: String = format!("{owner}-{slug}").chars().take(40).collect();
+    let name = name.trim_end_matches(['-', '.', '_']).to_string();
+    // A person's name near the limit leaves no room for the agent's: never the person's own name.
+    (name.len() > owner.len() + 1 && PRINCIPAL_NAME.is_match(&name)).then_some(name)
 }
 
 /// Whether `key` (in any case) is a valid collection key.
@@ -212,14 +232,59 @@ impl<S: Store> RoduService<S> {
         }
     }
 
+    /// The agent principal `label` names for the person `owner_id` (ADR 0008): `<owner>-<label>`,
+    /// made on first use. Its id comes from the person and the name, so two of that person's
+    /// machines that both make it make the same agent. A name that is a human's or another
+    /// person's agent is refused.
+    pub fn agent_for(&self, owner_id: &str, label: &str) -> Result<Principal> {
+        let owner = self.principal(owner_id)?;
+        if owner.kind != PrincipalKind::Human {
+            return Err(RoduError::invalid("An agent's owner must be a human"));
+        }
+        let name = agent_name(&owner.name, label).ok_or_else(|| {
+            RoduError::invalid(format!("\"{label}\" is not an agent name"))
+                .with_hint("Set RODU_AGENT to letters and digits, e.g. RODU_AGENT=claude-code")
+        })?;
+        if let Some(found) = self.store.find_principal(&name)? {
+            if found.kind == PrincipalKind::Agent && found.owner_id.as_deref() == Some(&owner.id) {
+                return Ok(found);
+            }
+            return Err(RoduError::conflict(format!("\"{name}\" is someone else's name"))
+                .with_hint("Set RODU_AGENT to another name for this agent"));
+        }
+        let principal = Principal {
+            id: stable_id(&format!("agent:{}:{}", owner.id, name.to_lowercase())),
+            kind: PrincipalKind::Agent,
+            name,
+            owner_id: Some(owner.id),
+        };
+        // Another process may make the same agent between the look and the write: same id, kept.
+        if let Err(e) = self.write(None, || self.store.insert_principal(&principal)) {
+            return match self.store.find_principal(&principal.id)? {
+                Some(made) if made.owner_id == principal.owner_id => Ok(made),
+                _ => Err(e),
+            };
+        }
+        Ok(principal)
+    }
+
     /// Who reported a card, as people read it: `ann`, or `ann via ann-agent`.
     pub fn reporter_label(&self, item: &Item) -> Result<Option<String>> {
-        let Some(reporter) = self.principal_name(item.reporter_id.as_deref())? else {
+        self.person_label(item.reporter_id.as_deref(), item.reporter_via_agent_id.as_deref())
+    }
+
+    /// Who created a card, as people read it: `ann`, or `ann via ann-claude-code`.
+    pub fn creator_label(&self, item: &Item) -> Result<Option<String>> {
+        self.person_label(item.creator_id.as_deref(), item.creator_via_agent_id.as_deref())
+    }
+
+    fn person_label(&self, person: Option<&str>, via: Option<&str>) -> Result<Option<String>> {
+        let Some(person) = self.principal_name(person)? else {
             return Ok(None);
         };
-        Ok(Some(match self.principal_name(item.reporter_via_agent_id.as_deref())? {
-            Some(agent) => format!("{reporter} via {agent}"),
-            None => reporter,
+        Ok(Some(match self.principal_name(via)? {
+            Some(agent) => format!("{person} via {agent}"),
+            None => person,
         }))
     }
 
@@ -627,6 +692,8 @@ impl<S: Store> RoduService<S> {
                         .transpose()?,
                     reporter_id,
                     reporter_via_agent_id,
+                    creator_id: Some(actor.principal_id.clone()),
+                    creator_via_agent_id: actor.via_agent_id.clone(),
                     parent_id: input
                         .parent
                         .as_deref()
@@ -991,6 +1058,7 @@ impl<S: Store> RoduService<S> {
         let parts = ContextParts {
             assignee: name(item.assignee_id.as_deref())?,
             reporter: self.reporter_label(&item)?,
+            creator: self.creator_label(&item)?,
             parent: match &item.parent_id {
                 Some(id) => self.store.get_item(id)?,
                 None => None,
