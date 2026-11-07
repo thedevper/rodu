@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use rodu_core::format::{format_activity, format_audit, item_line};
 use rodu_core::service::Triage;
 use rodu_core::store::{Store, TxMode};
+use rodu_core::tidy::TidyAction;
 use rodu_core::{Actor, PrincipalKind, Result, RoduError, RoduService};
 use rodu_http::{
     Bytes, LIVE_EVERY, LiveOptions, RunningServer, WebServerOptions, start_web_server,
@@ -42,6 +43,7 @@ pub const USAGE: &str = "Usage: rodu <command> [options]
   triage accept|decline <key>...   move waiting cards to Backlog, or cancel them
   triage duplicate <key> <of>      cancel a waiting card as a duplicate of another
   triage snooze <key>... --days N  hide waiting cards from the list for N days (1-365)
+  tidy [--apply]             run the stale rules in .rodu/tidy.json: shows what they would do; --apply does it
   collections                the collections in this workspace, key and name
   collection add <KEY> [--title <name>]   add a collection (a project with its own card numbers)
   mcp                        serve MCP over stdio for your agent
@@ -131,6 +133,8 @@ const BOOL_OPTIONS: &[&str] = &[
     "readable-copy",
     "signed",
     "unsigned",
+    "apply",
+    "dry-run",
 ];
 
 #[derive(Debug, Default)]
@@ -389,6 +393,12 @@ pub async fn run(argv: &[String], io: &mut Io<'_>) -> i32 {
         return 0;
     }
     let rest = &args.positionals[1..];
+    if command != "tidy"
+        && let Some(flag) = ["apply", "dry-run"].into_iter().find(|f| args.flag(f))
+    {
+        (io.err)(&format!("error: --{flag} is only for rodu tidy"));
+        return 1;
+    }
     match command_result(&command, rest, &args, io).await {
         Ok(code) => code,
         Err(error) => {
@@ -450,7 +460,7 @@ async fn command_result(
             team::after_reopen(io, true);
             served.map(|()| 0)
         }
-        "add" | "edit" | "ls" | "show" | "audit" | "mv" | "triage" | "collection"
+        "add" | "edit" | "ls" | "show" | "audit" | "mv" | "triage" | "tidy" | "collection"
         | "collections" => {
             let mut ws = open(io, false)?;
             team::before(io, &ws);
@@ -459,6 +469,8 @@ async fn command_result(
             let result = match command {
                 "ls" | "show" | "audit" | "collections" => Ok(()),
                 "triage" if rest.is_empty() => Ok(()),
+                // A rule's changes are made via the rule's own agent, never the one running it.
+                "tidy" => Ok(()),
                 _ => as_named_agent(io, &mut ws),
             }
             .and_then(|()| item_command(command, rest, args, &ws, io));
@@ -616,6 +628,57 @@ fn item_command(
                     })?;
                 let snoozed = item.snoozed_until.as_deref().map(|d| format!(" · until {d}"));
                 (io.out)(&format!("{}{}", people_line(ws, &item)?, snoozed.unwrap_or_default()));
+            }
+            Ok(0)
+        }
+        "tidy" => {
+            if !rest.is_empty() {
+                return Err(RoduError::invalid("tidy takes no arguments").with_hint(
+                    "rodu tidy shows what the rules would do; rodu tidy --apply does it",
+                ));
+            }
+            if args.flag("apply") && args.flag("dry-run") {
+                return Err(RoduError::invalid("Use --apply or --dry-run, not both"));
+            }
+            let path = ws.dir.join(rodu_core::tidy::RULES_FILE);
+            let text = std::fs::read_to_string(&path).map_err(|e| {
+                RoduError::not_found(format!("No tidy rules at {}: {e}", path.display()))
+                    .with_hint(rodu_core::tidy::EXAMPLE_HINT)
+            })?;
+            let rules = rodu_core::tidy::parse_rules(&text)?;
+            let apply = args.flag("apply");
+            let reports = ws.service.tidy(&ws.actor, &rules, apply)?;
+            if !apply {
+                (io.out)("Dry run: nothing was changed. rodu tidy --apply does what it lists.");
+            }
+            for r in &reports {
+                let doing = match (r.action, apply) {
+                    (TidyAction::Flag, _) => "flagged",
+                    (TidyAction::Comment, true) => "commented on",
+                    (TidyAction::Comment, false) => "would comment on",
+                    (TidyAction::Close, true) => "closed",
+                    (TidyAction::Close, false) => "would close",
+                };
+                let n = r.cards.len();
+                let cards = if n == 1 { "card" } else { "cards" };
+                (io.out)(&format!(
+                    "rule {} (no activity for {} days): {doing} {n} {cards}",
+                    r.rule, r.days
+                ));
+                for (item, last) in &r.cards {
+                    let day = last.get(..10).unwrap_or(last);
+                    (io.out)(&format!("  {} · last activity {day}", item_line(item)));
+                }
+                if !r.already.is_empty() {
+                    let keys: Vec<&str> = r.already.iter().map(|i| i.key.as_str()).collect();
+                    (io.out)(&format!("  already commented on: {}", keys.join(", ")));
+                }
+                if r.stuck_in_triage > 0 {
+                    (io.out)(&format!(
+                        "  {} in Triage for more than {} days: rodu triage",
+                        r.stuck_in_triage, r.days
+                    ));
+                }
             }
             Ok(0)
         }
